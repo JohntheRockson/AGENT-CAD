@@ -1,0 +1,74 @@
+# Allowlist: ignore everything except source and build manifests.
+# Root-level /* does not apply inside un-ignored directories.
+
+# Ignore all files and folders at the repo root
+/*
+
+# Keep project metadata and source trees
+!.gitignore
+!.env.example
+!Cargo.toml
+!Cargo.lock
+!README.md
+!SPEC.md
+!crates/
+!apps/
+!vendor/
+
+# apps/: only the web frontend source (never node_modules / dist)
+/apps/*
+!/apps/web/
+/apps/web/node_modules/
+/apps/web/dist/
+/apps/web/dist-ssr/
+
+# vendor/: only the vendored OCCT WASM crate (needed to build)
+/vendor/*
+!/vendor/occt-wasm/
+/vendor/occt-wasm/target/
+/vendor/occt-wasm/.cargo-ok
+
+# Generated / local junk anywhere
+target/
+**/target/
+node_modules/
+**/node_modules/
+dist/
+**/.vite/
+**/.cache/
+**/.turbo/
+**/.cargo-ok
+*.pdb
+*.rs.bk
+*.tsbuildinfo
+*.log
+*.tmp
+tmp/
+temp/
+.idea/
+.vs/
+.cursor/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets.json
+GEMINI_KEY
+
+# Generated CAD meshes (not source)
+*.stl
+*.step
+*.stp
+*.iges
+*.igs
+*.brep
+*.obj
+test_files/

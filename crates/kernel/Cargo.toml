@@ -1,0 +1,30 @@
+[package]
+name    = "kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+anyhow      = { workspace = true }
+
+# occt-wasm: OpenCASCADE B-Rep kernel bundled as a WASM binary run via wasmtime.
+# No C++ toolchain required – just `cargo add occt-wasm`.
+# cargo test -p kernel  →  uses mock backend (feature not set)
+# cargo build -p server →  links kernel with this feature via server's Cargo.toml
+[dependencies.occt-wasm]
+version  = "3"
+optional = true
+
+[features]
+default = []              # tests always use mock
+occt    = ["dep:occt-wasm"]
+
+[[test]]
+name = "occt_geometry"
+path = "tests/occt_geometry.rs"
+required-features = ["occt"]
+
+[dev-dependencies]
+serde_json = { workspace = true }

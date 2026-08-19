@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "crates/kernel",
+    "crates/server",
+    "crates/agent",
+]
+resolver = "2"
+
+[workspace.dependencies]
+serde       = { version = "1",   features = ["derive"] }
+serde_json  = "1"
+tokio       = { version = "1",   features = ["full"] }
+axum        = "0.7"
+thiserror   = "1"
+anyhow      = "1"
+tower-http  = { version = "0.5", features = ["cors"] }
+bytes       = "1"
+reqwest     = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+dotenvy     = "0.15"
+
+[patch.crates-io]
+occt-wasm = { path = "vendor/occt-wasm" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 8
+
+# Keep debug builds usable if `--release` is forgotten: Cranelift compiling the
+# 21 MB OCCT WASM module is unusably slow when wasmtime itself is unoptimized.
+[profile.dev.package.wasmtime]
+opt-level = 3
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+[profile.dev.package.occt-wasm]
+opt-level = 3
