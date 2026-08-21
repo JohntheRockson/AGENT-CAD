@@ -1,7 +1,28 @@
 import { useEffect, useRef, useState } from 'react'
-import { Download, Loader2, ChevronDown, Check } from 'lucide-react'
+import { Download, Loader2, ChevronDown, Check, FileBox, FileText, Package } from 'lucide-react'
 import { useCadStore } from '../store/useStore'
 import { EXPORT_KINDS } from '../lib/saveFile'
+import type { ExportFormat } from '../types/cad'
+
+// ── Format icon mapping ───────────────────────────────────────────────
+
+const FORMAT_ICON: Record<string, typeof FileBox> = {
+  step: FileBox,
+  stl:  Package,
+  gltf: Package,
+  obj:  FileText,
+  brep: FileBox,
+}
+
+const FORMAT_COLOR: Record<string, string> = {
+  step: 'text-cyan',
+  stl:  'text-green',
+  gltf: 'text-amber',
+  obj:  'text-muted',
+  brep: 'text-accent',
+}
+
+// ── Component ──────────────────────────────────────────────────────────
 
 export function ExportMenu() {
   const irCode         = useCadStore((s) => s.irCode)
@@ -24,50 +45,85 @@ export function ExportMenu() {
     return () => document.removeEventListener('mousedown', onPointer)
   }, [menuOpen])
 
+  const disabled = isRunning || isExporting || !irCode.trim()
+
   return (
     <div className="flex items-center gap-2">
+      {/* Export status pill */}
       {exportStatus && (
-        <span className="flex items-center gap-1.5 text-[10px] text-accent">
-          {isExporting && <Loader2 size={10} className="animate-spin" />}
-          {!isExporting && <Check size={10} />}
+        <span className="flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-full
+                         bg-accent/10 border border-accent/20 text-accent">
+          {isExporting
+            ? <Loader2 size={9} className="animate-spin" />
+            : <Check   size={9} />
+          }
           {exportStatus}
         </span>
       )}
 
+      {/* Dropdown */}
       <div className="relative" ref={menuRef}>
         <button
           onClick={() => setMenuOpen((o) => !o)}
-          disabled={isRunning || isExporting || !irCode.trim()}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-border text-gray-200
-                     text-xs font-medium hover:border-accent/50 hover:bg-accent/10
-                     disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          disabled={disabled}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border
+                     text-[11px] font-medium text-gray-200
+                     hover:border-accent/50 hover:bg-raised
+                     disabled:opacity-30 disabled:cursor-not-allowed transition-all"
         >
-          {isExporting ? (
-            <Loader2 size={12} className="animate-spin text-accent" />
-          ) : (
-            <Download size={12} />
-          )}
+          {isExporting
+            ? <Loader2 size={12} className="animate-spin text-accent" />
+            : <Download size={12} />
+          }
           Export
-          <ChevronDown size={11} className={`text-muted transition-transform ${menuOpen ? 'rotate-180' : ''}`} />
+          <ChevronDown
+            size={11}
+            className={`text-muted transition-transform ${menuOpen ? 'rotate-180' : ''}`}
+          />
         </button>
 
         {menuOpen && (
-          <div className="absolute right-0 top-full mt-1 w-64 z-50 rounded-md border border-border
-                          bg-panel shadow-xl overflow-hidden">
-            {EXPORT_KINDS.map((kind) => (
-              <button
-                key={kind.id}
-                onClick={() => {
-                  setMenuOpen(false)
-                  downloadExport(kind.id)
-                }}
-                className="w-full text-left px-3 py-2 hover:bg-accent/10 transition-colors
-                           border-b border-border last:border-b-0"
-              >
-                <div className="text-xs text-gray-200 font-medium">{kind.label}</div>
-                <div className="text-[10px] text-muted mt-0.5">{kind.hint}</div>
-              </button>
-            ))}
+          <div className="absolute right-0 top-full mt-1.5 w-72 z-50 rounded-xl border border-border
+                          bg-panel shadow-cad-lg overflow-hidden">
+            {/* Menu header */}
+            <div className="px-3 py-2 border-b border-divide">
+              <p className="text-[11px] font-semibold text-gray-300">Export Model</p>
+              <p className="text-[10px] text-dim mt-0.5">Choose output format</p>
+            </div>
+
+            {/* Format list */}
+            <div className="py-1">
+              {EXPORT_KINDS.map((kind) => {
+                const Icon  = FORMAT_ICON[kind.id] ?? FileBox
+                const color = FORMAT_COLOR[kind.id] ?? 'text-muted'
+                return (
+                  <button
+                    key={kind.id}
+                    onClick={() => { setMenuOpen(false); downloadExport(kind.id as ExportFormat) }}
+                    className="w-full text-left flex items-center gap-3 px-3 py-2.5
+                               hover:bg-raised transition-colors group"
+                  >
+                    <div className={`w-8 h-8 rounded-lg bg-surface border border-divide
+                                     flex items-center justify-center flex-shrink-0 ${color}`}>
+                      <Icon size={16} strokeWidth={1.5} />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[12px] font-semibold text-gray-200">{kind.label}</span>
+                        <span className="text-[9px] font-mono text-dim border border-divide rounded px-1">
+                          .{kind.ext}
+                        </span>
+                      </div>
+                      <div className="text-[10px] text-muted mt-0.5 truncate">{kind.hint}</div>
+                    </div>
+                    <Download
+                      size={13}
+                      className="text-dim group-hover:text-accent transition-colors flex-shrink-0"
+                    />
+                  </button>
+                )
+              })}
+            </div>
           </div>
         )}
       </div>

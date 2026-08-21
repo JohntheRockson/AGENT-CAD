@@ -2,14 +2,57 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Monaco editor container must have an explicit height */
-.monaco-container {
-  height: 100%;
-  min-height: 0;
+/* ── Base ───────────────────────────────────────────────────────────── */
+:root {
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* Thin scrollbars for panels */
-::-webkit-scrollbar       { width: 6px; height: 6px; }
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Display',
+    'Segoe UI', system-ui, sans-serif;
+}
+
+/* ── Monaco ──────────────────────────────────────────────────────────── */
+.monaco-container { height: 100%; min-height: 0; }
+
+/* ── Scrollbars ─────────────────────────────────────────────────────── */
+::-webkit-scrollbar       { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #58a6ff55; }
+::-webkit-scrollbar-thumb { background: #252538; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #5b8cff44; }
+
+/* ── Focus ───────────────────────────────────────────────────────────── */
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid rgba(91,140,255,0.45);
+  outline-offset: 1px;
+}
+
+/* ── Selection ───────────────────────────────────────────────────────── */
+::selection { background: rgba(91,140,255,0.22); }
+
+/* ── Tooltip ─────────────────────────────────────────────────────────── */
+.cad-tooltip {
+  font-size: 10px;
+  padding: 3px 7px;
+  background: #1a1a28;
+  border: 1px solid #252538;
+  border-radius: 4px;
+  color: #b8b8d8;
+  pointer-events: none;
+  white-space: nowrap;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+}
+
+/* ── Ribbon group label ───────────────────────────────────────────────── */
+.ribbon-label {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #3a3a58;
+}
