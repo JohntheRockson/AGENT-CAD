@@ -17,6 +17,8 @@
 //! # Open http://localhost:5173 in the browser (after `npm run dev` in apps/web)
 //! ```
 
+mod preview;
+
 use std::{convert::Infallible, sync::Arc, time::Instant};
 
 use axum::{
@@ -71,6 +73,9 @@ Convert the user's description into a CadDocument: one or more independent bodie
 - Cross-body boolean (optional): on the TOOL body, `"references": [{ "op": "cut"|"fuse", "target": "<bodyId>", "consume": false }]`.
   `consume: true` hides the tool after the boolean.
 - Place bodies with `"transform": { "position": [x,y,z], "rotation": [rx,ry,rz] }` (Euler degrees).
+  Rotation on X, Y, or Z is valid. Do not avoid Y rotation.
+- Start EVERY body with a solid: `box`, `cylinder`, `sphere`, `cone`, `torus`, `ellipsoid`, `helix`, `thread` (external), `sketch` then `extrude`/`revolve`/`sweep`, or `fuse`.
+  Never start a body with `cut`, `hole`, `fillet`, `chamfer`, `transform`, `offset`, `thicken`, `draft`, `common`, or internal `thread` (tap).
 - bodyId: stable slug like `body_base_plate`. name: human label for the outliner.
 - When the user asks to change one part (holes, thickness, that bracket), edit ONLY that body.
 - Example assembly (two bodies, not fused):
@@ -98,8 +103,24 @@ Convert the user's description into a CadDocument: one or more independent bodie
 { "circle":   { "d": <diameter>, "at": [x,y] } }          — `at` is the CENTER
 { "polyline": { "points": [[x,y],...], "closed": true } } — ≥3 points, coords may be negative
 { "arc":      { "center": [x,y], "radius": <r>, "start_angle": <deg>, "end_angle": <deg> } }
+{ "ellipse":  { "major": <d1>, "minor": <d2>, "at": [x,y] } } — full widths, like circle `d`
 
 Set `"centered": false` on a rect ONLY when `at` should be the min-corner, not the center.
+
+## Control arms / wishbones / brackets with pockets (CRITICAL)
+- Sketch ONE simple OUTER outline. Then CUT the inner window with hole/cut.
+- NEVER close a polyline by tracing back around the inside of the part. That self-intersects and tessellates as jagged disconnected bars.
+- Bosses and bushing eyes: cylinder JOINED onto the extruded plate. The cylinder MUST overlap the plate (height taller than thickness, `at.z` a few mm below the plate). A cylinder sitting above the face stays a separate lump.
+- Fasteners (bolts/bushings) are separate bodies. Structural parts (arm, knuckle, strut housing) must each be ONE continuous solid.
+- Assemblies must be ASSEMBLED, not an exploded view. Put the knuckle between the UCA and LCA ball-joint cups so bboxes overlap. Plant the strut on the LCA pad (strut `transform.position` = the pad, cylinders stacked in +Z from there). The top hat is at the TOP (high Z), not at z=0.
+- Fillet last with a SMALL radius (1.5–2.5, always less than half the plate thickness). Skip fillet rather than using a large r that shatters the solid.
+
+Example A-arm (copy this pattern):
+  sketch outer triangle/wishbone polyline closed, extrude 8,
+  cut inner window,
+  cylinder bosses at the three eyes overlapping the plate,
+  hole through each eye,
+  fillet r=2.
 
 ## Feature ops
 
@@ -121,34 +142,73 @@ revolve        { "op":"revolve", "axis":"X"|"Y"|"Z", "angle":360, "origin":[x,y,
 loft           { "op":"loft", "ruled": true, "sections": [ {"profile":<Profile>, "at":[x,y,z]}, ... ], "apex": [x,y,z] }
                ≥2 sections, OR 1 section plus apex. ruled:true = flat sides (square pyramid).
                Keep section XY at 0 and increase Z for a centered pyramid.
+sweep          { "op":"sweep", "profile": <Profile>, "path": { "helix": { "pitch":<p>, "height":<h>, "radius":<r>, "at":[x,y,z], "axis":"Z" } } }
+               or "path": { "polyline": { "points": [[x,y,z], ...] } }
+               Omit profile to sweep the last sketch. Helix path = coil/spring/thread-like sweep.
 
 ### Primitives (can be the FIRST feature — no sketch needed)
 box       { "op":"box", "size":[dx,dy,dz], "at":[x,y,z], "centered": true }
           XY-centered by default; bottom sits on Z = at[2].
-cylinder  { "op":"cylinder", "diameter":<d>, "height":<h>, "at":[x,y,z], "axis":"Z" }
+cylinder  { "op":"cylinder", "diameter":<d>, "height":<h>, "at":[x,y,z], "axis":"Z"|"X"|"Y" }
+          Axis X and Y are valid (the kernel rotates a Z primitive). Do not avoid them.
 sphere    { "op":"sphere", "diameter":<d>, "at":[x,y,z] }
 cone      { "op":"cone", "d1":<base>, "d2":<top>, "height":<h>, "at":[x,y,z] }
           d2=0 is a pointed cone.
 torus     { "op":"torus", "major":<R>, "minor":<r>, "at":[x,y,z] }
+ellipsoid { "op":"ellipsoid", "radii":[rx,ry,rz], "at":[x,y,z] }
+helix     { "op":"helix", "pitch":<p>, "height":<h>, "radius":<r>, "section_diameter":<d>, "at":[x,y,z], "axis":"Z" }
+          Solid spring / coil (circular wire swept along a helix).
+
+A coilover strut BODY is still stacked cylinders (tube, can, hat) along +Z that OVERLAP.
+The spring itself MAY be a separate `helix` body. `at` on a cylinder is the BOTTOM.
+Consecutive stacks: at.z = previous_bottom + previous_height - 2 (a few mm overlap).
+Do not place the top hat at z=0. Plant the strut on the LCA mount with overlapping coordinates.
+
+If the body already has a solid, a later box/cylinder/sphere/cone/torus/ellipsoid/helix/extrude is
+JOINED (boolean union) into it. Use that for bosses, bushing eyes, bolt heads, ball-joint
+studs. It does NOT replace the body. To subtract, use hole/cut/thread(internal). To make a separate part,
+add a new body — do not start a second feature tree on the same body expecting a replace.
+`fuse` as the FIRST feature of a body creates that solid (extruded profile). Prefer `box`
+or `cylinder` when they fit; fuse-first is still valid.
+
+### Threads (tap = internal, die = external)
+ISO metric and unified inch. Size strings: "M8", "M8x1", "M10", "1/4-20", or #8-32.
+Coarse pitch is filled in when omitted (M8 → 1.25 mm).
+
+thread  { "op":"thread", "kind":"external"|"internal"|"die"|"tap", "size":"M8",
+          "length":<mm>, "at":[x,y,z], "axis":"Z", "hand":"right"|"left" }
+        EXTERNAL / DIE: first feature → threaded cylinder (bolt shank). On an existing
+        solid → cuts a helical groove into a boss at `at` along `axis`.
+        INTERNAL / TAP: needs an existing solid. Drills the tap hole and cuts the thread.
+        Use hole-style placement: "center":[x,y], "plane":"XY", "through": true.
+        Example M8 bolt shank 20 mm: { "op":"thread", "kind":"external", "size":"M8", "length":20 }
+        Example M8 tapped hole: after a box, { "op":"thread", "kind":"tap", "size":"M8", "center":[0,0], "through":true }
+        Do NOT fake threads with stacked toruses. Use this op.
 
 ### Booleans & holes
 hole  { "op":"hole", "diameter":<d>, "depth":<h>, "center":[x,y], "plane":"XY" }
-      Through-hole by default (punches through the whole solid). Set "through": false for a blind hole of `depth`.
+      Through-hole by default (punches through the whole solid). `depth` and `center` may be
+      omitted (`depth` defaults to 1, `center` to [0,0]). Set "through": false for a blind hole.
 cut   { "op":"cut",  "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
-      Through-cut by default. The cutter is extended through the solid so it cannot leave a dimple
-      if `at` is on the wrong side. Set "through": false for a blind pocket of exactly `depth`.
+      Through-cut by default. `depth` may be omitted (defaults to 1); the cutter is extended
+      through the solid so a slightly-too-short or wrong-side `at` still punches through.
+      Set "through": false for a blind pocket of exactly `depth`.
       Plane UV: XY=(X,Y), XZ=(X,Z), YZ=(Y,Z). A side hole through a Z-axis tube at height 40:
       `"plane":"YZ", "profile":{"circle":{"d":3,"at":[0,40]}}` — at is (Y,Z), cut along X.
 fuse  { "op":"fuse", "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
       Default plane is XY. `at` is the world-space origin of the tool (bottom of the extrusion).
       To stack on the ground, use at [0, 0, z] with plane XY. Do not use plane XZ.
+      If this is the first feature on the body, it becomes the solid.
+common { "op":"common", "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
+      Boolean INTERSECTION: keep only the overlap of the current solid and the extruded tool.
 
 ### Modify the current solid
 fillet    { "op":"fillet", "radius":<r>, "edges":"all"|[0,3,7] }
           `all` fillets the top perimeter of a plate (not the thickness edges or
           the bottom). r must be less than the local wall thickness. On a 6 mm lid,
           r=5 leaves a ~1 mm vertical band — that is correct, not a missing fillet.
-chamfer   { "op":"chamfer", "distance":<d>, "edges":"all"|[0,3,7] }
+chamfer   { "op":"chamfer", "distance":<d>, "angle":<deg>, "edges":"all"|[0,3,7] }
+          Optional angle (degrees) for a distance+angle chamfer.
 transform { "op":"transform", "translate":[x,y,z], "rotate":{"axis":[x,y,z],"angle":<deg>,"origin":[x,y,z]}, "scale":<s> }
 mirror    { "op":"mirror", "plane":"YZ"|"XZ"|"XY", "origin":[x,y,z], "fuse": true }
           YZ flips X, XZ flips Y, XY flips Z. fuse:true unions the copy with the original.
@@ -156,6 +216,12 @@ pattern   { "op":"pattern", "kind":"linear"|"circular", "count":<n≥2>, "spacin
             "axis":"Z", "angle":<deg>, "center":[x,y,z] }
 shell     { "op":"shell", "thickness":<t>, "faces":"all"|[0] }
           "all" (default) = closed hollow. Integer indices = faces to open.
+offset    { "op":"offset", "distance":<d> }
+          Grow (positive) or shrink (negative) the whole solid.
+thicken   { "op":"thicken", "thickness":<t> }
+          Thicken a shell/surface into a solid.
+draft     { "op":"draft", "angle":<deg>, "pull":"Z", "faces":"all"|[0] }
+          Draft existing side faces. Different from draft_extrude (which tapers a new prism).
 
 ## How to build common shapes
 Stepped pyramid (square, stairs on every side, CENTERED):
@@ -211,6 +277,24 @@ L-bracket / anything not a rectangle: use a closed polyline with negative AND po
     { "op": "fuse", "depth": 10, "at": [0, 0, 30], "profile": { "rect": { "w": 60, "h": 60, "centered": true } } },
     { "op": "fuse", "depth": 10, "at": [0, 0, 40], "profile": { "rect": { "w": 40, "h": 40, "centered": true } } },
     { "op": "fillet", "radius": 1, "edges": "all" }
+  ]
+}
+
+## Example — M8 bolt shank (external thread / die)
+{
+  "units": "mm",
+  "features": [
+    { "op": "thread", "kind": "external", "size": "M8", "length": 24, "at": [0, 0, 0], "axis": "Z" },
+    { "op": "cylinder", "diameter": 13, "height": 5.5, "at": [0, 0, 24] }
+  ]
+}
+
+## Example — plate with M8 tapped hole
+{
+  "units": "mm",
+  "features": [
+    { "op": "box", "size": [40, 40, 12], "centered": true },
+    { "op": "thread", "kind": "tap", "size": "M8", "center": [0, 0], "plane": "XY", "through": true }
   ]
 }"#;
 
@@ -371,11 +455,19 @@ fn is_false(v: &bool) -> bool {
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct GeminiPart {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     text: String,
     /// Gemini marks thought-summary parts with `"thought": true`.
     #[serde(default, skip_serializing_if = "is_false")]
     thought: bool,
+    #[serde(rename = "inline_data", skip_serializing_if = "Option::is_none")]
+    inline_data: Option<GeminiInlineData>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct GeminiInlineData {
+    mime_type: String,
+    data: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -545,6 +637,18 @@ fn gemini_text(text: impl Into<String>) -> GeminiPart {
     GeminiPart {
         text: text.into(),
         thought: false,
+        inline_data: None,
+    }
+}
+
+fn gemini_png(png: &[u8]) -> GeminiPart {
+    GeminiPart {
+        text: String::new(),
+        thought: false,
+        inline_data: Some(GeminiInlineData {
+            mime_type: "image/png".into(),
+            data: preview::to_base64(png),
+        }),
     }
 }
 
@@ -584,7 +688,7 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
         parts: vec![gemini_text(user_text)],
     });
 
-    const MAX_ATTEMPTS: u32 = 5;
+    const MAX_ATTEMPTS: u32 = 6;
     let mut last_error = String::from("Unknown error");
 
     for attempt in 1..=MAX_ATTEMPTS {
@@ -695,15 +799,38 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
             Ok(output) => {
                 tracing::info!(attempt, "Chat: geometry generated successfully");
 
+                let quality = preview::quality_notes(&output);
+                let preview_png = preview::render_png(&output);
+                let quality_text = preview::quality_report(&quality);
+
                 emit(&tx, ChatSseEvent::VerifyingStart).await;
                 let verify_start = Instant::now();
-                let verdict = verify_against_request(
+                let mut verdict = verify_against_request(
                     &state,
                     &body.message,
                     &document,
-                    &output.metrics,
+                    &output,
+                    &quality_text,
+                    preview_png.as_deref(),
                 )
                 .await;
+                if let Some(local) = preview::reject_reason(&document, &output) {
+                    if matches!(
+                        verdict,
+                        VerifyVerdict::Ok { .. } | VerifyVerdict::Skipped { .. }
+                    ) {
+                        tracing::warn!("verify accepted an unfinished assembly; forcing repair");
+                        verdict = VerifyVerdict::Mismatch {
+                            reason: format!(
+                                "The model is not finished:\n{local}\n\
+                                 Keep going. Mate every joint, fillet structural parts, and put the \
+                                 strut on its mount. Return a corrected document — do not describe \
+                                 an assembly you did not build."
+                            ),
+                            document: None,
+                        };
+                    }
+                }
                 emit(
                     &tx,
                     ChatSseEvent::VerifyingDone {
@@ -761,6 +888,41 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                         .await;
                         match retry {
                             Ok(output) => {
+                                if let Some(local) = preview::reject_reason(&fixed, &output) {
+                                    last_error = format!(
+                                        "Corrected document still unfinished: {reason}\n{local}"
+                                    );
+                                    tracing::warn!(attempt, %last_error, "verify fix still incomplete");
+                                    emit(
+                                        &tx,
+                                        ChatSseEvent::Repair {
+                                            attempt,
+                                            error: last_error.clone(),
+                                        },
+                                    )
+                                    .await;
+                                    let retry_png = preview::render_png(&output);
+                                    contents.push(GeminiContent {
+                                        role: "model".to_string(),
+                                        parts: vec![gemini_text(model_text)],
+                                    });
+                                    contents.push(GeminiContent {
+                                        role: "user".to_string(),
+                                        parts: {
+                                            let mut parts = vec![gemini_text(format!(
+                                                "You returned a 'fixed' document but it is still not done.\n\
+                                                 {local}\nLook at the attached render. Mate the knuckle to both \
+                                                 ball joints, plant the strut on the LCA, and fillet the arms. \
+                                                 Return {{ \"say\", \"document\" }}."
+                                            ))];
+                                            if let Some(png) = retry_png.as_deref() {
+                                                parts.push(gemini_png(png));
+                                            }
+                                            parts
+                                        },
+                                    });
+                                    continue;
+                                }
                                 let program_val =
                                     serde_json::to_value(&fixed).unwrap_or_default();
                                 let message = say
@@ -774,7 +936,10 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                                 return;
                             }
                             Err(kern_err) => {
-                                last_error = format!("Kernel error on corrected document: {kern_err}");
+                                last_error = format!(
+                                    "Kernel error on corrected document: {}",
+                                    kernel_error_for_model(&kern_err)
+                                );
                                 contents.push(GeminiContent {
                                     role: "model".to_string(),
                                     parts: vec![gemini_text(model_text)],
@@ -783,8 +948,11 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                                     role: "user".to_string(),
                                     parts: vec![gemini_text(format!(
                                         "The solid did not match the request ({reason}) and the \
-                                         corrected document failed: {kern_err}. \
-                                         Return a valid {{ \"say\", \"document\" }} JSON object."
+                                         corrected document failed: {}. \
+                                         Return a valid {{ \"say\", \"document\" }} JSON object. \
+                                         Do not drop body rotation or X/Y cylinders — those ops are valid. \
+                                         Start each body with box/cylinder/sketch+extrude/fuse.",
+                                        kernel_error_for_model(&kern_err)
                                     ))],
                                 });
                                 continue;
@@ -808,14 +976,22 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                         });
                         contents.push(GeminiContent {
                             role: "user".to_string(),
-                            parts: vec![gemini_text(format!(
-                                "The kernel built a solid, but it does NOT match the user request. {reason} \
-                                 Bounding box {bbox:?}, volume {vol:.1}. \
-                                 Fix the CadProgram (for a tube/venturi: XZ half-section + revolve Z) \
-                                 and return {{ \"say\", \"program\" }}.",
-                                bbox = output.metrics.bbox,
-                                vol = output.metrics.volume,
-                            ))],
+                            parts: {
+                                let mut parts = vec![gemini_text(format!(
+                                    "The kernel built solids, but they do NOT look like what the user asked for. {reason}\n\
+                                     Mesh quality:\n{quality_text}\n\
+                                     Bounding box {bbox:?}, volume {vol:.1}.\n\
+                                     Look at the attached isometric render. Fix jagged/self-intersecting \
+                                     control arms, disconnected primitive bags, and missing fillets. \
+                                     Return {{ \"say\", \"document\" }}.",
+                                    bbox = output.metrics.bbox,
+                                    vol = output.metrics.volume,
+                                ))];
+                                if let Some(png) = preview_png.as_deref() {
+                                    parts.push(gemini_png(png));
+                                }
+                                parts
+                            },
                         });
                         continue;
                     }
@@ -831,7 +1007,7 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                 }
             }
             Err(kern_err) => {
-                last_error = format!("Kernel error: {kern_err}");
+                last_error = format!("Kernel error: {}", kernel_error_for_model(&kern_err));
                 tracing::warn!(attempt, %last_error, "repair loop");
                 emit(
                     &tx,
@@ -842,8 +1018,12 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                 )
                 .await;
                 let repair = format!(
-                    "The geometry kernel rejected the program: {kern_err}. \
-                     Fix the CadProgram and return ONLY the corrected JSON object."
+                    "The geometry kernel rejected the program: {}. \
+                     Fix the CadProgram and return ONLY the corrected JSON object. \
+                     Body rotation (including Y) and cylinders on X/Y are valid. \
+                     Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude. \
+                     Use cut/hole only after a solid exists.",
+                    kernel_error_for_model(&kern_err)
                 );
                 contents.push(GeminiContent {
                     role: "model".to_string(),
@@ -922,8 +1102,11 @@ async fn verify_against_request(
     state: &AppState,
     user_message: &str,
     document: &CadDocument,
-    metrics: &MetricsData,
+    output: &DocumentOutput,
+    quality_text: &str,
+    preview_png: Option<&[u8]>,
 ) -> VerifyVerdict {
+    let metrics = &output.metrics;
     let [xmin, ymin, zmin, xmax, ymax, zmax] = metrics.bbox;
     let dx = (xmax - xmin).abs();
     let dy = (ymax - ymin).abs();
@@ -939,11 +1122,23 @@ async fn verify_against_request(
          - extents dx={dx:.2} dy={dy:.2} dz={dz:.2}\n\
          - volume = {vol:.2}\n\
          - surface_area = {area:.2}\n\n\
-         Does this match what the user asked for?\n\
+         Per-body mesh quality:\n{quality_text}\n\n\
+         An isometric render of the ACTUAL tessellated solids is attached. Look at it.\n\
+         Does this match what the user asked for AS REAL CAD PARTS?\n\
          Rules:\n\
          - Assemblies should be multiple bodies, not one fused blob.\n\
          - A tube/venturi along Z must have similar dx and dy AND a real dz (not a disk).\n\
          - Volume must be clearly > 0.\n\
+         - Per-body mesh shells: OCCT counts faces, not parts. shells=20–80 on one body is normal \
+           tessellation. Only reject a body if the RENDER shows a bag of floating boxes/cylinders \
+           that do not touch. Do not set ok:false just because the shell number is > 1.\n\
+         - Structural parts should look assembled: knuckle between the arms, ball joints in their \
+           cups, strut standing on the LCA pad with the top hat at the TOP.\n\
+         - ACCEPT a complete first-pass multi-body suspension that is mated, even if proportions \
+           are approximate, a coilover spring is a helix or stacked rings, or parts mildly clip. \
+           Do not reject for 'awkward clipping', 'incorrectly proportioned', or missing fillets.\n\
+         - REJECT only if major parts are missing, the layout is exploded (parts floating apart), \
+           or the render is clearly disconnected primitives / a self-intersecting scribble.\n\
          Reply with JSON only:\n\
          {{ \"ok\": true, \"say\": \"<2-4 sentence description>\" }}\n\
          or\n\
@@ -952,13 +1147,18 @@ async fn verify_against_request(
         area = metrics.surface_area,
     );
 
+    let mut parts = vec![gemini_text(prompt)];
+    if let Some(png) = preview_png {
+        parts.push(gemini_png(png));
+    }
+
     let req_body = GeminiRequest {
         system_instruction: GeminiSystemInstruction {
             parts: vec![gemini_text(SYSTEM_PROMPT)],
         },
         contents: vec![GeminiContent {
             role: "user".to_string(),
-            parts: vec![gemini_text(prompt)],
+            parts,
         }],
         generation_config: GeminiGenerationConfig {
             temperature: 0.0,
@@ -1196,6 +1396,24 @@ fn extract_json(text: &str) -> String {
         return inner[start..=end].to_string();
     }
     inner.to_string()
+}
+
+/// Strip wasm backtraces so the model does not "learn" that Y-rotation is illegal.
+fn kernel_error_for_model(err: &kernel::engine::KernelError) -> String {
+    let raw = err.to_string();
+    let lower = raw.to_lowercase();
+    if lower.contains("internal cad kernel crash")
+        || lower.contains("out of bounds")
+        || lower.contains("wasm trap")
+        || lower.contains("wasm runtime")
+        || lower.contains("memory fault")
+    {
+        format!(
+            "{raw} The kernel recovers after a crash; keep rotation and X/Y cylinders."
+        )
+    } else {
+        raw
+    }
 }
 
 /// Accept `{ document }`, `{ body }` (patch), `{ program }`, or a raw document/program.

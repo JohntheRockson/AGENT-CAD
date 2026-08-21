@@ -92,6 +92,22 @@ export function featureLabel(feature: Feature, index: number): string {
       return `Revolve ${feature.axis}`
     case 'hole':
       return `Hole Ø${feature.diameter}`
+    case 'thread':
+      return `Thread ${feature.size ?? feature.kind}`
+    case 'helix':
+      return `Helix r${feature.radius}`
+    case 'ellipsoid':
+      return `Ellipsoid ${feature.radii.join('×')}`
+    case 'sweep':
+      return 'Sweep'
+    case 'offset':
+      return `Offset ${feature.distance}`
+    case 'thicken':
+      return `Thicken ${feature.thickness}`
+    case 'common':
+      return 'Intersect'
+    case 'draft':
+      return `Draft ${feature.angle}°`
     case 'cut':
       return 'Cut'
     case 'fuse':

@@ -1,9 +1,9 @@
 import type { LucideIcon } from 'lucide-react'
 import {
-  Box, Circle, Globe, Triangle, RotateCcw,
-  ArrowUp, RefreshCw, Layers, Package,
-  CornerDownRight, Minus, FlipHorizontal, LayoutGrid, Move,
-  Scissors, GitMerge, Target,
+  Box, Circle, Globe, Triangle, RotateCcw, CircleDot,
+  ArrowUp, RefreshCw, Layers, Package, Spline, Orbit,
+  CornerDownRight, Minus, FlipHorizontal, LayoutGrid, Move, Expand,
+  Scissors, GitMerge, Target, Nut, Blend,
   Code2, PanelLeft, MessageSquare,
   Play, Loader2, Settings,
 } from 'lucide-react'
@@ -31,7 +31,8 @@ const TOOL_GROUPS: ToolGroup[] = [
       { icon: Circle,          label: 'Cylinder', prompt: 'Create a cylinder, 30mm diameter, 60mm height' },
       { icon: Globe,           label: 'Sphere',   prompt: 'Create a sphere, 50mm diameter' },
       { icon: Triangle,        label: 'Cone',     prompt: 'Create a cone, 40mm base diameter, 60mm height' },
-      { icon: RotateCcw,       label: 'Torus',    prompt: 'Create a torus, 35mm major radius, 8mm minor radius' },
+      { icon: RotateCcw,       label: 'Torus',     prompt: 'Create a torus, 35mm major radius, 8mm minor radius' },
+      { icon: CircleDot,       label: 'Ellipsoid', prompt: 'Create an ellipsoid with radii 20, 12, and 8 mm' },
     ],
   },
   {
@@ -41,6 +42,8 @@ const TOOL_GROUPS: ToolGroup[] = [
       { icon: RefreshCw,       label: 'Revolve',  prompt: 'Revolve the profile 360° around the Z axis' },
       { icon: Layers,          label: 'Loft',     prompt: 'Create a loft sweep between two profiles' },
       { icon: Package,         label: 'Shell',    prompt: 'Shell the model with 2mm wall thickness, removing the top face' },
+      { icon: Spline,          label: 'Sweep',    prompt: 'Sweep a 4mm circle along a helix, pitch 8mm, radius 12mm, height 40mm' },
+      { icon: Orbit,           label: 'Helix',    prompt: 'Create a spring: helix radius 10mm, pitch 5mm, height 40mm, wire diameter 2mm' },
     ],
   },
   {
@@ -51,6 +54,7 @@ const TOOL_GROUPS: ToolGroup[] = [
       { icon: FlipHorizontal,  label: 'Mirror',   prompt: 'Mirror the body symmetrically across the XZ plane' },
       { icon: LayoutGrid,      label: 'Pattern',  prompt: 'Create a 3×3 rectangular pattern with 20mm spacing' },
       { icon: Move,            label: 'Transform',prompt: 'Translate the body 10mm along the X axis' },
+      { icon: Expand,          label: 'Offset',   prompt: 'Offset the solid outward by 1mm' },
     ],
   },
   {
@@ -59,6 +63,8 @@ const TOOL_GROUPS: ToolGroup[] = [
       { icon: Scissors,        label: 'Cut',      prompt: 'Subtract (cut) the second body from the first body' },
       { icon: GitMerge,        label: 'Fuse',     prompt: 'Fuse (union) all bodies into a single solid' },
       { icon: Target,          label: 'Hole',     prompt: 'Drill a 10mm diameter through-hole through the center of the part' },
+      { icon: Nut,             label: 'Thread',   prompt: 'Add an M8 tapped through-hole at the center of the part' },
+      { icon: Blend,           label: 'Intersect',prompt: 'Keep only the intersection of the current solid with a 20mm cylinder' },
     ],
   },
 ]

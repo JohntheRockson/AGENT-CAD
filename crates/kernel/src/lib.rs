@@ -20,6 +20,7 @@
 pub mod engine;
 pub mod export;
 pub mod ir;
+pub mod thread;
 
 pub use engine::{
     BodyOutput, DocumentOutput, Engine, ExportFormat, KernelError, MeshData, MetricsData,

@@ -143,3 +143,262 @@ fn thin_plate_fillet_does_not_spike() {
     }
     assert!(out.metrics.volume > 1000.0, "volume vanished: {}", out.metrics.volume);
 }
+
+/// A later cylinder on the same body must JOIN the existing solid, not replace it.
+#[test]
+fn later_cylinder_joins_existing_box() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "box", "size": [40, 40, 8], "centered": true },
+            { "op": "cylinder", "diameter": 20, "height": 24, "at": [0, 0, 8], "axis": "Z" }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let out = Engine::new()
+        .execute(&prog)
+        .expect("box + cylinder should join");
+
+    let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
+    let dx = (xmax - xmin).abs();
+    let dy = (ymax - ymin).abs();
+    let dz = (zmax - zmin).abs();
+    assert!(
+        dx > 35.0 && dy > 35.0,
+        "box XY vanished — cylinder replaced the body? bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(
+        dz > 28.0,
+        "expected ~32mm stacked height, got dz={dz:.1} bbox={:?}",
+        out.metrics.bbox
+    );
+    let box_vol = 40.0 * 40.0 * 8.0;
+    assert!(
+        out.metrics.volume > box_vol + 500.0,
+        "volume {} looks like box-only or cylinder-only",
+        out.metrics.volume
+    );
+}
+
+#[test]
+fn fuse_as_first_feature_creates_a_solid() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "fuse", "depth": 10, "profile": { "rect": { "w": 40, "h": 20, "centered": true } } }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new()
+        .execute(&prog)
+        .expect("fuse-first should build a solid");
+    let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
+    assert!((xmax - xmin).abs() > 30.0, "bbox={:?}", out.metrics.bbox);
+    assert!((ymax - ymin).abs() > 15.0, "bbox={:?}", out.metrics.bbox);
+    assert!((zmax - zmin).abs() > 8.0, "bbox={:?}", out.metrics.bbox);
+}
+
+#[test]
+fn cylinder_on_y_axis_builds() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "cylinder", "diameter": 12, "height": 40, "axis": "Y", "at": [0, -20, 0] }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new()
+        .execute(&prog)
+        .expect("Y-axis cylinder should build");
+    let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
+    let dx = (xmax - xmin).abs();
+    let dy = (ymax - ymin).abs();
+    let dz = (zmax - zmin).abs();
+    assert!(dy > 30.0, "expected length along Y, bbox={:?}", out.metrics.bbox);
+    assert!(dx > 8.0 && dz > 8.0, "expected ~12mm diameter in XZ, bbox={:?}", out.metrics.bbox);
+}
+
+#[test]
+fn body_rotate_y_on_box_builds() {
+    use kernel::ir::CadDocument;
+    let doc: CadDocument = serde_json::from_str(
+        r#"{
+          "documentId": "rot",
+          "units": "mm",
+          "bodies": [
+            {
+              "bodyId": "body_arm",
+              "transform": { "position": [0, 0, 0], "rotation": [0, 90, 0] },
+              "features": [{ "op": "box", "size": [40, 10, 6], "centered": true }]
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new()
+        .execute_document(&doc)
+        .expect("body rotate Y should build");
+    assert_eq!(out.bodies.len(), 1);
+    let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
+    let dx = (xmax - xmin).abs();
+    let dz = (zmax - zmin).abs();
+    // 40×10×6 box rotated 90° about Y → length along Z, thickness along X
+    assert!(dz > 30.0, "expected ~40mm along Z after Y rot, bbox={:?}", out.metrics.bbox);
+    assert!(dx > 4.0 && dx < 15.0, "expected ~6mm along X after Y rot, bbox={:?}", out.metrics.bbox);
+    let _ = (ymin, ymax);
+}
+
+#[test]
+fn body_rotate_y_on_disconnected_solids_builds() {
+    use kernel::ir::CadDocument;
+    let doc: CadDocument = serde_json::from_str(
+        r#"{
+          "documentId": "compound",
+          "units": "mm",
+          "bodies": [
+            {
+              "bodyId": "body_pair",
+              "transform": { "position": [0, 0, 0], "rotation": [0, 45, 0] },
+              "features": [
+                { "op": "box", "size": [12, 8, 6], "centered": true },
+                { "op": "cylinder", "diameter": 8, "height": 20, "at": [40, 0, 0], "axis": "Y" }
+              ]
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new()
+        .execute_document(&doc)
+        .expect("Y rotation of a multi-solid body should build");
+    assert!(!out.bodies[0].mesh.positions.is_empty());
+    assert!(out.metrics.volume > 100.0);
+}
+
+#[test]
+fn cut_without_depth_field_still_executes() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "box", "size": [40, 40, 10], "centered": true },
+            { "op": "cut", "through": true, "profile": { "circle": { "d": 8 } } }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new()
+        .execute(&prog)
+        .expect("through-cut with omitted depth should build");
+    assert!(out.metrics.volume < 40.0 * 40.0 * 10.0 - 10.0);
+}
+
+#[test]
+fn m8_external_thread_builds() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "thread", "kind": "external", "size": "M8", "length": 8 }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new()
+        .execute(&prog)
+        .expect("M8 external thread should build");
+    let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
+    let dx = (xmax - xmin).abs();
+    let dy = (ymax - ymin).abs();
+    let dz = (zmax - zmin).abs();
+    assert!(dx > 6.0 && dy > 6.0, "expected ~8mm diameter, bbox={:?}", out.metrics.bbox);
+    assert!(dz > 6.0, "expected ~8mm length, bbox={:?}", out.metrics.bbox);
+    assert!(out.metrics.volume > 50.0, "volume vanished: {}", out.metrics.volume);
+    assert!(out.metrics.is_solid);
+}
+
+#[test]
+fn m8_tap_in_plate_builds() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "box", "size": [30, 30, 10], "centered": true },
+            { "op": "thread", "kind": "tap", "size": "M8", "center": [0, 0], "through": true }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new()
+        .execute(&prog)
+        .expect("M8 tap in a plate should build");
+    let plate = 30.0 * 30.0 * 10.0;
+    assert!(
+        out.metrics.volume < plate - 50.0,
+        "tap should remove material, volume={}",
+        out.metrics.volume
+    );
+}
+
+#[test]
+fn ellipsoid_builds() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [{ "op": "ellipsoid", "radii": [10, 6, 4] }]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new().execute(&prog).expect("ellipsoid should build");
+    let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
+    assert!((xmax - xmin).abs() > 16.0, "bbox={:?}", out.metrics.bbox);
+    assert!((ymax - ymin).abs() > 8.0, "bbox={:?}", out.metrics.bbox);
+    assert!((zmax - zmin).abs() > 5.0, "bbox={:?}", out.metrics.bbox);
+    let _ = (xmin, ymin, zmin);
+}
+
+#[test]
+fn helix_spring_builds() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [{
+            "op": "helix", "pitch": 6, "height": 18, "radius": 8, "section_diameter": 2
+          }]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new().execute(&prog).expect("helix spring should build");
+    let [_xmin, _ymin, zmin, _xmax, _ymax, zmax] = out.metrics.bbox;
+    let dz = (zmax - zmin).abs();
+    assert!(dz > 10.0, "expected coil height, bbox={:?}", out.metrics.bbox);
+    assert!(out.metrics.volume > 10.0);
+}
+
+#[test]
+fn offset_grows_a_box() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "box", "size": [20, 20, 20], "centered": true },
+            { "op": "offset", "distance": 2 }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new().execute(&prog).expect("offset should build");
+    assert!(
+        out.metrics.volume > 20.0 * 20.0 * 20.0 + 100.0,
+        "offset should grow volume, got {}",
+        out.metrics.volume
+    );
+}

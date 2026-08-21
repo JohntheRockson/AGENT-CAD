@@ -14,11 +14,18 @@ export type ArcProfile = {
   end_angle: number
 }
 
+export type EllipseProfile = {
+  major: number
+  minor: number
+  at?: [number, number]
+}
+
 export type Profile =
   | { rect:     RectProfile }
   | { circle:   CircleProfile }
   | { polyline: PolylineProfile }
   | { arc:      ArcProfile }
+  | { ellipse:  EllipseProfile }
 
 export type EdgeSelection = 'all' | number[]
 
@@ -80,6 +87,7 @@ export type FilletOp = {
 export type ChamferOp = {
   op: 'chamfer'
   distance: number
+  angle?: number
   edges?: EdgeSelection
 }
 
@@ -168,12 +176,79 @@ export type DraftExtrudeOp = {
   angle: number
 }
 
+export type ThreadOp = {
+  op: 'thread'
+  kind: 'external' | 'internal' | 'die' | 'tap' | 'male' | 'bolt' | 'female' | 'nut'
+  size?: string
+  diameter?: number
+  pitch?: number
+  length?: number
+  depth?: number
+  at?: [number, number, number]
+  axis?: 'X' | 'Y' | 'Z'
+  center?: [number, number]
+  plane?: SketchPlane
+  through?: boolean
+  hand?: 'right' | 'left'
+}
+
+export type SweepOp = {
+  op: 'sweep'
+  profile?: Profile
+  path:
+    | { helix: { pitch: number; height: number; radius: number; at?: [number, number, number]; axis?: 'X' | 'Y' | 'Z' } }
+    | { polyline: { points: [number, number, number][] } }
+}
+
+export type HelixOp = {
+  op: 'helix'
+  pitch: number
+  height: number
+  radius: number
+  section_diameter: number
+  at?: [number, number, number]
+  axis?: 'X' | 'Y' | 'Z'
+}
+
+export type OffsetOp = {
+  op: 'offset'
+  distance: number
+}
+
+export type ThickenOp = {
+  op: 'thicken'
+  thickness: number
+}
+
+export type CommonOp = {
+  op: 'common'
+  profile: Profile
+  depth: number
+  at?: [number, number, number]
+  plane?: SketchPlane
+}
+
+export type EllipsoidOp = {
+  op: 'ellipsoid'
+  radii: [number, number, number]
+  at?: [number, number, number]
+}
+
+export type DraftOp = {
+  op: 'draft'
+  angle: number
+  pull?: 'X' | 'Y' | 'Z'
+  faces?: EdgeSelection
+}
+
 export type Feature =
   | SketchOp | ExtrudeOp | RevolveOp
   | CutOp   | FuseOp    | HoleOp
   | FilletOp | ChamferOp | TransformOp
   | BoxOp | CylinderOp | SphereOp | ConeOp | TorusOp
   | LoftOp | MirrorOp | PatternOp | ShellOp | DraftExtrudeOp
+  | ThreadOp | SweepOp | HelixOp | OffsetOp | ThickenOp
+  | CommonOp | EllipsoidOp | DraftOp
 
 export interface CadProgram {
   units: Units
