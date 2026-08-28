@@ -15,6 +15,7 @@ const FEATURE_ITEM = {
       enum: [
         'sketch','extrude','revolve','cut','fuse','hole','fillet','chamfer','transform',
         'box','cylinder','sphere','cone','torus','loft','mirror','pattern','shell','draft_extrude',
+        'sweep','pipe','thicken','helix','draft','common',
       ],
     },
     id:       { type: 'string' },

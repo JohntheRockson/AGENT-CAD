@@ -143,3 +143,133 @@ fn thin_plate_fillet_does_not_spike() {
     }
     assert!(out.metrics.volume > 1000.0, "volume vanished: {}", out.metrics.volume);
 }
+
+#[test]
+fn feature_pattern_holes_on_plate() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "box", "size": [80, 40, 8], "centered": true },
+            { "op": "hole", "diameter": 6, "depth": 20, "center": [-25, 0] },
+            { "op": "pattern", "scope": "feature", "kind": "linear", "count": 2,
+              "spacing": 50, "direction": [1, 0, 0] }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new().execute(&prog).expect("feature pattern holes");
+    assert!(out.metrics.is_solid);
+    // Two through-holes remove more volume than one.
+    assert!(out.metrics.volume < 80.0 * 40.0 * 8.0 - 100.0, "holes not patterned");
+}
+
+#[test]
+fn pipe_polyline_builds_solid() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "pipe", "diameter": 6, "fuse": false,
+              "path": { "polyline": { "points": [[0,0,0],[40,0,0],[40,0,30]] } } }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new().execute(&prog).expect("pipe");
+    assert!(out.metrics.volume > 10.0, "pipe volume too small: {}", out.metrics.volume);
+    let [xmin, _ymin, zmin, xmax, _ymax, zmax] = out.metrics.bbox;
+    assert!(xmax - xmin > 30.0 && zmax - zmin > 20.0, "pipe bbox {:?}", out.metrics.bbox);
+}
+
+#[test]
+fn compound_profile_extrude() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": {
+                "compound": {
+                  "outer": { "rect": { "w": 40, "h": 40, "centered": true } },
+                  "holes": [ { "circle": { "d": 12, "at": [0, 0] } } ]
+                }
+              }
+            },
+            { "op": "extrude", "depth": 5 }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new().execute(&prog).expect("compound extrude");
+    let solid_box = 40.0 * 40.0 * 5.0;
+    assert!(
+        out.metrics.volume < solid_box - 50.0,
+        "expected hole in compound profile, volume={}",
+        out.metrics.volume
+    );
+}
+
+#[test]
+fn common_boolean_shrinks_volume() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "box", "size": [40, 40, 40], "centered": true },
+            { "op": "common", "depth": 40, "at": [0,0,-20],
+              "profile": { "circle": { "d": 30, "at": [0, 0] } } }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new().execute(&prog).expect("common");
+    assert!(out.metrics.volume < 40.0 * 40.0 * 40.0 * 0.7);
+}
+
+#[test]
+fn topology_lists_faces_and_edges() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{ "units":"mm", "features":[ { "op":"box", "size":[20,10,5], "centered": true } ] }"#,
+    )
+    .unwrap();
+    let report = Engine::new().list_topology(&prog).expect("topology");
+    assert_eq!(report.summary.face_count, 6);
+    assert!(report.summary.edge_count >= 12);
+    assert!(report.summary.largest_face.is_some());
+    assert!(report.summary.top_face.is_some());
+}
+
+#[test]
+fn thicken_sketch_makes_solid() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": { "rect": { "w": 30, "h": 20, "centered": true } } },
+            { "op": "thicken", "thickness": 4, "fuse": false }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new().execute(&prog).expect("thicken");
+    assert!(out.metrics.volume > 100.0, "thicken volume {}", out.metrics.volume);
+}
+
+#[test]
+fn cut_on_largest_face() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "box", "size": [50, 50, 10], "centered": true },
+            { "op": "cut", "face": "largest", "through": false, "depth": 3,
+              "profile": { "circle": { "d": 10, "at": [0, 0] } } }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new().execute(&prog).expect("cut on face");
+    assert!(out.metrics.volume < 50.0 * 50.0 * 10.0);
+}

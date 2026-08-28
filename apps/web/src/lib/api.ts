@@ -17,6 +17,23 @@ export async function runProgram(program: CadProgram | CadDocument): Promise<Run
   return res.json() as Promise<RunResponse>
 }
 
+export async function listTopology(
+  program: CadProgram | CadDocument,
+): Promise<{ success: boolean; topology?: unknown; error?: string }> {
+  const res = await fetch(`${BASE}/topology`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(
+      'bodies' in program ? { document: program } : { program },
+    ),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => 'Unknown error')
+    throw new Error(`Topology ${res.status}: ${text}`)
+  }
+  return res.json()
+}
+
 export async function exportModel(
   program: CadProgram | CadDocument,
   format: ExportFormat,

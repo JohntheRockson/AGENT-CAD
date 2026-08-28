@@ -13,14 +13,17 @@ export type ArcProfile = {
   start_angle: number
   end_angle: number
 }
+export type CompoundProfile = { outer: Profile; holes?: Profile[] }
 
 export type Profile =
   | { rect:     RectProfile }
   | { circle:   CircleProfile }
   | { polyline: PolylineProfile }
   | { arc:      ArcProfile }
+  | { compound: CompoundProfile }
 
-export type EdgeSelection = 'all' | number[]
+export type EdgeSelection = 'all' | 'top' | 'longest' | 'outer' | number[]
+export type FaceRef = 'largest' | 'top' | 'bottom' | 'side' | number
 
 export type SketchOp = {
   op: 'sketch'
@@ -28,6 +31,7 @@ export type SketchOp = {
   plane?: SketchPlane
   profile: Profile
   origin?: [number, number]
+  face?: FaceRef
 }
 
 export type ExtrudeOp = {
@@ -52,6 +56,7 @@ export type CutOp = {
   at?: [number, number, number]
   plane?: SketchPlane
   through?: boolean
+  face?: FaceRef
 }
 
 export type FuseOp = {
@@ -60,6 +65,16 @@ export type FuseOp = {
   depth: number
   at?: [number, number, number]
   plane?: SketchPlane
+  face?: FaceRef
+}
+
+export type CommonOp = {
+  op: 'common'
+  profile: Profile
+  depth: number
+  at?: [number, number, number]
+  plane?: SketchPlane
+  face?: FaceRef
 }
 
 export type HoleOp = {
@@ -69,6 +84,7 @@ export type HoleOp = {
   center: [number, number]
   plane?: SketchPlane
   through?: boolean
+  face?: FaceRef
 }
 
 export type FilletOp = {
@@ -154,6 +170,7 @@ export type PatternOp = {
   axis?: 'X' | 'Y' | 'Z'
   angle?: number
   center?: [number, number, number]
+  scope?: 'body' | 'feature'
 }
 
 export type ShellOp = {
@@ -168,12 +185,64 @@ export type DraftExtrudeOp = {
   angle: number
 }
 
+export type SweepPath =
+  | { polyline: { points: [number, number, number][] } }
+  | {
+      helix: {
+        pitch: number
+        height: number
+        radius: number
+        center?: [number, number, number]
+        axis?: 'X' | 'Y' | 'Z'
+      }
+    }
+
+export type SweepOp = {
+  op: 'sweep'
+  profile: Profile
+  path: SweepPath
+  fuse?: boolean
+}
+
+export type PipeOp = {
+  op: 'pipe'
+  diameter: number
+  path: SweepPath
+  fuse?: boolean
+}
+
+export type ThickenOp = {
+  op: 'thicken'
+  thickness: number
+  face?: FaceRef
+  fuse?: boolean
+}
+
+export type HelixOp = {
+  op: 'helix'
+  pitch: number
+  height: number
+  radius: number
+  diameter: number
+  center?: [number, number, number]
+  axis?: 'X' | 'Y' | 'Z'
+  fuse?: boolean
+}
+
+export type DraftOp = {
+  op: 'draft'
+  faces: EdgeSelection
+  angle: number
+  direction?: [number, number, number]
+}
+
 export type Feature =
   | SketchOp | ExtrudeOp | RevolveOp
-  | CutOp   | FuseOp    | HoleOp
+  | CutOp   | FuseOp    | CommonOp | HoleOp
   | FilletOp | ChamferOp | TransformOp
   | BoxOp | CylinderOp | SphereOp | ConeOp | TorusOp
   | LoftOp | MirrorOp | PatternOp | ShellOp | DraftExtrudeOp
+  | SweepOp | PipeOp | ThickenOp | HelixOp | DraftOp
 
 export interface CadProgram {
   units: Units

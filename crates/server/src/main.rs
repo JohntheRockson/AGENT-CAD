@@ -4,6 +4,7 @@
 //! - `POST /api/run`    – execute a CadProgram, return mesh + metrics
 //! - `POST /api/export` – execute a CadProgram, stream back a binary file
 //! - `POST /api/chat`   – natural language → Gemini → CadProgram → mesh (with repair loop)
+//! - `POST /api/topology` – list faces/edges with semantic tags for agent selection
 //! - `GET  /api/health` – liveness probe
 //!
 //! # Geometry backend
@@ -93,20 +94,24 @@ Convert the user's description into a CadDocument: one or more independent bodie
 ## CadProgram schema
 { "units": "mm"|"in", "features": [ ...ops tagged by "op"... ] }
 
-## Profiles (used by sketch, cut, fuse, loft)
+## Profiles (used by sketch, cut, fuse, loft, sweep, common)
 { "rect":     { "w": <w>, "h": <h>, "at": [x,y], "centered": true } }
 { "circle":   { "d": <diameter>, "at": [x,y] } }          — `at` is the CENTER
 { "polyline": { "points": [[x,y],...], "closed": true } } — ≥3 points, coords may be negative
 { "arc":      { "center": [x,y], "radius": <r>, "start_angle": <deg>, "end_angle": <deg> } }
+{ "compound": { "outer": <Profile>, "holes": [ <Profile>, ... ] } }
+          Multi-contour: outer profile with inner holes (flange with cutouts, pocket islands).
 
 Set `"centered": false` on a rect ONLY when `at` should be the min-corner, not the center.
 
 ## Feature ops
 
 ### 2D → 3D
-sketch         { "op":"sketch", "plane":"XY"|"XZ"|"YZ", "profile": <Profile>, "origin":[x,y] }
+sketch         { "op":"sketch", "plane":"XY"|"XZ"|"YZ", "profile": <Profile>, "origin":[x,y],
+                 "face":"largest"|"top"|"bottom"|<index> }
+               Optional `face` places the sketch on an existing solid face (then extrude/thicken).
 extrude        { "op":"extrude", "depth": <positive>, "symmetric": false }
-               symmetric:true extrudes depth/2 both ways.
+               symmetric:true extrudes depth/2 both ways. On a face-sketch, fuses into the solid.
 draft_extrude  { "op":"draft_extrude", "depth": <positive>, "angle": <deg> }
                Tapered extrusion of the last sketch. Positive angle tapers inward (pyramid-like).
 revolve        { "op":"revolve", "axis":"X"|"Y"|"Z", "angle":360, "origin":[x,y,z] }
@@ -121,6 +126,15 @@ revolve        { "op":"revolve", "axis":"X"|"Y"|"Z", "angle":360, "origin":[x,y,
 loft           { "op":"loft", "ruled": true, "sections": [ {"profile":<Profile>, "at":[x,y,z]}, ... ], "apex": [x,y,z] }
                ≥2 sections, OR 1 section plus apex. ruled:true = flat sides (square pyramid).
                Keep section XY at 0 and increase Z for a centered pyramid.
+sweep          { "op":"sweep", "profile":<Profile>, "path": <Path>, "fuse": true }
+pipe           { "op":"pipe", "diameter":<d>, "path": <Path>, "fuse": true }
+               Path: { "polyline": { "points": [[x,y,z],...] } } (≥2 pts)
+                  or { "helix": { "pitch":<p>, "height":<h>, "radius":<r>, "center":[x,y,z], "axis":"Z" } }
+helix          { "op":"helix", "pitch":<p>, "height":<h>, "radius":<r>, "diameter":<wire_d>,
+                 "center":[x,y,z], "axis":"Z", "fuse": true }
+               Spring / coil: pipes a circular section along a helix.
+thicken        { "op":"thicken", "thickness":<t>, "face":"largest"|<index>, "fuse": true }
+               Thickens the last sketch face, or a selected solid face, into a solid.
 
 ### Primitives (can be the FIRST feature — no sketch needed)
 box       { "op":"box", "size":[dx,dy,dz], "at":[x,y,z], "centered": true }
@@ -132,30 +146,40 @@ cone      { "op":"cone", "d1":<base>, "d2":<top>, "height":<h>, "at":[x,y,z] }
 torus     { "op":"torus", "major":<R>, "minor":<r>, "at":[x,y,z] }
 
 ### Booleans & holes
-hole  { "op":"hole", "diameter":<d>, "depth":<h>, "center":[x,y], "plane":"XY" }
-      Through-hole by default (punches through the whole solid). Set "through": false for a blind hole of `depth`.
-cut   { "op":"cut",  "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
-      Through-cut by default. The cutter is extended through the solid so it cannot leave a dimple
-      if `at` is on the wrong side. Set "through": false for a blind pocket of exactly `depth`.
-      Plane UV: XY=(X,Y), XZ=(X,Z), YZ=(Y,Z). A side hole through a Z-axis tube at height 40:
-      `"plane":"YZ", "profile":{"circle":{"d":3,"at":[0,40]}}` — at is (Y,Z), cut along X.
-fuse  { "op":"fuse", "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
-      Default plane is XY. `at` is the world-space origin of the tool (bottom of the extrusion).
-      To stack on the ground, use at [0, 0, z] with plane XY. Do not use plane XZ.
+hole  { "op":"hole", "diameter":<d>, "depth":<h>, "center":[x,y], "plane":"XY",
+        "face":"largest"|"top"|<index> }
+      Through-hole by default. Prefer `face` when drilling on a selected face.
+cut   { "op":"cut",  "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY",
+        "face":"largest"|"top"|<index>, "through": true }
+      Through-cut by default. Use `face` to pocket/cut on a solid face.
+fuse  { "op":"fuse", "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY",
+        "face":"largest"|"top"|<index> }
+      Boss on a plane or on a selected face.
+common { "op":"common", "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
+      Boolean intersection (keep only overlap with the extruded tool).
 
 ### Modify the current solid
-fillet    { "op":"fillet", "radius":<r>, "edges":"all"|[0,3,7] }
-          `all` fillets the top perimeter of a plate (not the thickness edges or
-          the bottom). r must be less than the local wall thickness. On a 6 mm lid,
-          r=5 leaves a ~1 mm vertical band — that is correct, not a missing fillet.
-chamfer   { "op":"chamfer", "distance":<d>, "edges":"all"|[0,3,7] }
+fillet    { "op":"fillet", "radius":<r>, "edges":"all"|"top"|"longest"|[0,3,7] }
+          `all`/`top` fillets the top perimeter of a plate (not thickness edges).
+chamfer   { "op":"chamfer", "distance":<d>, "edges":"all"|"top"|"longest"|[0,3,7] }
 transform { "op":"transform", "translate":[x,y,z], "rotate":{"axis":[x,y,z],"angle":<deg>,"origin":[x,y,z]}, "scale":<s> }
 mirror    { "op":"mirror", "plane":"YZ"|"XZ"|"XY", "origin":[x,y,z], "fuse": true }
-          YZ flips X, XZ flips Y, XY flips Z. fuse:true unions the copy with the original.
-pattern   { "op":"pattern", "kind":"linear"|"circular", "count":<n≥2>, "spacing":<d>, "direction":[x,y,z],
-            "axis":"Z", "angle":<deg>, "center":[x,y,z] }
-shell     { "op":"shell", "thickness":<t>, "faces":"all"|[0] }
-          "all" (default) = closed hollow. Integer indices = faces to open.
+pattern   { "op":"pattern", "kind":"linear"|"circular", "count":<n≥2>, "spacing":<d>,
+            "direction":[x,y,z], "axis":"Z", "angle":<deg>, "center":[x,y,z],
+            "scope":"body"|"feature" }
+          scope "body" (default) patterns the whole solid.
+          scope "feature" re-applies the LAST cut/fuse/hole tool (bolt circles, hole grids).
+          Example bolt circle: hole at [20,0], then
+            { "op":"pattern", "scope":"feature", "kind":"circular", "count":6,
+              "center":[0,0,0], "axis":"Z", "angle":60 }
+shell     { "op":"shell", "thickness":<t>, "faces":"all"|[0]|"largest" }
+draft     { "op":"draft", "faces":"side"|[indices], "angle":<deg>, "direction":[0,0,1] }
+
+## Topology for agents
+Prefer semantic selectors over raw indices when possible:
+  face: "largest" | "top" | "bottom" | <index>
+  edges: "all" | "top" | "longest" | [indices]
+Call /api/topology with the current program when fillets/faces fail; it returns tagged faces/edges.
 
 ## How to build common shapes
 Stepped pyramid (square, stairs on every side, CENTERED):
@@ -176,6 +200,10 @@ Smooth circular pyramid / cone:  { "op":"cone", "d1":100, "d2":0, "height":60 }
 L-bracket / anything not a rectangle: use a closed polyline with negative AND positive points
   e.g. points [[0,0],[80,0],[80,10],[10,10],[10,50],[0,50]] then extrude. Center with transform if needed.
 
+Hole grid on a plate: one hole, then pattern scope=feature linear/circular.
+Pipe frame: pipe/sweep with a polyline path.
+Flange with bolt holes in one sketch: compound outer rect + hole circles, then extrude.
+
 ## Example — venturi / lathe tube (half-section on XZ, revolve around Z)
 {
   "units": "mm",
@@ -190,14 +218,15 @@ L-bracket / anything not a rectangle: use a closed polyline with negative AND po
   ]
 }
 
-## Example — centered mounting plate
+## Example — centered mounting plate with feature pattern
 {
   "units": "mm",
   "features": [
     { "op": "box", "size": [80, 40, 10], "centered": true },
     { "op": "hole", "diameter": 8, "depth": 15, "center": [-25, 0] },
-    { "op": "hole", "diameter": 8, "depth": 15, "center": [25, 0] },
-    { "op": "fillet", "radius": 3, "edges": "all" }
+    { "op": "pattern", "scope": "feature", "kind": "linear", "count": 2,
+      "spacing": 50, "direction": [1, 0, 0] },
+    { "op": "fillet", "radius": 3, "edges": "top" }
   ]
 }
 
@@ -409,6 +438,38 @@ struct GeminiCandidate {
 
 async fn health_handler() -> &'static str {
     "ok"
+}
+
+/// POST /api/topology — face/edge listing with semantic tags for the agent.
+async fn topology_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RunRequest>,
+) -> Json<serde_json::Value> {
+    let document = match scene_from_values(body.document, body.program) {
+        Ok(d) => d,
+        Err(e) => {
+            return Json(serde_json::json!({ "success": false, "error": e }));
+        }
+    };
+    let Some(body0) = document.bodies.first() else {
+        return Json(serde_json::json!({ "success": false, "error": "empty document" }));
+    };
+    let program = kernel::ir::CadProgram {
+        units: document.units.clone(),
+        features: body0.features.clone(),
+    };
+    let engine = state.engine;
+    let result = tokio::task::spawn_blocking(move || engine.list_topology(&program))
+        .await
+        .unwrap_or_else(|e| {
+            Err(kernel::engine::KernelError::InvalidState(format!(
+                "topology task panicked: {e}"
+            )))
+        });
+    match result {
+        Ok(report) => Json(serde_json::json!({ "success": true, "topology": report })),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+    }
 }
 
 /// POST /api/run
@@ -841,9 +902,13 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                     },
                 )
                 .await;
+                let topo_hint = topology_hint_for_document(&state.engine, &document).await;
                 let repair = format!(
                     "The geometry kernel rejected the program: {kern_err}. \
-                     Fix the CadProgram and return ONLY the corrected JSON object."
+                     Prefer face:\"largest\"|\"top\"|\"bottom\" and edges:\"top\"|\"longest\". \
+                     For hole grids use pattern with scope:\"feature\" after the first hole. \
+                     {topo_hint}\
+                     Fix the CadDocument and return ONLY the corrected JSON object."
                 );
                 contents.push(GeminiContent {
                     role: "model".to_string(),
@@ -1267,6 +1332,39 @@ fn compose_user_prompt(body: &ChatRequest) -> String {
     text
 }
 
+/// Best-effort topology summary for repair prompts (prefix of features that still build).
+async fn topology_hint_for_document(engine: &Engine, document: &CadDocument) -> String {
+    let Some(body) = document.bodies.first() else {
+        return String::new();
+    };
+    if body.features.len() < 2 {
+        return String::new();
+    }
+    // Drop the last feature — often the failing fillet/pattern — and query topology.
+    let mut features = body.features.clone();
+    features.pop();
+    let program = kernel::ir::CadProgram {
+        units: document.units.clone(),
+        features,
+    };
+    let engine = *engine;
+    let report = tokio::task::spawn_blocking(move || engine.list_topology(&program))
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+    match report {
+        Some(t) => format!(
+            "Topology hint (before last feature): faces={} edges={} largest_face={:?} top_face={:?} longest_edge={:?}. ",
+            t.summary.face_count,
+            t.summary.edge_count,
+            t.summary.largest_face,
+            t.summary.top_face,
+            t.summary.longest_edge
+        ),
+        None => String::new(),
+    }
+}
+
 fn scene_from_values(
     document: Option<serde_json::Value>,
     program: Option<serde_json::Value>,
@@ -1367,6 +1465,7 @@ async fn main() {
     let app = Router::new()
         .route("/api/health", get(health_handler))
         .route("/api/run", post(run_handler))
+        .route("/api/topology", post(topology_handler))
         .route("/api/export", post(export_handler))
         .route("/api/chat", post(chat_handler))
         .layer(cors)

@@ -20,9 +20,11 @@
 pub mod engine;
 pub mod export;
 pub mod ir;
+pub mod topology;
 
 pub use engine::{
     BodyOutput, DocumentOutput, Engine, ExportFormat, KernelError, MeshData, MetricsData,
     ModelOutput,
 };
 pub use ir::{CadBody, CadDocument, CadProgram, ValidationError};
+pub use topology::{EdgeInfo, FaceInfo, TopologyReport, TopologySummary};
