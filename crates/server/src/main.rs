@@ -54,10 +54,11 @@ Convert the user's description into a CadDocument: one or more independent bodie
   { "say": "<2–4 sentence summary>", "document": {
       "documentId": "<slug>",
       "units": "mm",
+      "parameters": { "plate_width": 80, "plate_depth": 40, "plate_thickness": 10 },
       "bodies": [
         { "bodyId": "<slug>", "name": "<label>", "visible": true,
           "transform": { "position": [0,0,0], "rotation": [0,0,0] },
-          "features": [ { "op": "box", ... } ],
+          "features": [ { "op": "box", "size": ["plate_width", "plate_depth", "plate_thickness"] } ],
           "references": [] }
       ]
     } }
@@ -67,6 +68,14 @@ Convert the user's description into a CadDocument: one or more independent bodie
 - Legacy single-solid `{ "say", "program": { "units", "features" } }` is allowed and becomes one body.
 - `say` is a 2–4 sentence summary of what you built. No JSON, no op names. Plain English.
 - Feature ops still use `"op"` (not `"type"`). Sizes > 0. Coordinates MAY be negative.
+
+## Parameters (CRITICAL for verification)
+- Put every important dimension in `"parameters": { "name": number, ... }` at document root.
+- Reference parameters by name (string) anywhere a number is allowed:
+  `"size": ["plate_width", "plate_depth", "plate_thickness"]`, `"depth": "plate_thickness"`, `"diameter": "hole_dia"`.
+- Use descriptive snake_case names (`plate_width`, `hole_dia`, `boss_height`). All values > 0.
+- When editing one dimension, update the parameter value — features should keep referencing the name.
+- Deterministic verification checks each parameter against measured geometry; do not rely on chat prose for sizes.
 
 ## Multi-body (CRITICAL)
 - Assemblies and multi-part designs MUST be separate bodies (base plate, bracket, shaft, fasteners, lid, …) — never one fused blob.
@@ -371,7 +380,10 @@ enum ChatSseEvent {
     CalculatingStart,
     CalculatingDone { ms: u64 },
     VerifyingStart,
-    VerifyingDone { ms: u64 },
+    VerifyingDone {
+        ms: u64,
+        verification: VerificationPayload,
+    },
     Result {
         success: bool,
         message: String,
@@ -817,20 +829,17 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
 
                 emit(&tx, ChatSseEvent::VerifyingStart).await;
                 let verify_start = Instant::now();
-                let verdict = verify_against_request(
-                    &state,
-                    &body.message,
-                    &document,
-                    &output,
-                )
-                .await;
+                let report = verify::verify_document(&body.message, &document, &output);
                 emit(
                     &tx,
                     ChatSseEvent::VerifyingDone {
                         ms: elapsed_ms(verify_start),
+                        verification: verification_payload(&report),
                     },
                 )
                 .await;
+                let verdict = verify_against_report(&state, &body.message, &document, &output, &report)
+                    .await;
 
                 match verdict {
                     VerifyVerdict::Mismatch { reason, document: Some(fixed) } => {
@@ -1056,14 +1065,14 @@ struct VerifyJson {
     body: Option<serde_json::Value>,
 }
 
-/// Deterministic verification first (fail closed), then optional Gemini prose.
-async fn verify_against_request(
+/// Optional Gemini prose after deterministic checks already passed.
+async fn verify_against_report(
     state: &AppState,
     user_message: &str,
     document: &CadDocument,
     output: &DocumentOutput,
+    report: &VerificationReport,
 ) -> VerifyVerdict {
-    let report = verify::verify_document(user_message, document, output);
     if !report.passed {
         tracing::warn!("deterministic verify failed: {}", report.summary());
         return VerifyVerdict::Mismatch {
@@ -1333,6 +1342,7 @@ fn parse_agent_payload(
         let mut doc = current.cloned().unwrap_or_else(|| CadDocument {
             document_id: "document".into(),
             units: kernel::ir::Units::Mm,
+            parameters: Default::default(),
             bodies: vec![],
         });
         doc.replace_body(patch);

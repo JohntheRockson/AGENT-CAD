@@ -132,60 +132,63 @@ pub fn verify_structure(document: &CadDocument, output: &DocumentOutput) -> Veri
         ));
     }
 
+    checks.extend(verify_parameters(document, output));
+
     let passed = checks.iter().all(|c| c.passed);
     VerificationReport { passed, checks }
 }
 
-/// Parse numeric requirements from the user's natural-language request and
-/// compare against built geometry. Skips dimension checks when none are found.
-pub fn verify_user_request(
-    user_message: &str,
-    document: &CadDocument,
-    output: &DocumentOutput,
-) -> VerificationReport {
-    let mut report = verify_structure(document, output);
-    let ctx = UnitContext::new(document.units.clone());
+/// Compare named `parameters` against measured geometry (no natural-language parsing).
+pub fn verify_parameters(document: &CadDocument, output: &DocumentOutput) -> Vec<VerificationCheck> {
+    if document.parameters.is_empty() {
+        return Vec::new();
+    }
 
-    if let Some(spec) = parse_size_triple(user_message, &document.units) {
-        let [xmin, ymin, zmin, xmax, ymax, zmax] = output.metrics.bbox;
-        let actual = sort3([(xmax - xmin).abs(), (ymax - ymin).abs(), (zmax - zmin).abs()]);
-        let expected = sort3(spec);
-        let ok = actual
+    let ctx = UnitContext::new(document.units);
+    let [xmin, ymin, zmin, xmax, ymax, zmax] = output.metrics.bbox;
+    let dx = (xmax - xmin).abs();
+    let dy = (ymax - ymin).abs();
+    let dz = (zmax - zmin).abs();
+    let extents = [dx, dy, dz];
+
+    let mut checks = Vec::new();
+    let mut unmatched_extents = extents.to_vec();
+
+    for (name, expected) in &document.parameters {
+        let matched_idx = unmatched_extents
             .iter()
-            .zip(expected.iter())
-            .all(|(a, e)| ctx.tolerant_eq(*e, *a));
-        report.checks.push(check(
-            "user_bbox_size",
-            ok,
+            .position(|ext| ctx.tolerant_eq(*expected, *ext));
+
+        let passed = matched_idx.is_some();
+        let message = if passed {
+            let ext = unmatched_extents[matched_idx.unwrap()];
             format!(
-                "user asked for ~{:.1}×{:.1}×{:.1} {}, got {:.1}×{:.1}×{:.1} {}",
-                expected[0],
-                expected[1],
-                expected[2],
+                "parameter `{name}` = {:.1} {} matches bbox extent {:.1} {}",
+                expected,
                 ctx.units.length_suffix(),
-                actual[0],
-                actual[1],
-                actual[2],
+                ext,
                 ctx.units.length_suffix()
-            ),
-        ));
+            )
+        } else {
+            format!(
+                "parameter `{name}` = {:.1} {} — no bbox extent in [{:.1}, {:.1}, {:.1}] {}",
+                expected,
+                ctx.units.length_suffix(),
+                dx,
+                dy,
+                dz,
+                ctx.units.length_suffix()
+            )
+        };
+
+        checks.push(check(format!("param_{name}"), passed, message));
+
+        if let Some(i) = matched_idx {
+            unmatched_extents.remove(i);
+        }
     }
 
-    if let Some(n) = parse_body_count_hint(user_message) {
-        let visible = output
-            .bodies
-            .iter()
-            .filter(|b| b.visible && !b.suppressed)
-            .count();
-        report.checks.push(check(
-            "user_body_count",
-            visible >= n,
-            format!("user implied ≥{n} part(s), got {visible} visible bod(ies)"),
-        ));
-    }
-
-    report.passed = report.checks.iter().all(|c| c.passed);
-    report
+    checks
 }
 
 /// Full verification used by the agent repair loop.
@@ -194,7 +197,53 @@ pub fn verify_document(
     document: &CadDocument,
     output: &DocumentOutput,
 ) -> VerificationReport {
-    verify_user_request(user_message, document, output)
+    let mut report = verify_structure(document, output);
+
+    // Natural-language size hints only when the document has no parameter table.
+    if document.parameters.is_empty() {
+        let ctx = UnitContext::new(document.units.clone());
+
+        if let Some(spec) = parse_size_triple(user_message, &document.units) {
+            let [xmin, ymin, zmin, xmax, ymax, zmax] = output.metrics.bbox;
+            let actual = sort3([(xmax - xmin).abs(), (ymax - ymin).abs(), (zmax - zmin).abs()]);
+            let expected = sort3(spec);
+            let ok = actual
+                .iter()
+                .zip(expected.iter())
+                .all(|(a, e)| ctx.tolerant_eq(*e, *a));
+            report.checks.push(check(
+                "user_bbox_size",
+                ok,
+                format!(
+                    "user asked for ~{:.1}×{:.1}×{:.1} {}, got {:.1}×{:.1}×{:.1} {}",
+                    expected[0],
+                    expected[1],
+                    expected[2],
+                    ctx.units.length_suffix(),
+                    actual[0],
+                    actual[1],
+                    actual[2],
+                    ctx.units.length_suffix()
+                ),
+            ));
+        }
+
+        if let Some(n) = parse_body_count_hint(user_message) {
+            let visible = output
+                .bodies
+                .iter()
+                .filter(|b| b.visible && !b.suppressed)
+                .count();
+            report.checks.push(check(
+                "user_body_count",
+                visible >= n,
+                format!("user implied ≥{n} part(s), got {visible} visible bod(ies)"),
+            ));
+        }
+    }
+
+    report.passed = report.checks.iter().all(|c| c.passed);
+    report
 }
 
 /// Verify a single-body program (tests / legacy `/api/run` with CadProgram).
@@ -219,7 +268,7 @@ pub fn verify_program(
         }],
         metrics: metrics.clone(),
     };
-    verify_user_request(user_message, &doc, &output)
+    verify_document(user_message, &doc, &output)
 }
 
 fn sort3(v: [f64; 3]) -> [f64; 3] {
@@ -399,11 +448,13 @@ mod tests {
     use super::*;
     use crate::engine::Engine;
     use crate::ir::*;
+    use std::collections::BTreeMap;
 
     fn box_doc(w: f64, h: f64, d: f64, units: Units) -> CadDocument {
         CadDocument {
             document_id: "t".into(),
             units,
+            parameters: BTreeMap::new(),
             bodies: vec![CadBody {
                 body_id: "b".into(),
                 name: "B".into(),
@@ -432,7 +483,7 @@ mod tests {
     fn user_size_triple_mm() {
         let doc = box_doc(80.0, 40.0, 10.0, Units::Mm);
         let out = Engine::default().execute_document(&doc).unwrap();
-        let report = verify_user_request(
+        let report = verify_document(
             "Make a plate 80 x 40 x 10 mm",
             &doc,
             &out,
@@ -441,10 +492,68 @@ mod tests {
     }
 
     #[test]
+    fn parameters_match_bbox() {
+        let mut params = BTreeMap::new();
+        params.insert("plate_width".into(), 80.0);
+        params.insert("plate_depth".into(), 40.0);
+        params.insert("plate_thickness".into(), 10.0);
+        let doc = CadDocument {
+            document_id: "t".into(),
+            units: Units::Mm,
+            parameters: params,
+            bodies: vec![CadBody {
+                body_id: "b".into(),
+                name: "B".into(),
+                visible: true,
+                suppressed: false,
+                transform: BodyTransform::default(),
+                features: vec![Feature::Box(BoxOp {
+                    size: [80.0, 40.0, 10.0],
+                    at: [0.0; 3],
+                    centered: true,
+                })],
+                references: vec![],
+            }],
+        };
+        let out = Engine::default().execute_document(&doc).unwrap();
+        let report = verify_document("", &doc, &out);
+        assert!(report.passed, "{}", report.summary());
+        assert!(report.checks.iter().any(|c| c.name == "param_plate_width"));
+    }
+
+    #[test]
+    fn parameter_mismatch_fails() {
+        let mut params = BTreeMap::new();
+        params.insert("plate_width".into(), 100.0);
+        let doc = CadDocument {
+            document_id: "t".into(),
+            units: Units::Mm,
+            parameters: params,
+            bodies: vec![CadBody {
+                body_id: "b".into(),
+                name: "B".into(),
+                visible: true,
+                suppressed: false,
+                transform: BodyTransform::default(),
+                features: vec![Feature::Box(BoxOp {
+                    size: [80.0, 40.0, 10.0],
+                    at: [0.0; 3],
+                    centered: true,
+                })],
+                references: vec![],
+            }],
+        };
+        let out = Engine::default().execute_document(&doc).unwrap();
+        let report = verify_document("", &doc, &out);
+        assert!(!report.passed);
+        assert!(report.summary().contains("param_plate_width"));
+    }
+
+    #[test]
     fn user_size_triple_inches() {
         let doc = box_doc(2.0, 2.0, 1.0, Units::Inch);
         let out = Engine::default().execute_document(&doc).unwrap();
-        let report = verify_user_request(
+        let report = verify_document(
             "Block 2 x 2 x 1 inches",
             &doc,
             &out,
@@ -456,7 +565,7 @@ mod tests {
     fn user_size_mismatch_fails() {
         let doc = box_doc(50.0, 50.0, 10.0, Units::Mm);
         let out = Engine::default().execute_document(&doc).unwrap();
-        let report = verify_user_request(
+        let report = verify_document(
             "plate 80 x 40 x 10 mm",
             &doc,
             &out,

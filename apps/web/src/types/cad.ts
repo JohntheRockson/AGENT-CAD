@@ -273,6 +273,8 @@ export interface CadBody {
 export interface CadDocument {
   documentId: string
   units: Units
+  /** Named scalar dimensions; feature fields may reference these by name. */
+  parameters?: Record<string, number>
   bodies: CadBody[]
 }
 
@@ -338,6 +340,8 @@ export interface ActivityStep {
   startedAt: number
   ms?:       number
   detail?:   string
+  /** Deterministic geometry checks (verifying step). */
+  checks?:   VerificationCheck[]
 }
 
 export interface ChatMessage {
@@ -358,7 +362,7 @@ export type ChatStreamEvent =
   | { type: 'calculating_start' }
   | { type: 'calculating_done'; ms: number }
   | { type: 'verifying_start' }
-  | { type: 'verifying_done'; ms: number }
+  | { type: 'verifying_done'; ms: number; verification: VerificationReport }
   | {
       type:      'result'
       success:   boolean

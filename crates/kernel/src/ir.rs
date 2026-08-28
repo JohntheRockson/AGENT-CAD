@@ -5,6 +5,8 @@
 //! reaches for non-existent methods). Everything is schema-validated by serde
 //! before touching the geometry kernel.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -26,6 +28,10 @@ pub struct CadDocument {
     #[serde(default = "default_document_id")]
     pub document_id: String,
     pub units: Units,
+    /// Named scalar dimensions (mm or in per `units`). Feature fields may reference
+    /// these by name instead of embedding literals.
+    #[serde(default)]
+    pub parameters: BTreeMap<String, f64>,
     pub bodies: Vec<CadBody>,
 }
 
@@ -81,6 +87,7 @@ impl CadDocument {
         CadDocument {
             document_id: default_document_id(),
             units: program.units,
+            parameters: BTreeMap::new(),
             bodies: vec![CadBody {
                 body_id: "body_main".to_string(),
                 name: "Body".to_string(),
@@ -94,16 +101,32 @@ impl CadDocument {
     }
 
     /// Accept a document `{ bodies: [...] }` or a legacy program `{ features: [...] }`.
+    /// Parameter references in numeric fields are resolved using `parameters`.
     pub fn from_json_value(value: serde_json::Value) -> Result<Self, String> {
-        if value.get("bodies").is_some() {
-            serde_json::from_value(value).map_err(|e| e.to_string())
-        } else if value.get("features").is_some() {
-            let program: CadProgram =
-                serde_json::from_value(value).map_err(|e| e.to_string())?;
-            Ok(Self::from_program(program))
-        } else {
-            Err("expected a CadDocument (bodies) or CadProgram (features)".into())
+        let parameters: BTreeMap<String, f64> = value
+            .get("parameters")
+            .and_then(|p| serde_json::from_value(p.clone()).ok())
+            .unwrap_or_default();
+
+        let mut resolved = value;
+        if !parameters.is_empty() {
+            crate::params::substitute_refs(&mut resolved, &parameters)?;
         }
+
+        let mut doc = if resolved.get("bodies").is_some() {
+            serde_json::from_value(resolved).map_err(|e| e.to_string())?
+        } else if resolved.get("features").is_some() {
+            let program: CadProgram =
+                serde_json::from_value(resolved).map_err(|e| e.to_string())?;
+            Self::from_program(program)
+        } else {
+            return Err("expected a CadDocument (bodies) or CadProgram (features)".into());
+        };
+
+        if !parameters.is_empty() {
+            doc.parameters = parameters;
+        }
+        Ok(doc)
     }
 
     pub fn as_program(&self) -> CadProgram {
@@ -130,6 +153,7 @@ impl CadDocument {
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
+        crate::params::validate_parameters(&self.parameters)?;
         if self.bodies.is_empty() {
             return Err(ValidationError::EmptyFeatures);
         }
@@ -1214,6 +1238,23 @@ mod tests {
         assert!(matches!(prog.features[1], Feature::Loft(_)));
         assert!(matches!(prog.features[2], Feature::Mirror(_)));
         assert!(matches!(prog.features[3], Feature::Pattern(_)));
+    }
+
+    #[test]
+    fn from_json_resolves_parameter_refs() {
+        let json = serde_json::json!({
+            "units": "mm",
+            "parameters": { "w": 30.0, "d": 20.0, "t": 8.0 },
+            "bodies": [{
+                "bodyId": "b",
+                "features": [{ "op": "box", "size": ["w", "d", "t"], "centered": true }]
+            }]
+        });
+        let doc = CadDocument::from_json_value(json).unwrap();
+        doc.validate().unwrap();
+        let out = crate::engine::Engine::default().execute_document(&doc).unwrap();
+        assert!(out.metrics.volume > 0.0);
+        assert_eq!(doc.parameters.get("w"), Some(&30.0));
     }
 
     #[test]

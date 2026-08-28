@@ -381,9 +381,21 @@ export const useCadStore = create<CadStore>((set, get) => ({
         case 'verifying_start':
           upsertStep('verifying', { status: 'running', startedAt: Date.now() })
           break
-        case 'verifying_done':
-          upsertStep('verifying', { status: 'done', ms: ev.ms })
+        case 'verifying_done': {
+          const v = ev.verification
+          const failed = v.checks.filter((c) => !c.passed).length
+          const summary =
+            failed === 0
+              ? `All ${v.checks.length} checks passed`
+              : `${failed} of ${v.checks.length} check(s) failed`
+          upsertStep('verifying', {
+            status: 'done',
+            ms:     ev.ms,
+            checks: v.checks,
+            detail: summary,
+          })
           break
+        }
         case 'result': {
           gotResult = true
           if (ev.success && (ev.program || ev.mesh || ev.bodies?.length)) {

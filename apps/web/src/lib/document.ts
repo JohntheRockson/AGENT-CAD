@@ -44,6 +44,7 @@ export function parseScene(raw: unknown): CadDocument {
     return {
       documentId: raw.documentId || 'document',
       units: raw.units ?? 'mm',
+      parameters: raw.parameters,
       bodies: raw.bodies.map(normalizeBody),
     }
   }
