@@ -73,6 +73,33 @@ export function parseSceneJson(text: string): CadDocument {
   return parseScene(JSON.parse(text) as unknown)
 }
 
+export function setDocumentParameter(
+  doc: CadDocument,
+  name: string,
+  value: number,
+): CadDocument {
+  return {
+    ...doc,
+    parameters: {
+      ...(doc.parameters ?? {}),
+      [name]: value,
+    },
+  }
+}
+
+export function parameterEntries(doc: CadDocument): Array<[string, number]> {
+  const p = doc.parameters ?? {}
+  return Object.entries(p).sort(([a], [b]) => a.localeCompare(b))
+}
+
+export function formatParameterName(name: string): string {
+  return name.replace(/_/g, ' ')
+}
+
+export function unitSuffix(units: CadDocument['units']): string {
+  return units === 'in' ? 'in' : 'mm'
+}
+
 export function prettyDocument(doc: CadDocument): string {
   return JSON.stringify(doc, null, 2)
 }

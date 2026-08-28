@@ -88,7 +88,12 @@ export async function streamChat(
   message: string,
   history: Array<{ role: string; content: string }>,
   onEvent: (ev: ChatStreamEvent) => void,
-  extras?: { document?: CadDocument; targetBodyId?: string | null },
+  extras?: {
+    document?: CadDocument
+    targetBodyId?: string | null
+    timelineStepIndex?: number
+    timelineStepLabel?: string
+  },
 ): Promise<void> {
   const res = await fetch(`${BASE}/chat`, {
     method:  'POST',
@@ -101,6 +106,8 @@ export async function streamChat(
       history,
       document: extras?.document,
       targetBodyId: extras?.targetBodyId || undefined,
+      timelineStepIndex: extras?.timelineStepIndex,
+      timelineStepLabel: extras?.timelineStepLabel,
     }),
   })
   if (!res.ok || !res.body) {

@@ -6,13 +6,21 @@ import type {
   CadDocument,
   ChatMessage,
   ChatStreamEvent,
+  DocumentSnapshot,
   ExportFormat,
   MeshData,
   MetricsData,
+  TimelineSource,
 } from '../types/cad'
 import { runProgram, exportModel, streamChat } from '../lib/api'
 import { EXPORT_KINDS, pickSaveTarget, writeSaveTarget } from '../lib/saveFile'
-import { parseScene, parseSceneJson, prettyDocument } from '../lib/document'
+import {
+  parseScene,
+  parseSceneJson,
+  prettyDocument,
+  setDocumentParameter,
+} from '../lib/document'
+import { makeSnapshot, truncateTimelineLabel } from '../lib/timeline'
 
 const EMPTY_IR = ''
 
@@ -71,10 +79,18 @@ interface CadStore {
   messages:      ChatMessage[]
   isChatLoading: boolean
 
+  timeline:      DocumentSnapshot[]
+  timelineIndex: number
+
   showJson: boolean
   setShowJson: (show: boolean) => void
 
-  runGeometry:     () => Promise<void>
+  runGeometry:     (opts?: RunGeometryOptions) => Promise<void>
+  setParameter:    (name: string, value: number) => Promise<void>
+  pushTimelineSnapshot: (label: string, source: TimelineSource) => void
+  restoreTimelineIndex: (index: number) => void
+  branchTimeline:  () => void
+  atTimelineTip:   () => boolean
   downloadExport:  (format: ExportFormat) => Promise<void>
   sendChatMessage: (text: string) => Promise<void>
   clearError:      () => void
@@ -86,6 +102,15 @@ interface CadStore {
   isolateBody: (id: string | null) => void
   renameBody: (id: string, name: string) => void
   deleteBody: (id: string) => void
+}
+
+interface RunGeometryOptions {
+  label?: string
+  source?: TimelineSource
+  /** Skip branching (caller already branched). */
+  skipBranch?: boolean
+  /** Skip recording a timeline snapshot after success. */
+  skipSnapshot?: boolean
 }
 
 // ── Zustand store ─────────────────────────────────────────────────────────────
@@ -109,8 +134,67 @@ export const useCadStore = create<CadStore>((set, get) => ({
   messages:      [],
   isChatLoading: false,
 
+  timeline:      [],
+  timelineIndex: -1,
+
   showJson: false,
   setShowJson: (show) => set({ showJson: show }),
+
+  atTimelineTip: () => {
+    const { timeline, timelineIndex } = get()
+    return timeline.length === 0 || timelineIndex >= timeline.length - 1
+  },
+
+  branchTimeline: () => {
+    const { timelineIndex, timeline } = get()
+    if (timelineIndex < 0 || timelineIndex >= timeline.length - 1) return
+    set({ timeline: timeline.slice(0, timelineIndex + 1) })
+  },
+
+  pushTimelineSnapshot: (label, source) => {
+    const s = get()
+    if (!s.irCode.trim()) return
+    const snap = makeSnapshot(label, source, {
+      irCode:   s.irCode,
+      bodies:   s.bodies,
+      meshData: s.meshData,
+      metrics:  s.metrics,
+    })
+    set((state) => {
+      const base =
+        state.timelineIndex >= 0
+          ? state.timeline.slice(0, state.timelineIndex + 1)
+          : []
+      const next = [...base, snap]
+      return { timeline: next, timelineIndex: next.length - 1 }
+    })
+  },
+
+  restoreTimelineIndex: (index) => {
+    const snap = get().timeline[index]
+    if (!snap) return
+    set({
+      timelineIndex: index,
+      irCode:        snap.irCode,
+      bodies:        snap.bodies,
+      meshData:      snap.meshData,
+      metrics:       snap.metrics,
+      runError:      null,
+    })
+  },
+
+  setParameter: async (name, value) => {
+    get().branchTimeline()
+    const doc = currentDocument(get().irCode)
+    if (!doc) return
+    const updated = setDocumentParameter(doc, name, value)
+    set({ irCode: prettyDocument(updated) })
+    await get().runGeometry({
+      label:      `${name} → ${value}`,
+      source:     'parameter',
+      skipBranch: true,
+    })
+  },
 
   clearError: () => set({ runError: null }),
 
@@ -158,11 +242,14 @@ export const useCadStore = create<CadStore>((set, get) => ({
 
   // ── Run geometry ────────────────────────────────────────────────────────────
 
-  runGeometry: async () => {
+  runGeometry: async (opts) => {
     const { irCode } = get()
     if (!irCode.trim()) {
       set({ runError: 'No CAD program to run. Describe a part in chat, or paste JSON here.' })
       return
+    }
+    if (!opts?.skipBranch) {
+      get().branchTimeline()
     }
     set({ isRunning: true, runError: null })
 
@@ -181,6 +268,12 @@ export const useCadStore = create<CadStore>((set, get) => ({
       const resp = await runProgram(document)
       if (resp.success && (resp.bodies?.length || resp.mesh)) {
         applyRunPayload(set, resp, { isRunning: false, irCode: prettyDocument(document) })
+        if (!opts?.skipSnapshot) {
+          get().pushTimelineSnapshot(
+            opts?.label ?? 'Manual rebuild',
+            opts?.source ?? 'manual',
+          )
+        }
       } else {
         set({
           isRunning: false,
@@ -260,7 +353,8 @@ export const useCadStore = create<CadStore>((set, get) => ({
   // ── Chat ─────────────────────────────────────────────────────────────────────
 
   sendChatMessage: async (text) => {
-    const { messages, irCode, selectedBodyId } = get()
+    const { messages, irCode, selectedBodyId, timeline, timelineIndex } = get()
+    get().branchTimeline()
     const document = currentDocument(irCode)
 
     const history = messages
@@ -409,6 +503,10 @@ export const useCadStore = create<CadStore>((set, get) => ({
             const renderStart = performance.now()
             upsertStep('rendering', { status: 'running', startedAt: Date.now() })
             applyRunPayload(set, ev, { irCode: newIrCode })
+            get().pushTimelineSnapshot(
+              truncateTimelineLabel(`Agent: ${text}`),
+              'agent',
+            )
             requestAnimationFrame(() => {
               requestAnimationFrame(() => {
                 upsertStep('rendering', {
@@ -436,9 +534,12 @@ export const useCadStore = create<CadStore>((set, get) => ({
     }
 
     try {
+      const step = timeline[timelineIndex]
       await streamChat(text, history, handleEvent, {
         document: document ?? undefined,
         targetBodyId: selectedBodyId,
+        timelineStepIndex: step && timelineIndex >= 0 ? timelineIndex : undefined,
+        timelineStepLabel: step?.label,
       })
       if (!gotResult) {
         patchAssistant((m) =>

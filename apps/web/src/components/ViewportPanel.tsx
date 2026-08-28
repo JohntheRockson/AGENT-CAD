@@ -6,6 +6,8 @@ import { Loader2, Box } from 'lucide-react'
 import { useCadStore } from '../store/useStore'
 import { bodyColor } from '../lib/document'
 import { Outliner } from './Outliner'
+import { ParametersPanel } from './ParametersPanel'
+import { HistoryTimeline } from './HistoryTimeline'
 import type { BodyInstance, MeshData, MetricsData } from '../types/cad'
 
 // ── CAD mesh with edge overlay ────────────────────────────────────────────────
@@ -220,13 +222,16 @@ export function ViewportPanel() {
   const isolatedBodyId  = useCadStore((s) => s.isolatedBodyId)
   const selectBody      = useCadStore((s) => s.selectBody)
 
+  const timelineLen     = useCadStore((s) => s.timeline.length)
+
   const selected = bodies.find((b) => b.bodyId === selectedBodyId)
   const hasSolid = bodies.some((b) => b.visible && !b.suppressed) || !!meshData
   const pointerDown = useRef({ x: 0, y: 0 })
+  const bottomPad = timelineLen > 0 ? 'pb-[58px]' : ''
 
   return (
     <div
-      className="relative h-full w-full bg-[#0a0e14]"
+      className={`relative h-full w-full bg-[#0a0e14] ${bottomPad}`}
       onPointerDown={(e) => {
         pointerDown.current = { x: e.clientX, y: e.clientY }
       }}
@@ -254,6 +259,7 @@ export function ViewportPanel() {
       </div>
 
       <Outliner />
+      <ParametersPanel />
 
       <Canvas
         camera={{ position: [120, -140, 90], fov: 45, up: [0, 0, 1] }}
@@ -279,6 +285,8 @@ export function ViewportPanel() {
           <p className="text-xs text-muted">Describe a part in chat to render it</p>
         </div>
       )}
+
+      <HistoryTimeline />
     </div>
   )
 }

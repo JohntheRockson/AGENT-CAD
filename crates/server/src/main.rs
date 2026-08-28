@@ -353,11 +353,16 @@ struct ChatRequest {
     /// Prior conversation turns sent by the frontend for multi-turn context.
     #[serde(default)]
     history: Vec<HistoryMessage>,
-    /// Current multi-body document so the agent can patch one body.
-    #[serde(default)]
-    document: Option<CadDocument>,
-    #[serde(default, alias = "targetBodyId")]
-    target_body_id: Option<String>,
+  /// Current multi-body document so the agent can patch one body.
+  #[serde(default)]
+  document: Option<CadDocument>,
+  #[serde(default, alias = "targetBodyId")]
+  target_body_id: Option<String>,
+  /// When the user scrubbed the design timeline, this is the active step index.
+  #[serde(default, alias = "timelineStepIndex")]
+  timeline_step_index: Option<u32>,
+  #[serde(default, alias = "timelineStepLabel")]
+  timeline_step_label: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -1356,6 +1361,12 @@ fn parse_agent_payload(
 
 fn compose_user_prompt(body: &ChatRequest) -> String {
     let mut text = body.message.clone();
+    if let (Some(idx), Some(label)) = (body.timeline_step_index, body.timeline_step_label.as_deref()) {
+        text.push_str(&format!(
+            "\n\n[AgentCAD] The user is viewing design history step {idx} (\"{label}\"). \
+             Edit THIS document state; later timeline steps will be discarded after your change.\n"
+        ));
+    }
     let Some(doc) = body.document.as_ref() else {
         return text;
     };

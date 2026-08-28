@@ -278,6 +278,21 @@ export interface CadDocument {
   bodies: CadBody[]
 }
 
+// ── Design timeline (parametric history) ─────────────────────────────────────
+
+export type TimelineSource = 'agent' | 'parameter' | 'manual' | 'restore'
+
+export interface DocumentSnapshot {
+  id: string
+  label: string
+  source: TimelineSource
+  timestamp: number
+  irCode: string
+  bodies: BodyInstance[]
+  meshData: MeshData | null
+  metrics: MetricsData | null
+}
+
 export interface BodyInstance {
   bodyId: string
   name: string
