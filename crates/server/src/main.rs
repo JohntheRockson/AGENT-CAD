@@ -5,6 +5,7 @@
 //! - `POST /api/export` – execute a CadProgram, stream back a binary file
 //! - `POST /api/chat`   – natural language → Gemini → CadProgram → mesh (with repair loop)
 //! - `POST /api/topology` – list faces/edges with semantic tags for agent selection
+//! - `POST /api/verify`  – deterministic structural checks (no LLM)
 //! - `GET  /api/health` – liveness probe
 //!
 //! # Geometry backend
@@ -34,7 +35,8 @@ use axum::{
 use bytes::Bytes;
 use kernel::{
     engine::{DocumentOutput, Engine, ExportFormat, MetricsData},
-    ir::{CadBody, CadDocument},
+    ir::{CadBody, CadDocument, Units},
+    verify::{self, VerificationReport},
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
@@ -272,6 +274,8 @@ struct RunResponse {
     mesh: Option<MeshPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics: Option<MetricsPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<VerificationPayload>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     bodies: Vec<BodyPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,10 +306,25 @@ struct MeshPayload {
 #[derive(Serialize)]
 struct MetricsPayload {
     volume: f64,
-    /// [xmin, ymin, zmin, xmax, ymax, zmax]
+    /// [xmin, ymin, zmin, xmax, ymax, zmax] in document units
     bbox: [f64; 6],
     surface_area: f64,
     is_solid: bool,
+    /// Linear/volume values are expressed in these units (not cosmetic labels).
+    units: String,
+}
+
+#[derive(Serialize)]
+struct VerificationPayload {
+    passed: bool,
+    checks: Vec<VerificationCheckPayload>,
+}
+
+#[derive(Serialize)]
+struct VerificationCheckPayload {
+    name: String,
+    passed: bool,
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -440,6 +459,39 @@ async fn health_handler() -> &'static str {
     "ok"
 }
 
+/// POST /api/verify — deterministic structural checks (no LLM).
+async fn verify_handler(
+    Json(body): Json<RunRequest>,
+) -> Json<serde_json::Value> {
+    let document = match scene_from_values(body.document, body.program) {
+        Ok(d) => d,
+        Err(e) => {
+            return Json(serde_json::json!({ "success": false, "error": e }));
+        }
+    };
+    let engine = Engine::new();
+    let document_for_kernel = document.clone();
+    let result = tokio::task::spawn_blocking(move || engine.execute_document(&document_for_kernel))
+        .await
+        .unwrap_or_else(|e| {
+            Err(kernel::engine::KernelError::InvalidState(format!(
+                "verify task panicked: {e}"
+            )))
+        });
+    match result {
+        Ok(output) => {
+            let report = verify::verify_structure(&document, &output);
+            Json(serde_json::json!({
+                "success": true,
+                "passed": report.passed,
+                "verification": verification_payload(&report),
+                "metrics": metrics_payload(&output.metrics, &document.units),
+            }))
+        }
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
 /// POST /api/topology — face/edge listing with semantic tags for the agent.
 async fn topology_handler(
     State(state): State<Arc<AppState>>,
@@ -486,6 +538,7 @@ async fn run_handler(
                 success: false,
                 mesh: None,
                 metrics: None,
+                verification: None,
                 bodies: vec![],
                 error: Some(e),
             })
@@ -493,8 +546,10 @@ async fn run_handler(
     };
 
     let engine = state.engine;
+    let units = document.units;
     let started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || engine.execute_document(&document))
+    let document_for_kernel = document.clone();
+    let result = tokio::task::spawn_blocking(move || engine.execute_document(&document_for_kernel))
         .await
         .unwrap_or_else(|e| {
             Err(kernel::engine::KernelError::InvalidState(format!(
@@ -507,11 +562,15 @@ async fn run_handler(
     );
 
     match result {
-        Ok(output) => Json(document_run_response(output)),
+        Ok(output) => {
+            let report = verify::verify_structure(&document, &output);
+            Json(document_run_response(output, &units, Some(&report)))
+        }
         Err(e) => Json(RunResponse {
             success: false,
             mesh: None,
             metrics: None,
+            verification: None,
             bodies: vec![],
             error: Some(e.to_string()),
         }),
@@ -762,7 +821,7 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                     &state,
                     &body.message,
                     &document,
-                    &output.metrics,
+                    &output,
                 )
                 .await;
                 emit(
@@ -831,7 +890,15 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                                         "Updated the model after checking it against your request."
                                             .to_string()
                                     });
-                                emit_success(&tx, message, program_val, output, attempt).await;
+                                emit_success(
+                                    &tx,
+                                    message,
+                                    program_val,
+                                    output,
+                                    &fixed.units,
+                                    attempt,
+                                )
+                                .await;
                                 return;
                             }
                             Err(kern_err) => {
@@ -880,13 +947,21 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                         });
                         continue;
                     }
-                    VerifyVerdict::Ok { say: verified_say } | VerifyVerdict::Skipped { say: verified_say } => {
+                    VerifyVerdict::Ok { say: verified_say } => {
                         let program_val = serde_json::to_value(&document).unwrap_or_default();
                         let message = verified_say
                             .or(say)
                             .filter(|s| !s.trim().is_empty())
                             .unwrap_or_else(|| "Updated the model.".to_string());
-                        emit_success(&tx, message, program_val, output, attempt).await;
+                        emit_success(
+                            &tx,
+                            message,
+                            program_val,
+                            output,
+                            &document.units,
+                            attempt,
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -938,6 +1013,7 @@ async fn emit_success(
     message: String,
     program_val: serde_json::Value,
     output: DocumentOutput,
+    units: &Units,
     attempts: u32,
 ) {
     let combined = output.clone().into_model_output().ok();
@@ -948,8 +1024,8 @@ async fn emit_success(
             message,
             program: Some(program_val),
             mesh: combined.as_ref().map(|o| mesh_payload(&o.mesh)),
-            metrics: Some(metrics_payload(&output.metrics)),
-            bodies: body_payloads(&output),
+            metrics: Some(metrics_payload(&output.metrics, units)),
+            bodies: body_payloads(&output, units),
             error: None,
             attempts,
         },
@@ -959,7 +1035,6 @@ async fn emit_success(
 
 enum VerifyVerdict {
     Ok { say: Option<String> },
-    Skipped { say: Option<String> },
     Mismatch {
         reason: String,
         document: Option<CadDocument>,
@@ -981,40 +1056,38 @@ struct VerifyJson {
     body: Option<serde_json::Value>,
 }
 
-/// Ask Gemini whether the built solid matches the user's request.
-/// Fails open (Skipped) if the API errors — we still show the geometry.
+/// Deterministic verification first (fail closed), then optional Gemini prose.
 async fn verify_against_request(
     state: &AppState,
     user_message: &str,
     document: &CadDocument,
-    metrics: &MetricsData,
+    output: &DocumentOutput,
 ) -> VerifyVerdict {
+    let report = verify::verify_document(user_message, document, output);
+    if !report.passed {
+        tracing::warn!("deterministic verify failed: {}", report.summary());
+        return VerifyVerdict::Mismatch {
+            reason: format!("Verification failed: {}", report.summary()),
+            document: None,
+        };
+    }
+
+    // Deterministic checks passed — optional LLM for a polished `say` line only.
+    let metrics = &output.metrics;
     let [xmin, ymin, zmin, xmax, ymax, zmax] = metrics.bbox;
     let dx = (xmax - xmin).abs();
     let dy = (ymax - ymin).abs();
     let dz = (zmax - zmin).abs();
-    let program_json = serde_json::to_string_pretty(document).unwrap_or_default();
-    let n_bodies = document.bodies.len();
+    let units = document.units.as_str();
 
     let prompt = format!(
         "The user asked:\n{user_message}\n\n\
-         You produced this CadDocument ({n_bodies} bodies):\n{program_json}\n\n\
-         The kernel built solids with combined:\n\
-         - bbox [xmin,ymin,zmin,xmax,ymax,zmax] = [{xmin:.2}, {ymin:.2}, {zmin:.2}, {xmax:.2}, {ymax:.2}, {zmax:.2}]\n\
-         - extents dx={dx:.2} dy={dy:.2} dz={dz:.2}\n\
-         - volume = {vol:.2}\n\
-         - surface_area = {area:.2}\n\n\
-         Does this match what the user asked for?\n\
-         Rules:\n\
-         - Assemblies should be multiple bodies, not one fused blob.\n\
-         - A tube/venturi along Z must have similar dx and dy AND a real dz (not a disk).\n\
-         - Volume must be clearly > 0.\n\
-         Reply with JSON only:\n\
-         {{ \"ok\": true, \"say\": \"<2-4 sentence description>\" }}\n\
-         or\n\
-         {{ \"ok\": false, \"reason\": \"<what's wrong>\", \"say\": \"...\", \"document\": {{ ...fixed CadDocument }} }}",
-        vol = metrics.volume,
-        area = metrics.surface_area,
+         Deterministic verification PASSED for this solid ({units}):\n\
+         - bbox [{xmin:.2}, {ymin:.2}, {zmin:.2}, {xmax:.2}, {ymax:.2}, {zmax:.2}] {units}\n\
+         - extents {dx:.2}×{dy:.2}×{dz:.2} {units}\n\
+         - volume = {:.2} {units}³\n\
+         Reply JSON only: {{ \"ok\": true, \"say\": \"<2-4 sentence description>\" }}",
+        metrics.volume,
     );
 
     let req_body = GeminiRequest {
@@ -1040,19 +1113,19 @@ async fn verify_against_request(
     let http_resp = match state.http.post(&url).json(&req_body).send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("verify call failed: {e}");
-            return VerifyVerdict::Skipped { say: None };
+            tracing::warn!("verify say call failed: {e}");
+            return VerifyVerdict::Ok { say: None };
         }
     };
     if !http_resp.status().is_success() {
         tracing::warn!("verify Gemini status {}", http_resp.status());
-        return VerifyVerdict::Skipped { say: None };
+        return VerifyVerdict::Ok { say: None };
     }
     let parsed: GeminiResponse = match http_resp.json().await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("verify deserialize failed: {e}");
-            return VerifyVerdict::Skipped { say: None };
+            return VerifyVerdict::Ok { say: None };
         }
     };
     let text = parsed
@@ -1065,35 +1138,11 @@ async fn verify_against_request(
     let json_text = extract_json(&text);
     let v: VerifyJson = match serde_json::from_str(&json_text) {
         Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("verify JSON parse failed: {e}");
-            return VerifyVerdict::Skipped { say: None };
-        }
+        Err(_) => return VerifyVerdict::Ok { say: None },
     };
 
-    if v.ok {
-        VerifyVerdict::Ok {
-            say: v.say.filter(|s| !s.trim().is_empty()),
-        }
-    } else {
-        let reason = v
-            .reason
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "geometry does not match the request".to_string());
-        let document = v
-            .document
-            .or(v.program)
-            .and_then(|val| CadDocument::from_json_value(val).ok())
-            .or_else(|| {
-                v.body.and_then(|b| {
-                    serde_json::from_value::<CadBody>(b).ok().map(|body| {
-                        let mut d = document.clone();
-                        d.replace_body(body);
-                        d
-                    })
-                })
-            });
-        VerifyVerdict::Mismatch { reason, document }
+    VerifyVerdict::Ok {
+        say: v.say.filter(|s| !s.trim().is_empty()),
     }
 }
 
@@ -1383,16 +1432,32 @@ fn mesh_payload(mesh: &kernel::engine::MeshData) -> MeshPayload {
     }
 }
 
-fn metrics_payload(m: &MetricsData) -> MetricsPayload {
+fn metrics_payload(m: &MetricsData, units: &Units) -> MetricsPayload {
     MetricsPayload {
         volume: m.volume,
         bbox: m.bbox,
         surface_area: m.surface_area,
         is_solid: m.is_solid,
+        units: units.as_str().to_string(),
     }
 }
 
-fn body_payloads(out: &DocumentOutput) -> Vec<BodyPayload> {
+fn verification_payload(report: &VerificationReport) -> VerificationPayload {
+    VerificationPayload {
+        passed: report.passed,
+        checks: report
+            .checks
+            .iter()
+            .map(|c| VerificationCheckPayload {
+                name: c.name.clone(),
+                passed: c.passed,
+                message: c.message.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn body_payloads(out: &DocumentOutput, units: &Units) -> Vec<BodyPayload> {
     out.bodies
         .iter()
         .map(|b| BodyPayload {
@@ -1401,18 +1466,23 @@ fn body_payloads(out: &DocumentOutput) -> Vec<BodyPayload> {
             visible: b.visible,
             suppressed: b.suppressed,
             mesh: mesh_payload(&b.mesh),
-            metrics: metrics_payload(&b.metrics),
+            metrics: metrics_payload(&b.metrics, units),
         })
         .collect()
 }
 
-fn document_run_response(output: DocumentOutput) -> RunResponse {
+fn document_run_response(
+    output: DocumentOutput,
+    units: &Units,
+    verification: Option<&VerificationReport>,
+) -> RunResponse {
     let combined = output.clone().into_model_output().ok();
     RunResponse {
         success: true,
         mesh: combined.as_ref().map(|o| mesh_payload(&o.mesh)),
-        metrics: Some(metrics_payload(&output.metrics)),
-        bodies: body_payloads(&output),
+        metrics: Some(metrics_payload(&output.metrics, units)),
+        verification: verification.map(verification_payload),
+        bodies: body_payloads(&output, units),
         error: None,
     }
 }
@@ -1466,6 +1536,7 @@ async fn main() {
         .route("/api/health", get(health_handler))
         .route("/api/run", post(run_handler))
         .route("/api/topology", post(topology_handler))
+        .route("/api/verify", post(verify_handler))
         .route("/api/export", post(export_handler))
         .route("/api/chat", post(chat_handler))
         .layer(cors)

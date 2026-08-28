@@ -180,15 +180,23 @@ export function EditorPanel() {
   )
 }
 
+function metricSuffixes(units?: MetricsData['units']) {
+  if (units === 'in') {
+    return { volume: 'in³', length: 'in', area: 'in²' }
+  }
+  return { volume: 'mm³', length: 'mm', area: 'mm²' }
+}
+
 function MetricsBar({ metrics }: { metrics: MetricsData }) {
   const [xmin, ymin, zmin, xmax, ymax, zmax] = metrics.bbox
   const size = [xmax - xmin, ymax - ymin, zmax - zmin].map((v) => v.toFixed(1))
+  const suffix = metricSuffixes(metrics.units)
 
   return (
     <div className="flex items-center gap-4 px-3 py-1.5 bg-surface border-t border-border flex-shrink-0 text-[10px] text-muted font-mono">
-      <MetricItem label="Vol" value={`${metrics.volume.toFixed(1)} mm³`} />
-      <MetricItem label="Size" value={`${size[0]}×${size[1]}×${size[2]} mm`} />
-      <MetricItem label="Area" value={`${metrics.surface_area.toFixed(1)} mm²`} />
+      <MetricItem label="Vol" value={`${metrics.volume.toFixed(1)} ${suffix.volume}`} />
+      <MetricItem label="Size" value={`${size[0]}×${size[1]}×${size[2]} ${suffix.length}`} />
+      <MetricItem label="Area" value={`${metrics.surface_area.toFixed(1)} ${suffix.area}`} />
       <span className={`ml-auto ${metrics.is_solid ? 'text-green-400' : 'text-yellow-400'}`}>
         {metrics.is_solid ? '● solid' : '○ open'}
       </span>

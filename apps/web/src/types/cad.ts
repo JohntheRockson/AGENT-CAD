@@ -293,18 +293,34 @@ export interface MeshData {
   indices:   number[]
 }
 
+export type LinearUnits = 'mm' | 'in'
+
 export interface MetricsData {
   volume:       number
-  /** [xmin, ymin, zmin, xmax, ymax, zmax] */
+  /** [xmin, ymin, zmin, xmax, ymax, zmax] in document units */
   bbox:         [number, number, number, number, number, number]
   surface_area: number
   is_solid:     boolean
+  /** Linear/volume values are expressed in these units (from kernel, not UI labels). */
+  units?:       LinearUnits
+}
+
+export interface VerificationCheck {
+  name:    string
+  passed:  boolean
+  message: string
+}
+
+export interface VerificationReport {
+  passed: boolean
+  checks: VerificationCheck[]
 }
 
 export interface RunResponse {
   success:  boolean
   mesh?:    MeshData
   metrics?: MetricsData
+  verification?: VerificationReport
   bodies?:  BodyInstance[]
   error?:   string
 }
