@@ -488,8 +488,8 @@ pub(crate) mod occt_backend {
         static KERNEL: RefCell<Option<occt_wasm::OcctKernel>> = const { RefCell::new(None) };
         /// Maps (cumulative feature hash) → state after that feature.
         static STEP_CACHE: RefCell<HashMap<u64, StepEntry>> = RefCell::new(HashMap::new());
-        /// After a tessellate wasm trap, rebuild with a coarser mesh instead of 0.002 relative.
-        static COARSE_MESH: Cell<bool> = const { Cell::new(false) };
+        /// After a tessellate wasm trap, rebuild with a coarser absolute mesh.
+        static COARSE_LEVEL: Cell<u8> = const { Cell::new(0) };
     }
 
     fn is_fatal_occt(err: &KernelError) -> bool {
@@ -563,22 +563,29 @@ pub(crate) mod occt_backend {
         result
     }
 
-    /// After a wasm trap the instance is dead. Rebuild once on a fresh kernel
-    /// so a poisoned thread-local does not burn the rest of the chat.
-    /// Long helical threads often trap at the default tessellation density; the
-    /// retry uses `COARSE_MESH` so the second pass can finish.
+    /// After a wasm trap the instance is dead. Rebuild on a fresh kernel with
+    /// successively coarser absolute tessellation (relative meshing OOMs on
+    /// long helical threads).
     fn with_kernel_retry<T>(f: impl Fn() -> Result<T, KernelError>) -> Result<T, KernelError> {
-        COARSE_MESH.with(|c| c.set(false));
-        match f() {
-            Ok(v) => Ok(v),
-            Err(e) if is_fatal_occt(&e) => {
-                COARSE_MESH.with(|c| c.set(true));
-                let retry = f();
-                COARSE_MESH.with(|c| c.set(false));
-                retry
+        let mut last = KernelError::Occt("kernel retry exhausted".into());
+        for level in 0..=2u8 {
+            COARSE_LEVEL.with(|c| c.set(level));
+            match f() {
+                Ok(v) => {
+                    COARSE_LEVEL.with(|c| c.set(0));
+                    return Ok(v);
+                }
+                Err(e) if is_fatal_occt(&e) && level < 2 => {
+                    last = e;
+                }
+                Err(e) => {
+                    COARSE_LEVEL.with(|c| c.set(0));
+                    return Err(e);
+                }
             }
-            Err(e) => Err(e),
         }
+        COARSE_LEVEL.with(|c| c.set(0));
+        Err(last)
     }
 
     // ── Handle conversion helpers ─────────────────────────────────────────────
@@ -1000,22 +1007,29 @@ pub(crate) mod occt_backend {
     ) -> Result<ModelOutput, KernelError> {
         let ids = k.get_sub_shapes(shape, "solid").unwrap_or_default();
         let solids: Vec<Handle> = if ids.len() > 1 {
-            // Fuse fallback may leave a compound (hex head + threaded shank).
-            // Tessellate every solid so the head is not dropped by heal_shape.
             ids.into_iter().map(id_to_handle).collect()
+        } else if ids.len() == 1 {
+            let h = id_to_handle(ids[0]);
+            let healed = heal_shape(k, h);
+            vec![if shape_has_extent(k, healed) {
+                healed
+            } else {
+                h
+            }]
         } else {
-            vec![heal_shape(k, shape)]
+            vec![shape]
         };
 
         let mut meshes = Vec::with_capacity(solids.len());
         let mut metrics = Vec::with_capacity(solids.len());
         for solid in solids {
+            if !shape_has_extent(k, solid) {
+                continue;
+            }
             reject_if_planar(k, solid)?;
             let tess = tessellate_adaptive(k, solid)?;
             let bbox = bbox_from_positions(&tess.positions);
-            let volume = k
-                .get_volume(solid)
-                .map_err(|e| occt_err(format!("get_volume: {:?}", e)))?;
+            let volume = k.get_volume(solid).unwrap_or(0.0);
             let surface_area = k.get_surface_area(solid).unwrap_or(0.0);
             meshes.push(MeshData {
                 positions: tess.positions,
@@ -1029,6 +1043,9 @@ pub(crate) mod occt_backend {
                 is_solid: true,
             });
         }
+        if meshes.is_empty() {
+            return Err(occt_err("tessellate: shape has no drawable solid"));
+        }
         let mesh_refs: Vec<&MeshData> = meshes.iter().collect();
         let metric_refs: Vec<&MetricsData> = metrics.iter().collect();
         Ok(ModelOutput {
@@ -1037,14 +1054,8 @@ pub(crate) mod occt_backend {
         })
     }
 
-    /// Preview deflection: tiny parts stay fine; long helical fasteners coarsen
-    /// so a 40 mm M8 does not wasm-trap the mesher.
-    fn preview_relative(k: &mut occt_wasm::OcctKernel, solid: Handle) -> f64 {
-        if COARSE_MESH.with(|c| c.get()) {
-            return 0.02;
-        }
-        let diag = k
-            .get_bounding_box(solid, false)
+    fn bbox_diag(k: &mut occt_wasm::OcctKernel, solid: Handle) -> f64 {
+        k.get_bounding_box(solid, false)
             .ok()
             .map(|b| {
                 let dx = b.max.x - b.min.x;
@@ -1052,82 +1063,59 @@ pub(crate) mod occt_backend {
                 let dz = b.max.z - b.min.z;
                 (dx * dx + dy * dy + dz * dz).sqrt()
             })
-            .unwrap_or(10.0);
-        (0.002 * (diag / 10.0).max(1.0)).clamp(0.002, 0.03)
+            .unwrap_or(10.0)
     }
 
+    fn shape_has_extent(k: &mut occt_wasm::OcctKernel, shape: Handle) -> bool {
+        k.get_bounding_box(shape, false)
+            .ok()
+            .map(|b| {
+                let dx = (b.max.x - b.min.x).abs();
+                let dy = (b.max.y - b.min.y).abs();
+                let dz = (b.max.z - b.min.z).abs();
+                dx.max(dy).max(dz) > 1e-6
+            })
+            .unwrap_or(false)
+    }
+
+    /// Absolute deflection only. `tessellate_relative` at 0.002 traps WASM on a
+    /// 40 mm M8 helix; a failed relative call cannot fall back on the same instance.
     fn tessellate_adaptive(
         k: &mut occt_wasm::OcctKernel,
         solid: Handle,
     ) -> Result<occt_wasm::Mesh, KernelError> {
-        let coarse = COARSE_MESH.with(|c| c.get());
-        let start = preview_relative(k, solid);
-        let relatives: Vec<f64> = if coarse {
-            vec![start.max(0.02), 0.04, 0.08]
+        let level = COARSE_LEVEL.with(|c| c.get());
+        let diag = bbox_diag(k, solid);
+        let start = if diag > 25.0 {
+            0.35
         } else {
-            vec![start, (start * 3.0).min(0.025), 0.02, 0.04]
+            (diag * 0.008).clamp(0.06, 0.25)
         };
-        let angular = if coarse { 0.55 } else { 0.25 };
+        let linears: Vec<f64> = match level {
+            0 => vec![start, 0.5, 1.0],
+            1 => vec![0.8, 1.5],
+            _ => vec![2.0, 4.0],
+        };
+        let angular = if level == 0 { 0.4 } else { 0.75 };
         let mut last_err: Option<KernelError> = None;
-        let mut seen = std::collections::BTreeSet::new();
-        for rel in relatives {
-            let key = (rel * 1000.0).round() as i32;
-            if !seen.insert(key) {
-                continue;
-            }
-            match tessellate_with(k, solid, rel, angular) {
-                Ok(mesh) => return Ok(mesh),
-                Err(e) if is_fatal_occt(&e) => return Err(e),
-                Err(e) => last_err = Some(e),
+        for linear in linears {
+            match k.tessellate(solid, linear, angular) {
+                Ok(mut mesh) => {
+                    if let Ok(bb) = k.get_bounding_box(solid, false) {
+                        strip_spike_triangles(&mut mesh, &bb);
+                    }
+                    return Ok(mesh);
+                }
+                Err(e) => {
+                    let err = occt_err(format!("tessellate: {:?}", e));
+                    if is_fatal_occt(&err) {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                }
             }
         }
         Err(last_err.unwrap_or_else(|| occt_err("tessellate: all deflection levels failed")))
-    }
-
-    /// Relative chordal tolerance first; fall back to an absolute deflection
-    /// derived from the bounding-box diagonal if the relative mesher fails.
-    /// A wasm trap from relative meshing must not continue on the dead instance.
-    fn tessellate_with(
-        k: &mut occt_wasm::OcctKernel,
-        solid: Handle,
-        relative: f64,
-        angular: f64,
-    ) -> Result<occt_wasm::Mesh, KernelError> {
-        match k.tessellate_relative(solid, relative, angular) {
-            Ok(mut mesh) => {
-                if let Ok(bb) = k.get_bounding_box(solid, false) {
-                    strip_spike_triangles(&mut mesh, &bb);
-                }
-                Ok(mesh)
-            }
-            Err(e) => {
-                let rel_err = occt_err(format!("tessellate: {:?}", e));
-                if is_fatal_occt(&rel_err) {
-                    return Err(rel_err);
-                }
-                let linear = linear_from_bbox(k, solid, relative);
-                let mut mesh = k
-                    .tessellate(solid, linear, angular)
-                    .map_err(|e| occt_err(format!("tessellate: {:?}", e)))?;
-                if let Ok(bb) = k.get_bounding_box(solid, false) {
-                    strip_spike_triangles(&mut mesh, &bb);
-                }
-                Ok(mesh)
-            }
-        }
-    }
-
-    fn linear_from_bbox(k: &mut occt_wasm::OcctKernel, solid: Handle, fraction: f64) -> f64 {
-        k.get_bounding_box(solid, false)
-            .ok()
-            .map(|b| {
-                let dx = b.max.x - b.min.x;
-                let dy = b.max.y - b.min.y;
-                let dz = b.max.z - b.min.z;
-                let diag = (dx * dx + dy * dy + dz * dz).sqrt().max(1.0);
-                (diag * fraction).clamp(0.02, 2.0)
-            })
-            .unwrap_or(0.1)
     }
 
     fn apply_body_transform(
@@ -2325,8 +2313,15 @@ pub(crate) mod occt_backend {
         internal: bool,
         z0: f64,
     ) -> Result<Handle, KernelError> {
-        helical_thread_cutter(k, major, pitch, length, internal, z0)
-            .or_else(|_| helical_round_groove(k, major, pitch, length, internal, z0))
+        if (length / pitch.max(1e-9)) > 12.0 {
+            // Long fasteners: round helical groove first — the V-pipe of 30+ turns
+            // exhausts WASM before tessellation.
+            helical_round_groove(k, major, pitch, length, internal, z0)
+                .or_else(|_| helical_thread_cutter(k, major, pitch, length, internal, z0))
+        } else {
+            helical_thread_cutter(k, major, pitch, length, internal, z0)
+                .or_else(|_| helical_round_groove(k, major, pitch, length, internal, z0))
+        }
     }
 
     /// True helical V-groove (not a lathe/revolve of stacked rings).
@@ -3424,31 +3419,21 @@ pub(crate) mod occt_backend {
     /// Boolean union that survives coplanar and helical contact.
     ///
     /// Fusing a hex prism onto a threaded shank fails in OCCT (helical caps /
-    /// coincident faces). Heal, then nudge the addend into the base, then keep
-    /// both solids in a compound so tessellation still shows the full part.
+    /// coincident faces). Nudge the addend into the base, then keep both solids
+    /// in a compound so tessellation still shows the full part.
     fn fuse_robust(
         k: &mut occt_wasm::OcctKernel,
         a: Handle,
         b: Handle,
         ctx: &str,
     ) -> Result<Handle, KernelError> {
-        match k.fuse(a, b) {
-            Ok(raw) => return Ok(drawable_shape(k, raw)),
-            Err(e) => {
-                let err = occt_err(format!("{ctx}: {e}"));
-                if is_fatal_occt(&err) {
-                    return Err(err);
-                }
+        if let Ok(raw) = k.fuse(a, b) {
+            if let Some(ok) = valid_drawable(k, raw) {
+                return Ok(ok);
             }
         }
 
-        let ah = heal_shape(k, a);
-        let bh = heal_shape(k, b);
-        if let Ok(raw) = k.fuse(ah, bh) {
-            return Ok(drawable_shape(k, raw));
-        }
-
-        if let (Ok(ba), Ok(bb)) = (k.get_bounding_box(ah, false), k.get_bounding_box(bh, false)) {
+        if let (Ok(ba), Ok(bb)) = (k.get_bounding_box(a, false), k.get_bounding_box(b, false)) {
             let ca = [
                 (ba.min.x + ba.max.x) * 0.5,
                 (ba.min.y + ba.max.y) * 0.5,
@@ -3465,24 +3450,29 @@ pub(crate) mod occt_backend {
             let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-9);
             let overlap = 0.08;
             if let Ok(shifted) = k.translate(
-                bh,
+                b,
                 dx / len * overlap,
                 dy / len * overlap,
                 dz / len * overlap,
             ) {
-                if let Ok(raw) = k.fuse(ah, shifted) {
-                    return Ok(drawable_shape(k, raw));
+                if let Ok(raw) = k.fuse(a, shifted) {
+                    if let Some(ok) = valid_drawable(k, raw) {
+                        return Ok(ok);
+                    }
                 }
             }
         }
 
-        k.make_compound(&[ah, bh])
-            .or_else(|_| k.make_compound(&[a, b]))
-            .map_err(|e| {
-                occt_err(format!(
-                    "{ctx}: fuse failed and compound fallback failed: {e}"
-                ))
-            })
+        k.make_compound(&[a, b]).map_err(|e| {
+            occt_err(format!(
+                "{ctx}: fuse failed and compound fallback failed: {e}"
+            ))
+        })
+    }
+
+    fn valid_drawable(k: &mut occt_wasm::OcctKernel, raw: Handle) -> Option<Handle> {
+        let d = drawable_shape(k, raw);
+        shape_has_extent(k, d).then_some(d)
     }
 
     /// Fuse leftover solids in a compound so a body of overlapping bosses is one part.
