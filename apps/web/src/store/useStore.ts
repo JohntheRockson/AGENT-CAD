@@ -518,11 +518,20 @@ export const useCadStore = create<CadStore>((set, get) => ({
               })
             })
           } else {
+            let irPatch: { irCode?: string } = {}
+            if (ev.program) {
+              try {
+                irPatch = { irCode: prettyDocument(parseScene(ev.program)) }
+              } catch {
+                irPatch = { irCode: JSON.stringify(ev.program, null, 2) }
+              }
+            }
             patchAssistant((m) => ({
               ...m,
               content: ev.message || ev.error || 'Could not generate a valid model.',
             }))
             set({
+              ...irPatch,
               isChatLoading: false,
               isRunning:     false,
               runError:      ev.error ?? 'AI could not generate a valid model.',

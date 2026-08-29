@@ -141,11 +141,7 @@ impl CadDocument {
     }
 
     pub fn replace_body(&mut self, body: CadBody) {
-        if let Some(existing) = self
-            .bodies
-            .iter_mut()
-            .find(|b| b.body_id == body.body_id)
-        {
+        if let Some(existing) = self.bodies.iter_mut().find(|b| b.body_id == body.body_id) {
             *existing = body;
         } else {
             self.bodies.push(body);
@@ -520,7 +516,10 @@ pub struct CutOp {
     /// Extrude depth of the tool solid. For through-cuts this is a minimum;
     /// the kernel extends the tool through the whole solid.
     /// Omitted / null defaults to 1 so a through-cut still parses.
-    #[serde(default = "default_cutter_depth", deserialize_with = "deserialize_cutter_depth")]
+    #[serde(
+        default = "default_cutter_depth",
+        deserialize_with = "deserialize_cutter_depth"
+    )]
     pub depth: f64,
     /// 3-D position of the tool profile.
     #[serde(default)]
@@ -543,7 +542,10 @@ pub struct CutOp {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FuseOp {
     pub profile: Profile,
-    #[serde(default = "default_cutter_depth", deserialize_with = "deserialize_cutter_depth")]
+    #[serde(
+        default = "default_cutter_depth",
+        deserialize_with = "deserialize_cutter_depth"
+    )]
     pub depth: f64,
     #[serde(default)]
     pub at: [f64; 3],
@@ -559,7 +561,10 @@ pub struct FuseOp {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CommonOp {
     pub profile: Profile,
-    #[serde(default = "default_cutter_depth", deserialize_with = "deserialize_cutter_depth")]
+    #[serde(
+        default = "default_cutter_depth",
+        deserialize_with = "deserialize_cutter_depth"
+    )]
     pub depth: f64,
     #[serde(default)]
     pub at: [f64; 3],
@@ -578,7 +583,10 @@ pub struct HoleOp {
     /// Depth of the hole. Ignored when `through` is true (the default): the
     /// cutter is sized to the solid's bounding box so it always punches through.
     /// Omitted / null defaults to 1.
-    #[serde(default = "default_cutter_depth", deserialize_with = "deserialize_cutter_depth")]
+    #[serde(
+        default = "default_cutter_depth",
+        deserialize_with = "deserialize_cutter_depth"
+    )]
     pub depth: f64,
     /// 2-D center position on the hole plane / face UV.
     #[serde(default)]
@@ -1384,14 +1392,15 @@ fn validate_profile_nested(
     index: usize,
     label: &str,
 ) -> Result<(), ValidationError> {
-    let err = |msg: String| ValidationError::InvalidParameter { index, message: msg };
+    let err = |msg: String| ValidationError::InvalidParameter {
+        index,
+        message: msg,
+    };
     match profile {
         Profile::Rect(r) if r.w <= 0.0 || r.h <= 0.0 => {
             Err(err(format!("{label}: rect size must be positive")))
         }
-        Profile::Circle(c) if c.d <= 0.0 => {
-            Err(err(format!("{label}: circle.d must be positive")))
-        }
+        Profile::Circle(c) if c.d <= 0.0 => Err(err(format!("{label}: circle.d must be positive"))),
         Profile::Polyline(p) if p.points.len() < 3 => {
             Err(err(format!("{label}: polyline needs ≥ 3 points")))
         }
@@ -1474,7 +1483,8 @@ mod tests {
         assert_eq!(prog.features.len(), 4);
         assert_eq!(prog.units, Units::Mm);
         // Re-serialise and re-parse to verify round-trip
-        let again: CadProgram = serde_json::from_str(&serde_json::to_string(&prog).unwrap()).unwrap();
+        let again: CadProgram =
+            serde_json::from_str(&serde_json::to_string(&prog).unwrap()).unwrap();
         assert_eq!(prog, again);
     }
 
@@ -1486,11 +1496,20 @@ mod tests {
                 Feature::Sketch(SketchOp {
                     id: "s".into(),
                     plane: SketchPlane::XY,
-                    profile: Profile::Rect(RectProfile { w: 10.0, h: 10.0, at: [0.0; 2], centered: true }),
+                    profile: Profile::Rect(RectProfile {
+                        w: 10.0,
+                        h: 10.0,
+                        at: [0.0; 2],
+                        centered: true,
+                    }),
                     origin: [0.0; 2],
                     face: None,
                 }),
-                Feature::Extrude(ExtrudeOp { id: "b".into(), depth: -1.0, symmetric: false }),
+                Feature::Extrude(ExtrudeOp {
+                    id: "b".into(),
+                    depth: -1.0,
+                    symmetric: false,
+                }),
             ],
         };
         assert!(prog.validate().is_err());
@@ -1500,16 +1519,14 @@ mod tests {
     fn rejects_zero_diameter_hole() {
         let prog = CadProgram {
             units: Units::Mm,
-            features: vec![
-                Feature::Hole(HoleOp {
-                    diameter: 0.0,
-                    depth: 5.0,
-                    center: [0.0; 2],
-                    plane: SketchPlane::XY,
-                    through: true,
-                    face: None,
-                }),
-            ],
+            features: vec![Feature::Hole(HoleOp {
+                diameter: 0.0,
+                depth: 5.0,
+                center: [0.0; 2],
+                plane: SketchPlane::XY,
+                through: true,
+                face: None,
+            })],
         };
         assert!(prog.validate().is_err());
     }
@@ -1610,7 +1627,9 @@ mod tests {
         });
         let doc = CadDocument::from_json_value(json).unwrap();
         doc.validate().unwrap();
-        let out = crate::engine::Engine::default().execute_document(&doc).unwrap();
+        let out = crate::engine::Engine::default()
+            .execute_document(&doc)
+            .unwrap();
         assert!(out.metrics.volume > 0.0);
         assert_eq!(doc.parameters.get("w"), Some(&30.0));
     }
@@ -1731,7 +1750,10 @@ mod tests {
 
     #[test]
     fn simple_closed_square_polyline_is_ok() {
-        assert!(polyline_self_intersection(&[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]).is_none());
+        assert!(
+            polyline_self_intersection(&[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]])
+                .is_none()
+        );
     }
 
     #[test]
@@ -1820,5 +1842,73 @@ mod tests {
         )
         .unwrap();
         assert!(prog.validate().is_err());
+    }
+
+    #[test]
+    fn hex_profile_across_flats() {
+        let p: Profile = serde_json::from_str(r#"{ "hex": { "across_flats": 10 } }"#).unwrap();
+        match p {
+            Profile::Hex(h) => {
+                assert!((h.across_flats - 10.0).abs() < 1e-12);
+                let pts = h.points();
+                assert_eq!(pts.len(), 6);
+                let max_y = pts.iter().map(|pt| pt[1]).fold(f64::NEG_INFINITY, f64::max);
+                assert!(
+                    (max_y - 5.0).abs() < 0.05,
+                    "10 mm across-flats hex should have a flat at y=±5, max_y={max_y}"
+                );
+            }
+            _ => panic!("expected hex"),
+        }
+    }
+
+    #[test]
+    fn hex_bolt_document_substitutes_params() {
+        let doc = CadDocument::from_json_value(serde_json::json!({
+            "documentId": "m8_bolt",
+            "units": "mm",
+            "parameters": { "bolt_length": 40.0, "head_width": 10.0, "head_height": 5.5 },
+            "bodies": [{
+                "bodyId": "body_bolt",
+                "name": "M8 bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY", "profile": { "hex": { "across_flats": "head_width" } } },
+                    { "op": "extrude", "depth": "head_height" },
+                    { "op": "cylinder", "diameter": 8,
+                      "height": "bolt_length - head_height + 1",
+                      "at": [0, 0, "head_height - 1"] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": "bolt_length - head_height",
+                      "at": [0, 0, "head_height"] }
+                ]
+            }]
+        }))
+        .expect("bolt document should parse and substitute");
+        assert!(doc.validate().is_ok(), "{:?}", doc.validate().err());
+        match &doc.bodies[0].features[0] {
+            Feature::Sketch(op) => match &op.profile {
+                Profile::Hex(h) => assert!((h.across_flats - 10.0).abs() < 1e-9),
+                other => panic!("expected hex, got {other:?}"),
+            },
+            other => panic!("expected sketch, got {other:?}"),
+        }
+        match &doc.bodies[0].features[1] {
+            Feature::Extrude(op) => assert!((op.depth - 5.5).abs() < 1e-9),
+            other => panic!("expected extrude, got {other:?}"),
+        }
+        match &doc.bodies[0].features[2] {
+            Feature::Cylinder(op) => {
+                assert!((op.height - 35.5).abs() < 1e-9, "height={}", op.height);
+                assert!((op.at[2] - 4.5).abs() < 1e-9, "at.z={}", op.at[2]);
+            }
+            other => panic!("expected cylinder, got {other:?}"),
+        }
+        match &doc.bodies[0].features[3] {
+            Feature::Thread(op) => {
+                assert!((op.length - 34.5).abs() < 1e-9, "length={}", op.length);
+                assert!((op.at[2] - 5.5).abs() < 1e-9, "at.z={}", op.at[2]);
+            }
+            other => panic!("expected thread, got {other:?}"),
+        }
     }
 }

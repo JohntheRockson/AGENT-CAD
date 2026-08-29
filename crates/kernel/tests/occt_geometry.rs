@@ -141,7 +141,11 @@ fn thin_plate_fillet_does_not_spike() {
             chunk
         );
     }
-    assert!(out.metrics.volume > 1000.0, "volume vanished: {}", out.metrics.volume);
+    assert!(
+        out.metrics.volume > 1000.0,
+        "volume vanished: {}",
+        out.metrics.volume
+    );
 }
 
 #[test]
@@ -161,7 +165,10 @@ fn feature_pattern_holes_on_plate() {
     let out = Engine::new().execute(&prog).expect("feature pattern holes");
     assert!(out.metrics.is_solid);
     // Two through-holes remove more volume than one.
-    assert!(out.metrics.volume < 80.0 * 40.0 * 8.0 - 100.0, "holes not patterned");
+    assert!(
+        out.metrics.volume < 80.0 * 40.0 * 8.0 - 100.0,
+        "holes not patterned"
+    );
 }
 
 #[test]
@@ -177,9 +184,17 @@ fn pipe_polyline_builds_solid() {
     )
     .unwrap();
     let out = Engine::new().execute(&prog).expect("pipe");
-    assert!(out.metrics.volume > 10.0, "pipe volume too small: {}", out.metrics.volume);
+    assert!(
+        out.metrics.volume > 10.0,
+        "pipe volume too small: {}",
+        out.metrics.volume
+    );
     let [xmin, _ymin, zmin, xmax, _ymax, zmax] = out.metrics.bbox;
-    assert!(xmax - xmin > 30.0 && zmax - zmin > 20.0, "pipe bbox {:?}", out.metrics.bbox);
+    assert!(
+        xmax - xmin > 30.0 && zmax - zmin > 20.0,
+        "pipe bbox {:?}",
+        out.metrics.bbox
+    );
 }
 
 #[test]
@@ -254,7 +269,11 @@ fn thicken_sketch_makes_solid() {
     )
     .unwrap();
     let out = Engine::new().execute(&prog).expect("thicken");
-    assert!(out.metrics.volume > 100.0, "thicken volume {}", out.metrics.volume);
+    assert!(
+        out.metrics.volume > 100.0,
+        "thicken volume {}",
+        out.metrics.volume
+    );
 }
 
 #[test]
@@ -350,8 +369,16 @@ fn cylinder_on_y_axis_builds() {
     let dx = (xmax - xmin).abs();
     let dy = (ymax - ymin).abs();
     let dz = (zmax - zmin).abs();
-    assert!(dy > 30.0, "expected length along Y, bbox={:?}", out.metrics.bbox);
-    assert!(dx > 8.0 && dz > 8.0, "expected ~12mm diameter in XZ, bbox={:?}", out.metrics.bbox);
+    assert!(
+        dy > 30.0,
+        "expected length along Y, bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(
+        dx > 8.0 && dz > 8.0,
+        "expected ~12mm diameter in XZ, bbox={:?}",
+        out.metrics.bbox
+    );
 }
 
 #[test]
@@ -379,8 +406,16 @@ fn body_rotate_y_on_box_builds() {
     let dx = (xmax - xmin).abs();
     let dz = (zmax - zmin).abs();
     // 40×10×6 box rotated 90° about Y → length along Z, thickness along X
-    assert!(dz > 30.0, "expected ~40mm along Z after Y rot, bbox={:?}", out.metrics.bbox);
-    assert!(dx > 4.0 && dx < 15.0, "expected ~6mm along X after Y rot, bbox={:?}", out.metrics.bbox);
+    assert!(
+        dz > 30.0,
+        "expected ~40mm along Z after Y rot, bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(
+        dx > 4.0 && dx < 15.0,
+        "expected ~6mm along X after Y rot, bbox={:?}",
+        out.metrics.bbox
+    );
     let _ = (ymin, ymax);
 }
 
@@ -447,9 +482,21 @@ fn m8_external_thread_builds() {
     let dx = (xmax - xmin).abs();
     let dy = (ymax - ymin).abs();
     let dz = (zmax - zmin).abs();
-    assert!(dx > 6.0 && dy > 6.0, "expected ~8mm diameter, bbox={:?}", out.metrics.bbox);
-    assert!(dz > 6.0, "expected ~8mm length, bbox={:?}", out.metrics.bbox);
-    assert!(out.metrics.volume > 50.0, "volume vanished: {}", out.metrics.volume);
+    assert!(
+        dx > 6.0 && dy > 6.0,
+        "expected ~8mm diameter, bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(
+        dz > 6.0,
+        "expected ~8mm length, bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(
+        out.metrics.volume > 50.0,
+        "volume vanished: {}",
+        out.metrics.volume
+    );
     let major_cyl = std::f64::consts::PI * 4.0 * 4.0 * 8.0;
     assert!(
         out.metrics.volume < 0.97 * major_cyl,
@@ -516,7 +563,9 @@ fn ellipsoid_builds() {
         }"#,
     )
     .unwrap();
-    let out = Engine::new().execute(&prog).expect("ellipsoid should build");
+    let out = Engine::new()
+        .execute(&prog)
+        .expect("ellipsoid should build");
     let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
     assert!((xmax - xmin).abs() > 16.0, "bbox={:?}", out.metrics.bbox);
     assert!((ymax - ymin).abs() > 8.0, "bbox={:?}", out.metrics.bbox);
@@ -535,10 +584,16 @@ fn helix_spring_builds() {
         }"#,
     )
     .unwrap();
-    let out = Engine::new().execute(&prog).expect("helix spring should build");
+    let out = Engine::new()
+        .execute(&prog)
+        .expect("helix spring should build");
     let [_xmin, _ymin, zmin, _xmax, _ymax, zmax] = out.metrics.bbox;
     let dz = (zmax - zmin).abs();
-    assert!(dz > 10.0, "expected coil height, bbox={:?}", out.metrics.bbox);
+    assert!(
+        dz > 10.0,
+        "expected coil height, bbox={:?}",
+        out.metrics.bbox
+    );
     assert!(out.metrics.volume > 10.0);
 }
 
@@ -560,4 +615,78 @@ fn offset_grows_a_box() {
         "offset should grow volume, got {}",
         out.metrics.volume
     );
+}
+
+/// Canonical hex-head bolt: hex extrude → overlapping shank → thread cut.
+/// This is the recipe that must work for "M8 × 40 mm, 10 mm hex head".
+#[test]
+fn m8_hex_head_bolt_40mm_builds() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": { "hex": { "across_flats": 10 } } },
+            { "op": "extrude", "depth": 5.5 },
+            { "op": "cylinder", "diameter": 8, "height": 35.5, "at": [0, 0, 4.5] },
+            { "op": "thread", "kind": "external", "size": "M8", "length": 34.5, "at": [0, 0, 5.5] }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new()
+        .execute(&prog)
+        .expect("M8×40 hex-head bolt should build");
+    let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
+    let dx = (xmax - xmin).abs();
+    let dy = (ymax - ymin).abs();
+    let dz = (zmax - zmin).abs();
+    assert!(
+        dx > 9.0 && dy > 9.0,
+        "expected ~10 mm hex head, bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(
+        dz > 38.0 && dz < 48.0,
+        "expected ~40 mm overall length, bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(
+        out.metrics.volume > 200.0,
+        "volume vanished: {}",
+        out.metrics.volume
+    );
+    let variation = radius_variation_at_z(&out.mesh, zmin + 20.0, 0.35);
+    assert!(
+        variation > 0.08,
+        "shank should be helical at mid-length; variation={variation}"
+    );
+}
+
+/// Agent often threads first then fuses a hex head — that boolean used to crash.
+/// Compound fallback must still produce a visible head + shank.
+#[test]
+fn hex_head_fused_onto_short_thread_does_not_crash() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "thread", "kind": "external", "size": "M8", "length": 8 },
+            { "op": "fuse", "depth": 5.5, "at": [0, 0, 8],
+              "profile": { "hex": { "across_flats": 10 } } }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new()
+        .execute(&prog)
+        .expect("fusing a hex onto a thread must not crash");
+    let [_xmin, _ymin, zmin, _xmax, _ymax, zmax] = out.metrics.bbox;
+    let dz = (zmax - zmin).abs();
+    assert!(
+        dz > 10.0,
+        "expected thread + head height, bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(!out.mesh.positions.is_empty());
 }
