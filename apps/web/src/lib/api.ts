@@ -1,4 +1,11 @@
-import type { CadDocument, CadProgram, ChatStreamEvent, ExportFormat, RunResponse } from '../types/cad'
+import type {
+  CadDocument,
+  CadProgram,
+  ChatStreamEvent,
+  ExportFormat,
+  RunResponse,
+  VerificationReport,
+} from '../types/cad'
 
 const BASE = '/api'
 
@@ -15,6 +22,46 @@ export async function runProgram(program: CadProgram | CadDocument): Promise<Run
     throw new Error(`Server ${res.status}: ${text}`)
   }
   return res.json() as Promise<RunResponse>
+}
+
+export async function verifyDocument(
+  program: CadProgram | CadDocument,
+): Promise<{
+  success: boolean
+  passed?: boolean
+  verification?: VerificationReport
+  metrics?: RunResponse['metrics']
+  error?: string
+}> {
+  const res = await fetch(`${BASE}/verify`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(
+      'bodies' in program ? { document: program } : { program },
+    ),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => 'Unknown error')
+    throw new Error(`Verify ${res.status}: ${text}`)
+  }
+  return res.json()
+}
+
+export async function listTopology(
+  program: CadProgram | CadDocument,
+): Promise<{ success: boolean; topology?: unknown; error?: string }> {
+  const res = await fetch(`${BASE}/topology`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(
+      'bodies' in program ? { document: program } : { program },
+    ),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => 'Unknown error')
+    throw new Error(`Topology ${res.status}: ${text}`)
+  }
+  return res.json()
 }
 
 export async function exportModel(
@@ -41,7 +88,12 @@ export async function streamChat(
   message: string,
   history: Array<{ role: string; content: string }>,
   onEvent: (ev: ChatStreamEvent) => void,
-  extras?: { document?: CadDocument; targetBodyId?: string | null },
+  extras?: {
+    document?: CadDocument
+    targetBodyId?: string | null
+    timelineStepIndex?: number
+    timelineStepLabel?: string
+  },
 ): Promise<void> {
   const res = await fetch(`${BASE}/chat`, {
     method:  'POST',
@@ -54,6 +106,8 @@ export async function streamChat(
       history,
       document: extras?.document,
       targetBodyId: extras?.targetBodyId || undefined,
+      timelineStepIndex: extras?.timelineStepIndex,
+      timelineStepLabel: extras?.timelineStepLabel,
     }),
   })
   if (!res.ok || !res.body) {

@@ -26,8 +26,8 @@ pub enum AgentTool {
     RunModel,
     /// Return volume, bbox, surface_area, is_solid for the last-run model.
     Measure,
-    /// Return the edge/face topology of the last-run model (for fillet
-    /// index selection).
+    /// Return face/edge topology with semantic tags (largest/top/longest, …)
+    /// for fillet, shell, and face-based cut/fuse selection.
     ListTopology,
     /// Export the last-run model in a manufacturing format.
     Export { format: ExportFormat },

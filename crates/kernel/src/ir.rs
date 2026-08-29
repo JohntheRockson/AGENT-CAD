@@ -5,6 +5,8 @@
 //! reaches for non-existent methods). Everything is schema-validated by serde
 //! before touching the geometry kernel.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -26,6 +28,10 @@ pub struct CadDocument {
     #[serde(default = "default_document_id")]
     pub document_id: String,
     pub units: Units,
+    /// Named scalar dimensions (mm or in per `units`). Feature fields may reference
+    /// these by name instead of embedding literals.
+    #[serde(default)]
+    pub parameters: BTreeMap<String, f64>,
     pub bodies: Vec<CadBody>,
 }
 
@@ -81,6 +87,7 @@ impl CadDocument {
         CadDocument {
             document_id: default_document_id(),
             units: program.units,
+            parameters: BTreeMap::new(),
             bodies: vec![CadBody {
                 body_id: "body_main".to_string(),
                 name: "Body".to_string(),
@@ -94,16 +101,32 @@ impl CadDocument {
     }
 
     /// Accept a document `{ bodies: [...] }` or a legacy program `{ features: [...] }`.
+    /// Parameter references in numeric fields are resolved using `parameters`.
     pub fn from_json_value(value: serde_json::Value) -> Result<Self, String> {
-        if value.get("bodies").is_some() {
-            serde_json::from_value(value).map_err(|e| e.to_string())
-        } else if value.get("features").is_some() {
-            let program: CadProgram =
-                serde_json::from_value(value).map_err(|e| e.to_string())?;
-            Ok(Self::from_program(program))
-        } else {
-            Err("expected a CadDocument (bodies) or CadProgram (features)".into())
+        let parameters: BTreeMap<String, f64> = value
+            .get("parameters")
+            .and_then(|p| serde_json::from_value(p.clone()).ok())
+            .unwrap_or_default();
+
+        let mut resolved = value;
+        if !parameters.is_empty() {
+            crate::params::substitute_refs(&mut resolved, &parameters)?;
         }
+
+        let mut doc = if resolved.get("bodies").is_some() {
+            serde_json::from_value(resolved).map_err(|e| e.to_string())?
+        } else if resolved.get("features").is_some() {
+            let program: CadProgram =
+                serde_json::from_value(resolved).map_err(|e| e.to_string())?;
+            Self::from_program(program)
+        } else {
+            return Err("expected a CadDocument (bodies) or CadProgram (features)".into());
+        };
+
+        if !parameters.is_empty() {
+            doc.parameters = parameters;
+        }
+        Ok(doc)
     }
 
     pub fn as_program(&self) -> CadProgram {
@@ -130,6 +153,7 @@ impl CadDocument {
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
+        crate::params::validate_parameters(&self.parameters)?;
         if self.bodies.is_empty() {
             return Err(ValidationError::EmptyFeatures);
         }
@@ -179,7 +203,7 @@ impl CadBody {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Units {
     Mm,
@@ -198,6 +222,7 @@ pub enum Feature {
     Revolve(RevolveOp),
     Cut(CutOp),
     Fuse(FuseOp),
+    Common(CommonOp),
     Hole(HoleOp),
     Fillet(FilletOp),
     Chamfer(ChamferOp),
@@ -212,6 +237,11 @@ pub enum Feature {
     Pattern(PatternOp),
     Shell(ShellOp),
     DraftExtrude(DraftExtrudeOp),
+    Sweep(SweepOp),
+    Pipe(PipeOp),
+    Thicken(ThickenOp),
+    Helix(HelixOp),
+    Draft(DraftOp),
 }
 
 // ── Sketch ───────────────────────────────────────────────────────────────────
@@ -221,7 +251,7 @@ pub struct SketchOp {
     /// Optional identifier for referencing later (unused in v0 but in schema).
     #[serde(default = "default_sketch_id")]
     pub id: String,
-    /// Which construction plane to sketch on.
+    /// Which construction plane to sketch on (ignored when `face` is set).
     #[serde(default)]
     pub plane: SketchPlane,
     /// The 2-D profile to be sketched.
@@ -229,6 +259,10 @@ pub struct SketchOp {
     /// 2-D offset of the profile origin on the chosen plane.
     #[serde(default)]
     pub origin: [f64; 2],
+    /// Sketch on an existing solid face instead of a world plane.
+    /// Indices come from topology queries (`largest`, `top`, `bottom`, or a face index).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face: Option<FaceRef>,
 }
 
 fn default_sketch_id() -> String {
@@ -253,6 +287,15 @@ pub enum Profile {
     Circle(CircleProfile),
     Polyline(PolylineProfile),
     Arc(ArcProfile),
+    /// Outer contour with inner holes (multi-contour / pocket-with-islands).
+    Compound(CompoundProfile),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompoundProfile {
+    pub outer: Box<Profile>,
+    #[serde(default)]
+    pub holes: Vec<Profile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -343,10 +386,11 @@ fn default_revolve_angle() -> f64 {
     360.0
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum RevolveAxis {
     X,
     Y,
+    #[default]
     Z,
 }
 
@@ -363,7 +407,7 @@ pub struct CutOp {
     /// 3-D position of the tool profile.
     #[serde(default)]
     pub at: [f64; 3],
-    /// Plane on which the profile sits.
+    /// Plane on which the profile sits (ignored when `face` is set).
     #[serde(default)]
     pub plane: SketchPlane,
     /// When true (default), the cutter is extended through the entire solid
@@ -371,6 +415,9 @@ pub struct CutOp {
     /// Set false for a blind pocket of exactly `depth`.
     #[serde(default = "default_true")]
     pub through: bool,
+    /// Place the cut on a selected face of the current solid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face: Option<FaceRef>,
 }
 
 /// Boolean union: adds an extruded solid to the current solid.
@@ -382,6 +429,23 @@ pub struct FuseOp {
     pub at: [f64; 3],
     #[serde(default)]
     pub plane: SketchPlane,
+    /// Place the boss on a selected face of the current solid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face: Option<FaceRef>,
+}
+
+/// Boolean intersection: keep only the overlap of the current solid and an
+/// extruded tool from `profile`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommonOp {
+    pub profile: Profile,
+    pub depth: f64,
+    #[serde(default)]
+    pub at: [f64; 3],
+    #[serde(default)]
+    pub plane: SketchPlane,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face: Option<FaceRef>,
 }
 
 // ── Hole (convenience boolean subtract) ──────────────────────────────────────
@@ -393,7 +457,7 @@ pub struct HoleOp {
     /// Depth of the hole. Ignored when `through` is true (the default): the
     /// cutter is sized to the solid's bounding box so it always punches through.
     pub depth: f64,
-    /// 2-D center position on the hole plane.
+    /// 2-D center position on the hole plane / face UV.
     pub center: [f64; 2],
     /// Plane the hole is normal to (default XY → hole goes in Z).
     #[serde(default)]
@@ -401,6 +465,9 @@ pub struct HoleOp {
     /// Default true: through-hole. Set false for a blind hole of `depth`.
     #[serde(default = "default_true")]
     pub through: bool,
+    /// Drill on a selected face instead of a world plane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face: Option<FaceRef>,
 }
 
 // ── Fillet / chamfer ──────────────────────────────────────────────────────────
@@ -423,13 +490,14 @@ pub struct ChamferOp {
     pub edges: EdgeSelection,
 }
 
-/// Flexible edge selector: JSON string `"all"` or an integer array `[0, 3, 7]`.
+/// Flexible edge selector: JSON string `"all"` / `"top"` / `"longest"` or an
+/// integer array `[0, 3, 7]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum EdgeSelection {
-    /// Named selection – only `"all"` is defined in v0.
+    /// Named selection: `"all"`, `"top"`, `"longest"`, `"outer"`.
     Named(String),
-    /// Explicit edge indices as returned by `list_topology`.
+    /// Explicit edge indices as returned by topology queries.
     Indices(Vec<usize>),
 }
 
@@ -442,6 +510,24 @@ impl Default for EdgeSelection {
 impl EdgeSelection {
     pub fn is_all(&self) -> bool {
         matches!(self, EdgeSelection::Named(s) if s == "all")
+    }
+}
+
+/// Face selector for shell / thicken / sketch-on-face / cut-on-face.
+/// JSON: `"largest"`, `"top"`, `"bottom"`, or a zero-based face index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum FaceRef {
+    Named(String),
+    Index(usize),
+}
+
+impl FaceRef {
+    pub fn as_named(&self) -> Option<&str> {
+        match self {
+            FaceRef::Named(s) => Some(s.as_str()),
+            FaceRef::Index(_) => None,
+        }
     }
 }
 
@@ -572,6 +658,18 @@ pub struct PatternOp {
     /// Circular: center of the pattern.
     #[serde(default)]
     pub center: [f64; 3],
+    /// `"body"` (default) patterns the whole solid. `"feature"` re-applies the
+    /// last cut/fuse/hole tool at each instance (bolt circles, hole grids).
+    #[serde(default)]
+    pub scope: PatternScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternScope {
+    #[default]
+    Body,
+    Feature,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -596,6 +694,91 @@ pub struct DraftExtrudeOp {
     pub depth: f64,
     /// Draft angle in degrees. Positive tapers inward toward the top.
     pub angle: f64,
+}
+
+/// Sweep a profile along a 3-D path (polyline or helix).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SweepOp {
+    pub profile: Profile,
+    pub path: SweepPath,
+    /// When true (default), fuse the swept solid into the current body if one exists.
+    #[serde(default = "default_true")]
+    pub fuse: bool,
+}
+
+/// Circular pipe / tube along a path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PipeOp {
+    /// Outer diameter of the pipe solid.
+    pub diameter: f64,
+    pub path: SweepPath,
+    /// When true (default), fuse into the current body if one exists.
+    #[serde(default = "default_true")]
+    pub fuse: bool,
+}
+
+/// Path for sweep / pipe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepPath {
+    Polyline {
+        /// At least 2 points in world XYZ.
+        points: Vec<[f64; 3]>,
+    },
+    Helix {
+        pitch: f64,
+        height: f64,
+        radius: f64,
+        #[serde(default)]
+        center: [f64; 3],
+        #[serde(default)]
+        axis: RevolveAxis,
+    },
+}
+
+/// Thicken the current sketch face (or a selected solid face) into a solid.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThickenOp {
+    pub thickness: f64,
+    /// Optional face on the current solid. If omitted, thickens `current_face`
+    /// from the last sketch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face: Option<FaceRef>,
+    #[serde(default = "default_true")]
+    pub fuse: bool,
+}
+
+/// Build a helical solid (spring / coil) by piping a circular section along a helix.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HelixOp {
+    pub pitch: f64,
+    pub height: f64,
+    /// Helix radius (centerline distance from axis).
+    pub radius: f64,
+    /// Wire / tube section diameter.
+    pub diameter: f64,
+    #[serde(default)]
+    pub center: [f64; 3],
+    #[serde(default)]
+    pub axis: RevolveAxis,
+    #[serde(default = "default_true")]
+    pub fuse: bool,
+}
+
+/// Apply a draft angle to selected faces of the current solid.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DraftOp {
+    /// Face indices or `"largest"` / `"side"`.
+    pub faces: EdgeSelection,
+    /// Draft angle in degrees.
+    pub angle: f64,
+    /// Pull direction (default +Z).
+    #[serde(default = "default_z_dir")]
+    pub direction: [f64; 3],
+}
+
+fn default_z_dir() -> [f64; 3] {
+    [0.0, 0.0, 1.0]
 }
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -653,6 +836,12 @@ impl Feature {
                         return Err(err("arc.radius must be positive"));
                     }
                 }
+                Profile::Compound(c) => {
+                    validate_profile_nested(&c.outer, index, "compound.outer")?;
+                    for (hi, h) in c.holes.iter().enumerate() {
+                        validate_profile_nested(h, index, &format!("compound.holes[{hi}]"))?;
+                    }
+                }
             },
             Feature::Extrude(op) => {
                 if op.depth <= 0.0 {
@@ -677,6 +866,7 @@ impl Feature {
                         op.depth
                     )));
                 }
+                validate_profile_nested(&op.profile, index, "cut.profile")?;
             }
             Feature::Fuse(op) => {
                 if op.depth <= 0.0 {
@@ -685,6 +875,16 @@ impl Feature {
                         op.depth
                     )));
                 }
+                validate_profile_nested(&op.profile, index, "fuse.profile")?;
+            }
+            Feature::Common(op) => {
+                if op.depth <= 0.0 {
+                    return Err(err(&format!(
+                        "common.depth must be positive (got {})",
+                        op.depth
+                    )));
+                }
+                validate_profile_nested(&op.profile, index, "common.profile")?;
             }
             Feature::Hole(op) => {
                 if op.diameter <= 0.0 {
@@ -768,21 +968,7 @@ impl Feature {
                     ));
                 }
                 for (si, sec) in op.sections.iter().enumerate() {
-                    match &sec.profile {
-                        Profile::Rect(r) if r.w <= 0.0 || r.h <= 0.0 => {
-                            return Err(err(&format!("loft section {si}: rect size must be positive")));
-                        }
-                        Profile::Circle(c) if c.d <= 0.0 => {
-                            return Err(err(&format!("loft section {si}: circle.d must be positive")));
-                        }
-                        Profile::Polyline(p) if p.points.len() < 3 => {
-                            return Err(err(&format!("loft section {si}: polyline needs ≥ 3 points")));
-                        }
-                        Profile::Arc(a) if a.radius <= 0.0 => {
-                            return Err(err(&format!("loft section {si}: arc.radius must be positive")));
-                        }
-                        _ => {}
-                    }
+                    validate_profile_nested(&sec.profile, index, &format!("loft section {si}"))?;
                 }
             }
             Feature::Mirror(_) => {}
@@ -809,9 +995,104 @@ impl Feature {
                     return Err(err("draft_extrude.depth must be positive"));
                 }
             }
+            Feature::Sweep(op) => {
+                validate_profile_nested(&op.profile, index, "sweep.profile")?;
+                validate_sweep_path(&op.path, index)?;
+            }
+            Feature::Pipe(op) => {
+                if op.diameter <= 0.0 {
+                    return Err(err("pipe.diameter must be positive"));
+                }
+                validate_sweep_path(&op.path, index)?;
+            }
+            Feature::Thicken(op) => {
+                if op.thickness == 0.0 {
+                    return Err(err("thicken.thickness must be non-zero"));
+                }
+            }
+            Feature::Helix(op) => {
+                if op.pitch <= 0.0 {
+                    return Err(err("helix.pitch must be positive"));
+                }
+                if op.height <= 0.0 {
+                    return Err(err("helix.height must be positive"));
+                }
+                if op.radius <= 0.0 {
+                    return Err(err("helix.radius must be positive"));
+                }
+                if op.diameter <= 0.0 {
+                    return Err(err("helix.diameter must be positive"));
+                }
+            }
+            Feature::Draft(op) => {
+                if op.angle == 0.0 {
+                    return Err(err("draft.angle must be non-zero"));
+                }
+            }
         }
         Ok(())
     }
+}
+
+fn validate_profile_nested(
+    profile: &Profile,
+    index: usize,
+    label: &str,
+) -> Result<(), ValidationError> {
+    let err = |msg: String| ValidationError::InvalidParameter { index, message: msg };
+    match profile {
+        Profile::Rect(r) if r.w <= 0.0 || r.h <= 0.0 => {
+            Err(err(format!("{label}: rect size must be positive")))
+        }
+        Profile::Circle(c) if c.d <= 0.0 => {
+            Err(err(format!("{label}: circle.d must be positive")))
+        }
+        Profile::Polyline(p) if p.points.len() < 3 => {
+            Err(err(format!("{label}: polyline needs ≥ 3 points")))
+        }
+        Profile::Arc(a) if a.radius <= 0.0 => {
+            Err(err(format!("{label}: arc.radius must be positive")))
+        }
+        Profile::Compound(c) => {
+            validate_profile_nested(&c.outer, index, &format!("{label}.outer"))?;
+            for (hi, h) in c.holes.iter().enumerate() {
+                validate_profile_nested(h, index, &format!("{label}.holes[{hi}]"))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_sweep_path(path: &SweepPath, index: usize) -> Result<(), ValidationError> {
+    let err = |msg: &str| ValidationError::InvalidParameter {
+        index,
+        message: msg.to_string(),
+    };
+    match path {
+        SweepPath::Polyline { points } => {
+            if points.len() < 2 {
+                return Err(err("path polyline needs ≥ 2 points"));
+            }
+        }
+        SweepPath::Helix {
+            pitch,
+            height,
+            radius,
+            ..
+        } => {
+            if *pitch <= 0.0 {
+                return Err(err("path helix.pitch must be positive"));
+            }
+            if *height <= 0.0 {
+                return Err(err("path helix.height must be positive"));
+            }
+            if *radius <= 0.0 {
+                return Err(err("path helix.radius must be positive"));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Unit Tests ────────────────────────────────────────────────────────────────
@@ -849,6 +1130,7 @@ mod tests {
                     plane: SketchPlane::XY,
                     profile: Profile::Rect(RectProfile { w: 10.0, h: 10.0, at: [0.0; 2], centered: true }),
                     origin: [0.0; 2],
+                    face: None,
                 }),
                 Feature::Extrude(ExtrudeOp { id: "b".into(), depth: -1.0, symmetric: false }),
             ],
@@ -867,10 +1149,46 @@ mod tests {
                     center: [0.0; 2],
                     plane: SketchPlane::XY,
                     through: true,
+                    face: None,
                 }),
             ],
         };
         assert!(prog.validate().is_err());
+    }
+
+    #[test]
+    fn new_ops_parse() {
+        let json = r#"{
+            "units": "mm",
+            "features": [
+                { "op": "box", "size": [10,10,10], "centered": true },
+                { "op": "common", "depth": 10, "profile": { "circle": { "d": 8 } } },
+                { "op": "pipe", "diameter": 4,
+                  "path": { "polyline": { "points": [[0,0,0],[10,0,0]] } } },
+                { "op": "pattern", "scope": "feature", "kind": "linear",
+                  "count": 3, "spacing": 5, "direction": [1,0,0] },
+                { "op": "thicken", "thickness": 2 },
+                { "op": "helix", "pitch": 5, "height": 20, "radius": 8, "diameter": 2 }
+            ]
+        }"#;
+        let prog: CadProgram = serde_json::from_str(json).unwrap();
+        assert_eq!(prog.features.len(), 6);
+        prog.validate().unwrap();
+    }
+
+    #[test]
+    fn compound_profile_parses() {
+        let json = r#"{
+            "op": "sketch",
+            "profile": {
+              "compound": {
+                "outer": { "rect": { "w": 20, "h": 20 } },
+                "holes": [ { "circle": { "d": 4 } } ]
+              }
+            }
+        }"#;
+        let sketch: SketchOp = serde_json::from_str(json).unwrap();
+        assert!(matches!(sketch.profile, Profile::Compound(_)));
     }
 
     #[test]
@@ -920,6 +1238,23 @@ mod tests {
         assert!(matches!(prog.features[1], Feature::Loft(_)));
         assert!(matches!(prog.features[2], Feature::Mirror(_)));
         assert!(matches!(prog.features[3], Feature::Pattern(_)));
+    }
+
+    #[test]
+    fn from_json_resolves_parameter_refs() {
+        let json = serde_json::json!({
+            "units": "mm",
+            "parameters": { "w": 30.0, "d": 20.0, "t": 8.0 },
+            "bodies": [{
+                "bodyId": "b",
+                "features": [{ "op": "box", "size": ["w", "d", "t"], "centered": true }]
+            }]
+        });
+        let doc = CadDocument::from_json_value(json).unwrap();
+        doc.validate().unwrap();
+        let out = crate::engine::Engine::default().execute_document(&doc).unwrap();
+        assert!(out.metrics.volume > 0.0);
+        assert_eq!(doc.parameters.get("w"), Some(&30.0));
     }
 
     #[test]

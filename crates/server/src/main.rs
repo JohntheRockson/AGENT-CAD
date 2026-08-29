@@ -4,6 +4,8 @@
 //! - `POST /api/run`    – execute a CadProgram, return mesh + metrics
 //! - `POST /api/export` – execute a CadProgram, stream back a binary file
 //! - `POST /api/chat`   – natural language → Gemini → CadProgram → mesh (with repair loop)
+//! - `POST /api/topology` – list faces/edges with semantic tags for agent selection
+//! - `POST /api/verify`  – deterministic structural checks (no LLM)
 //! - `GET  /api/health` – liveness probe
 //!
 //! # Geometry backend
@@ -33,7 +35,8 @@ use axum::{
 use bytes::Bytes;
 use kernel::{
     engine::{DocumentOutput, Engine, ExportFormat, MetricsData},
-    ir::{CadBody, CadDocument},
+    ir::{CadBody, CadDocument, Units},
+    verify::{self, VerificationReport},
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
@@ -51,10 +54,11 @@ Convert the user's description into a CadDocument: one or more independent bodie
   { "say": "<2–4 sentence summary>", "document": {
       "documentId": "<slug>",
       "units": "mm",
+      "parameters": { "plate_width": 80, "plate_depth": 40, "plate_thickness": 10 },
       "bodies": [
         { "bodyId": "<slug>", "name": "<label>", "visible": true,
           "transform": { "position": [0,0,0], "rotation": [0,0,0] },
-          "features": [ { "op": "box", ... } ],
+          "features": [ { "op": "box", "size": ["plate_width", "plate_depth", "plate_thickness"] } ],
           "references": [] }
       ]
     } }
@@ -64,6 +68,14 @@ Convert the user's description into a CadDocument: one or more independent bodie
 - Legacy single-solid `{ "say", "program": { "units", "features" } }` is allowed and becomes one body.
 - `say` is a 2–4 sentence summary of what you built. No JSON, no op names. Plain English.
 - Feature ops still use `"op"` (not `"type"`). Sizes > 0. Coordinates MAY be negative.
+
+## Parameters (CRITICAL for verification)
+- Put every important dimension in `"parameters": { "name": number, ... }` at document root.
+- Reference parameters by name (string) anywhere a number is allowed:
+  `"size": ["plate_width", "plate_depth", "plate_thickness"]`, `"depth": "plate_thickness"`, `"diameter": "hole_dia"`.
+- Use descriptive snake_case names (`plate_width`, `hole_dia`, `boss_height`). All values > 0.
+- When editing one dimension, update the parameter value — features should keep referencing the name.
+- Deterministic verification checks each parameter against measured geometry; do not rely on chat prose for sizes.
 
 ## Multi-body (CRITICAL)
 - Assemblies and multi-part designs MUST be separate bodies (base plate, bracket, shaft, fasteners, lid, …) — never one fused blob.
@@ -93,20 +105,24 @@ Convert the user's description into a CadDocument: one or more independent bodie
 ## CadProgram schema
 { "units": "mm"|"in", "features": [ ...ops tagged by "op"... ] }
 
-## Profiles (used by sketch, cut, fuse, loft)
+## Profiles (used by sketch, cut, fuse, loft, sweep, common)
 { "rect":     { "w": <w>, "h": <h>, "at": [x,y], "centered": true } }
 { "circle":   { "d": <diameter>, "at": [x,y] } }          — `at` is the CENTER
 { "polyline": { "points": [[x,y],...], "closed": true } } — ≥3 points, coords may be negative
 { "arc":      { "center": [x,y], "radius": <r>, "start_angle": <deg>, "end_angle": <deg> } }
+{ "compound": { "outer": <Profile>, "holes": [ <Profile>, ... ] } }
+          Multi-contour: outer profile with inner holes (flange with cutouts, pocket islands).
 
 Set `"centered": false` on a rect ONLY when `at` should be the min-corner, not the center.
 
 ## Feature ops
 
 ### 2D → 3D
-sketch         { "op":"sketch", "plane":"XY"|"XZ"|"YZ", "profile": <Profile>, "origin":[x,y] }
+sketch         { "op":"sketch", "plane":"XY"|"XZ"|"YZ", "profile": <Profile>, "origin":[x,y],
+                 "face":"largest"|"top"|"bottom"|<index> }
+               Optional `face` places the sketch on an existing solid face (then extrude/thicken).
 extrude        { "op":"extrude", "depth": <positive>, "symmetric": false }
-               symmetric:true extrudes depth/2 both ways.
+               symmetric:true extrudes depth/2 both ways. On a face-sketch, fuses into the solid.
 draft_extrude  { "op":"draft_extrude", "depth": <positive>, "angle": <deg> }
                Tapered extrusion of the last sketch. Positive angle tapers inward (pyramid-like).
 revolve        { "op":"revolve", "axis":"X"|"Y"|"Z", "angle":360, "origin":[x,y,z] }
@@ -121,6 +137,15 @@ revolve        { "op":"revolve", "axis":"X"|"Y"|"Z", "angle":360, "origin":[x,y,
 loft           { "op":"loft", "ruled": true, "sections": [ {"profile":<Profile>, "at":[x,y,z]}, ... ], "apex": [x,y,z] }
                ≥2 sections, OR 1 section plus apex. ruled:true = flat sides (square pyramid).
                Keep section XY at 0 and increase Z for a centered pyramid.
+sweep          { "op":"sweep", "profile":<Profile>, "path": <Path>, "fuse": true }
+pipe           { "op":"pipe", "diameter":<d>, "path": <Path>, "fuse": true }
+               Path: { "polyline": { "points": [[x,y,z],...] } } (≥2 pts)
+                  or { "helix": { "pitch":<p>, "height":<h>, "radius":<r>, "center":[x,y,z], "axis":"Z" } }
+helix          { "op":"helix", "pitch":<p>, "height":<h>, "radius":<r>, "diameter":<wire_d>,
+                 "center":[x,y,z], "axis":"Z", "fuse": true }
+               Spring / coil: pipes a circular section along a helix.
+thicken        { "op":"thicken", "thickness":<t>, "face":"largest"|<index>, "fuse": true }
+               Thickens the last sketch face, or a selected solid face, into a solid.
 
 ### Primitives (can be the FIRST feature — no sketch needed)
 box       { "op":"box", "size":[dx,dy,dz], "at":[x,y,z], "centered": true }
@@ -132,30 +157,40 @@ cone      { "op":"cone", "d1":<base>, "d2":<top>, "height":<h>, "at":[x,y,z] }
 torus     { "op":"torus", "major":<R>, "minor":<r>, "at":[x,y,z] }
 
 ### Booleans & holes
-hole  { "op":"hole", "diameter":<d>, "depth":<h>, "center":[x,y], "plane":"XY" }
-      Through-hole by default (punches through the whole solid). Set "through": false for a blind hole of `depth`.
-cut   { "op":"cut",  "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
-      Through-cut by default. The cutter is extended through the solid so it cannot leave a dimple
-      if `at` is on the wrong side. Set "through": false for a blind pocket of exactly `depth`.
-      Plane UV: XY=(X,Y), XZ=(X,Z), YZ=(Y,Z). A side hole through a Z-axis tube at height 40:
-      `"plane":"YZ", "profile":{"circle":{"d":3,"at":[0,40]}}` — at is (Y,Z), cut along X.
-fuse  { "op":"fuse", "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
-      Default plane is XY. `at` is the world-space origin of the tool (bottom of the extrusion).
-      To stack on the ground, use at [0, 0, z] with plane XY. Do not use plane XZ.
+hole  { "op":"hole", "diameter":<d>, "depth":<h>, "center":[x,y], "plane":"XY",
+        "face":"largest"|"top"|<index> }
+      Through-hole by default. Prefer `face` when drilling on a selected face.
+cut   { "op":"cut",  "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY",
+        "face":"largest"|"top"|<index>, "through": true }
+      Through-cut by default. Use `face` to pocket/cut on a solid face.
+fuse  { "op":"fuse", "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY",
+        "face":"largest"|"top"|<index> }
+      Boss on a plane or on a selected face.
+common { "op":"common", "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
+      Boolean intersection (keep only overlap with the extruded tool).
 
 ### Modify the current solid
-fillet    { "op":"fillet", "radius":<r>, "edges":"all"|[0,3,7] }
-          `all` fillets the top perimeter of a plate (not the thickness edges or
-          the bottom). r must be less than the local wall thickness. On a 6 mm lid,
-          r=5 leaves a ~1 mm vertical band — that is correct, not a missing fillet.
-chamfer   { "op":"chamfer", "distance":<d>, "edges":"all"|[0,3,7] }
+fillet    { "op":"fillet", "radius":<r>, "edges":"all"|"top"|"longest"|[0,3,7] }
+          `all`/`top` fillets the top perimeter of a plate (not thickness edges).
+chamfer   { "op":"chamfer", "distance":<d>, "edges":"all"|"top"|"longest"|[0,3,7] }
 transform { "op":"transform", "translate":[x,y,z], "rotate":{"axis":[x,y,z],"angle":<deg>,"origin":[x,y,z]}, "scale":<s> }
 mirror    { "op":"mirror", "plane":"YZ"|"XZ"|"XY", "origin":[x,y,z], "fuse": true }
-          YZ flips X, XZ flips Y, XY flips Z. fuse:true unions the copy with the original.
-pattern   { "op":"pattern", "kind":"linear"|"circular", "count":<n≥2>, "spacing":<d>, "direction":[x,y,z],
-            "axis":"Z", "angle":<deg>, "center":[x,y,z] }
-shell     { "op":"shell", "thickness":<t>, "faces":"all"|[0] }
-          "all" (default) = closed hollow. Integer indices = faces to open.
+pattern   { "op":"pattern", "kind":"linear"|"circular", "count":<n≥2>, "spacing":<d>,
+            "direction":[x,y,z], "axis":"Z", "angle":<deg>, "center":[x,y,z],
+            "scope":"body"|"feature" }
+          scope "body" (default) patterns the whole solid.
+          scope "feature" re-applies the LAST cut/fuse/hole tool (bolt circles, hole grids).
+          Example bolt circle: hole at [20,0], then
+            { "op":"pattern", "scope":"feature", "kind":"circular", "count":6,
+              "center":[0,0,0], "axis":"Z", "angle":60 }
+shell     { "op":"shell", "thickness":<t>, "faces":"all"|[0]|"largest" }
+draft     { "op":"draft", "faces":"side"|[indices], "angle":<deg>, "direction":[0,0,1] }
+
+## Topology for agents
+Prefer semantic selectors over raw indices when possible:
+  face: "largest" | "top" | "bottom" | <index>
+  edges: "all" | "top" | "longest" | [indices]
+Call /api/topology with the current program when fillets/faces fail; it returns tagged faces/edges.
 
 ## How to build common shapes
 Stepped pyramid (square, stairs on every side, CENTERED):
@@ -176,6 +211,10 @@ Smooth circular pyramid / cone:  { "op":"cone", "d1":100, "d2":0, "height":60 }
 L-bracket / anything not a rectangle: use a closed polyline with negative AND positive points
   e.g. points [[0,0],[80,0],[80,10],[10,10],[10,50],[0,50]] then extrude. Center with transform if needed.
 
+Hole grid on a plate: one hole, then pattern scope=feature linear/circular.
+Pipe frame: pipe/sweep with a polyline path.
+Flange with bolt holes in one sketch: compound outer rect + hole circles, then extrude.
+
 ## Example — venturi / lathe tube (half-section on XZ, revolve around Z)
 {
   "units": "mm",
@@ -190,14 +229,15 @@ L-bracket / anything not a rectangle: use a closed polyline with negative AND po
   ]
 }
 
-## Example — centered mounting plate
+## Example — centered mounting plate with feature pattern
 {
   "units": "mm",
   "features": [
     { "op": "box", "size": [80, 40, 10], "centered": true },
     { "op": "hole", "diameter": 8, "depth": 15, "center": [-25, 0] },
-    { "op": "hole", "diameter": 8, "depth": 15, "center": [25, 0] },
-    { "op": "fillet", "radius": 3, "edges": "all" }
+    { "op": "pattern", "scope": "feature", "kind": "linear", "count": 2,
+      "spacing": 50, "direction": [1, 0, 0] },
+    { "op": "fillet", "radius": 3, "edges": "top" }
   ]
 }
 
@@ -243,6 +283,8 @@ struct RunResponse {
     mesh: Option<MeshPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics: Option<MetricsPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<VerificationPayload>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     bodies: Vec<BodyPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -273,10 +315,25 @@ struct MeshPayload {
 #[derive(Serialize)]
 struct MetricsPayload {
     volume: f64,
-    /// [xmin, ymin, zmin, xmax, ymax, zmax]
+    /// [xmin, ymin, zmin, xmax, ymax, zmax] in document units
     bbox: [f64; 6],
     surface_area: f64,
     is_solid: bool,
+    /// Linear/volume values are expressed in these units (not cosmetic labels).
+    units: String,
+}
+
+#[derive(Serialize)]
+struct VerificationPayload {
+    passed: bool,
+    checks: Vec<VerificationCheckPayload>,
+}
+
+#[derive(Serialize)]
+struct VerificationCheckPayload {
+    name: String,
+    passed: bool,
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -296,11 +353,16 @@ struct ChatRequest {
     /// Prior conversation turns sent by the frontend for multi-turn context.
     #[serde(default)]
     history: Vec<HistoryMessage>,
-    /// Current multi-body document so the agent can patch one body.
-    #[serde(default)]
-    document: Option<CadDocument>,
-    #[serde(default, alias = "targetBodyId")]
-    target_body_id: Option<String>,
+  /// Current multi-body document so the agent can patch one body.
+  #[serde(default)]
+  document: Option<CadDocument>,
+  #[serde(default, alias = "targetBodyId")]
+  target_body_id: Option<String>,
+  /// When the user scrubbed the design timeline, this is the active step index.
+  #[serde(default, alias = "timelineStepIndex")]
+  timeline_step_index: Option<u32>,
+  #[serde(default, alias = "timelineStepLabel")]
+  timeline_step_label: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -323,7 +385,10 @@ enum ChatSseEvent {
     CalculatingStart,
     CalculatingDone { ms: u64 },
     VerifyingStart,
-    VerifyingDone { ms: u64 },
+    VerifyingDone {
+        ms: u64,
+        verification: VerificationPayload,
+    },
     Result {
         success: bool,
         message: String,
@@ -411,6 +476,71 @@ async fn health_handler() -> &'static str {
     "ok"
 }
 
+/// POST /api/verify — deterministic structural checks (no LLM).
+async fn verify_handler(
+    Json(body): Json<RunRequest>,
+) -> Json<serde_json::Value> {
+    let document = match scene_from_values(body.document, body.program) {
+        Ok(d) => d,
+        Err(e) => {
+            return Json(serde_json::json!({ "success": false, "error": e }));
+        }
+    };
+    let engine = Engine::new();
+    let document_for_kernel = document.clone();
+    let result = tokio::task::spawn_blocking(move || engine.execute_document(&document_for_kernel))
+        .await
+        .unwrap_or_else(|e| {
+            Err(kernel::engine::KernelError::InvalidState(format!(
+                "verify task panicked: {e}"
+            )))
+        });
+    match result {
+        Ok(output) => {
+            let report = verify::verify_structure(&document, &output);
+            Json(serde_json::json!({
+                "success": true,
+                "passed": report.passed,
+                "verification": verification_payload(&report),
+                "metrics": metrics_payload(&output.metrics, &document.units),
+            }))
+        }
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// POST /api/topology — face/edge listing with semantic tags for the agent.
+async fn topology_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RunRequest>,
+) -> Json<serde_json::Value> {
+    let document = match scene_from_values(body.document, body.program) {
+        Ok(d) => d,
+        Err(e) => {
+            return Json(serde_json::json!({ "success": false, "error": e }));
+        }
+    };
+    let Some(body0) = document.bodies.first() else {
+        return Json(serde_json::json!({ "success": false, "error": "empty document" }));
+    };
+    let program = kernel::ir::CadProgram {
+        units: document.units.clone(),
+        features: body0.features.clone(),
+    };
+    let engine = state.engine;
+    let result = tokio::task::spawn_blocking(move || engine.list_topology(&program))
+        .await
+        .unwrap_or_else(|e| {
+            Err(kernel::engine::KernelError::InvalidState(format!(
+                "topology task panicked: {e}"
+            )))
+        });
+    match result {
+        Ok(report) => Json(serde_json::json!({ "success": true, "topology": report })),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
 /// POST /api/run
 ///
 /// Body:  `{ "document": <CadDocument> }` or `{ "program": <CadProgram|CadDocument> }`
@@ -425,6 +555,7 @@ async fn run_handler(
                 success: false,
                 mesh: None,
                 metrics: None,
+                verification: None,
                 bodies: vec![],
                 error: Some(e),
             })
@@ -432,8 +563,10 @@ async fn run_handler(
     };
 
     let engine = state.engine;
+    let units = document.units;
     let started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || engine.execute_document(&document))
+    let document_for_kernel = document.clone();
+    let result = tokio::task::spawn_blocking(move || engine.execute_document(&document_for_kernel))
         .await
         .unwrap_or_else(|e| {
             Err(kernel::engine::KernelError::InvalidState(format!(
@@ -446,11 +579,15 @@ async fn run_handler(
     );
 
     match result {
-        Ok(output) => Json(document_run_response(output)),
+        Ok(output) => {
+            let report = verify::verify_structure(&document, &output);
+            Json(document_run_response(output, &units, Some(&report)))
+        }
         Err(e) => Json(RunResponse {
             success: false,
             mesh: None,
             metrics: None,
+            verification: None,
             bodies: vec![],
             error: Some(e.to_string()),
         }),
@@ -697,20 +834,17 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
 
                 emit(&tx, ChatSseEvent::VerifyingStart).await;
                 let verify_start = Instant::now();
-                let verdict = verify_against_request(
-                    &state,
-                    &body.message,
-                    &document,
-                    &output.metrics,
-                )
-                .await;
+                let report = verify::verify_document(&body.message, &document, &output);
                 emit(
                     &tx,
                     ChatSseEvent::VerifyingDone {
                         ms: elapsed_ms(verify_start),
+                        verification: verification_payload(&report),
                     },
                 )
                 .await;
+                let verdict = verify_against_report(&state, &body.message, &document, &output, &report)
+                    .await;
 
                 match verdict {
                     VerifyVerdict::Mismatch { reason, document: Some(fixed) } => {
@@ -770,7 +904,15 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                                         "Updated the model after checking it against your request."
                                             .to_string()
                                     });
-                                emit_success(&tx, message, program_val, output, attempt).await;
+                                emit_success(
+                                    &tx,
+                                    message,
+                                    program_val,
+                                    output,
+                                    &fixed.units,
+                                    attempt,
+                                )
+                                .await;
                                 return;
                             }
                             Err(kern_err) => {
@@ -819,13 +961,21 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                         });
                         continue;
                     }
-                    VerifyVerdict::Ok { say: verified_say } | VerifyVerdict::Skipped { say: verified_say } => {
+                    VerifyVerdict::Ok { say: verified_say } => {
                         let program_val = serde_json::to_value(&document).unwrap_or_default();
                         let message = verified_say
                             .or(say)
                             .filter(|s| !s.trim().is_empty())
                             .unwrap_or_else(|| "Updated the model.".to_string());
-                        emit_success(&tx, message, program_val, output, attempt).await;
+                        emit_success(
+                            &tx,
+                            message,
+                            program_val,
+                            output,
+                            &document.units,
+                            attempt,
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -841,9 +991,13 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                     },
                 )
                 .await;
+                let topo_hint = topology_hint_for_document(&state.engine, &document).await;
                 let repair = format!(
                     "The geometry kernel rejected the program: {kern_err}. \
-                     Fix the CadProgram and return ONLY the corrected JSON object."
+                     Prefer face:\"largest\"|\"top\"|\"bottom\" and edges:\"top\"|\"longest\". \
+                     For hole grids use pattern with scope:\"feature\" after the first hole. \
+                     {topo_hint}\
+                     Fix the CadDocument and return ONLY the corrected JSON object."
                 );
                 contents.push(GeminiContent {
                     role: "model".to_string(),
@@ -873,6 +1027,7 @@ async fn emit_success(
     message: String,
     program_val: serde_json::Value,
     output: DocumentOutput,
+    units: &Units,
     attempts: u32,
 ) {
     let combined = output.clone().into_model_output().ok();
@@ -883,8 +1038,8 @@ async fn emit_success(
             message,
             program: Some(program_val),
             mesh: combined.as_ref().map(|o| mesh_payload(&o.mesh)),
-            metrics: Some(metrics_payload(&output.metrics)),
-            bodies: body_payloads(&output),
+            metrics: Some(metrics_payload(&output.metrics, units)),
+            bodies: body_payloads(&output, units),
             error: None,
             attempts,
         },
@@ -894,7 +1049,6 @@ async fn emit_success(
 
 enum VerifyVerdict {
     Ok { say: Option<String> },
-    Skipped { say: Option<String> },
     Mismatch {
         reason: String,
         document: Option<CadDocument>,
@@ -916,40 +1070,38 @@ struct VerifyJson {
     body: Option<serde_json::Value>,
 }
 
-/// Ask Gemini whether the built solid matches the user's request.
-/// Fails open (Skipped) if the API errors — we still show the geometry.
-async fn verify_against_request(
+/// Optional Gemini prose after deterministic checks already passed.
+async fn verify_against_report(
     state: &AppState,
     user_message: &str,
     document: &CadDocument,
-    metrics: &MetricsData,
+    output: &DocumentOutput,
+    report: &VerificationReport,
 ) -> VerifyVerdict {
+    if !report.passed {
+        tracing::warn!("deterministic verify failed: {}", report.summary());
+        return VerifyVerdict::Mismatch {
+            reason: format!("Verification failed: {}", report.summary()),
+            document: None,
+        };
+    }
+
+    // Deterministic checks passed — optional LLM for a polished `say` line only.
+    let metrics = &output.metrics;
     let [xmin, ymin, zmin, xmax, ymax, zmax] = metrics.bbox;
     let dx = (xmax - xmin).abs();
     let dy = (ymax - ymin).abs();
     let dz = (zmax - zmin).abs();
-    let program_json = serde_json::to_string_pretty(document).unwrap_or_default();
-    let n_bodies = document.bodies.len();
+    let units = document.units.as_str();
 
     let prompt = format!(
         "The user asked:\n{user_message}\n\n\
-         You produced this CadDocument ({n_bodies} bodies):\n{program_json}\n\n\
-         The kernel built solids with combined:\n\
-         - bbox [xmin,ymin,zmin,xmax,ymax,zmax] = [{xmin:.2}, {ymin:.2}, {zmin:.2}, {xmax:.2}, {ymax:.2}, {zmax:.2}]\n\
-         - extents dx={dx:.2} dy={dy:.2} dz={dz:.2}\n\
-         - volume = {vol:.2}\n\
-         - surface_area = {area:.2}\n\n\
-         Does this match what the user asked for?\n\
-         Rules:\n\
-         - Assemblies should be multiple bodies, not one fused blob.\n\
-         - A tube/venturi along Z must have similar dx and dy AND a real dz (not a disk).\n\
-         - Volume must be clearly > 0.\n\
-         Reply with JSON only:\n\
-         {{ \"ok\": true, \"say\": \"<2-4 sentence description>\" }}\n\
-         or\n\
-         {{ \"ok\": false, \"reason\": \"<what's wrong>\", \"say\": \"...\", \"document\": {{ ...fixed CadDocument }} }}",
-        vol = metrics.volume,
-        area = metrics.surface_area,
+         Deterministic verification PASSED for this solid ({units}):\n\
+         - bbox [{xmin:.2}, {ymin:.2}, {zmin:.2}, {xmax:.2}, {ymax:.2}, {zmax:.2}] {units}\n\
+         - extents {dx:.2}×{dy:.2}×{dz:.2} {units}\n\
+         - volume = {:.2} {units}³\n\
+         Reply JSON only: {{ \"ok\": true, \"say\": \"<2-4 sentence description>\" }}",
+        metrics.volume,
     );
 
     let req_body = GeminiRequest {
@@ -975,19 +1127,19 @@ async fn verify_against_request(
     let http_resp = match state.http.post(&url).json(&req_body).send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("verify call failed: {e}");
-            return VerifyVerdict::Skipped { say: None };
+            tracing::warn!("verify say call failed: {e}");
+            return VerifyVerdict::Ok { say: None };
         }
     };
     if !http_resp.status().is_success() {
         tracing::warn!("verify Gemini status {}", http_resp.status());
-        return VerifyVerdict::Skipped { say: None };
+        return VerifyVerdict::Ok { say: None };
     }
     let parsed: GeminiResponse = match http_resp.json().await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("verify deserialize failed: {e}");
-            return VerifyVerdict::Skipped { say: None };
+            return VerifyVerdict::Ok { say: None };
         }
     };
     let text = parsed
@@ -1000,35 +1152,11 @@ async fn verify_against_request(
     let json_text = extract_json(&text);
     let v: VerifyJson = match serde_json::from_str(&json_text) {
         Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("verify JSON parse failed: {e}");
-            return VerifyVerdict::Skipped { say: None };
-        }
+        Err(_) => return VerifyVerdict::Ok { say: None },
     };
 
-    if v.ok {
-        VerifyVerdict::Ok {
-            say: v.say.filter(|s| !s.trim().is_empty()),
-        }
-    } else {
-        let reason = v
-            .reason
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "geometry does not match the request".to_string());
-        let document = v
-            .document
-            .or(v.program)
-            .and_then(|val| CadDocument::from_json_value(val).ok())
-            .or_else(|| {
-                v.body.and_then(|b| {
-                    serde_json::from_value::<CadBody>(b).ok().map(|body| {
-                        let mut d = document.clone();
-                        d.replace_body(body);
-                        d
-                    })
-                })
-            });
-        VerifyVerdict::Mismatch { reason, document }
+    VerifyVerdict::Ok {
+        say: v.say.filter(|s| !s.trim().is_empty()),
     }
 }
 
@@ -1219,6 +1347,7 @@ fn parse_agent_payload(
         let mut doc = current.cloned().unwrap_or_else(|| CadDocument {
             document_id: "document".into(),
             units: kernel::ir::Units::Mm,
+            parameters: Default::default(),
             bodies: vec![],
         });
         doc.replace_body(patch);
@@ -1232,6 +1361,12 @@ fn parse_agent_payload(
 
 fn compose_user_prompt(body: &ChatRequest) -> String {
     let mut text = body.message.clone();
+    if let (Some(idx), Some(label)) = (body.timeline_step_index, body.timeline_step_label.as_deref()) {
+        text.push_str(&format!(
+            "\n\n[AgentCAD] The user is viewing design history step {idx} (\"{label}\"). \
+             Edit THIS document state; later timeline steps will be discarded after your change.\n"
+        ));
+    }
     let Some(doc) = body.document.as_ref() else {
         return text;
     };
@@ -1267,6 +1402,39 @@ fn compose_user_prompt(body: &ChatRequest) -> String {
     text
 }
 
+/// Best-effort topology summary for repair prompts (prefix of features that still build).
+async fn topology_hint_for_document(engine: &Engine, document: &CadDocument) -> String {
+    let Some(body) = document.bodies.first() else {
+        return String::new();
+    };
+    if body.features.len() < 2 {
+        return String::new();
+    }
+    // Drop the last feature — often the failing fillet/pattern — and query topology.
+    let mut features = body.features.clone();
+    features.pop();
+    let program = kernel::ir::CadProgram {
+        units: document.units.clone(),
+        features,
+    };
+    let engine = *engine;
+    let report = tokio::task::spawn_blocking(move || engine.list_topology(&program))
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+    match report {
+        Some(t) => format!(
+            "Topology hint (before last feature): faces={} edges={} largest_face={:?} top_face={:?} longest_edge={:?}. ",
+            t.summary.face_count,
+            t.summary.edge_count,
+            t.summary.largest_face,
+            t.summary.top_face,
+            t.summary.longest_edge
+        ),
+        None => String::new(),
+    }
+}
+
 fn scene_from_values(
     document: Option<serde_json::Value>,
     program: Option<serde_json::Value>,
@@ -1285,16 +1453,32 @@ fn mesh_payload(mesh: &kernel::engine::MeshData) -> MeshPayload {
     }
 }
 
-fn metrics_payload(m: &MetricsData) -> MetricsPayload {
+fn metrics_payload(m: &MetricsData, units: &Units) -> MetricsPayload {
     MetricsPayload {
         volume: m.volume,
         bbox: m.bbox,
         surface_area: m.surface_area,
         is_solid: m.is_solid,
+        units: units.as_str().to_string(),
     }
 }
 
-fn body_payloads(out: &DocumentOutput) -> Vec<BodyPayload> {
+fn verification_payload(report: &VerificationReport) -> VerificationPayload {
+    VerificationPayload {
+        passed: report.passed,
+        checks: report
+            .checks
+            .iter()
+            .map(|c| VerificationCheckPayload {
+                name: c.name.clone(),
+                passed: c.passed,
+                message: c.message.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn body_payloads(out: &DocumentOutput, units: &Units) -> Vec<BodyPayload> {
     out.bodies
         .iter()
         .map(|b| BodyPayload {
@@ -1303,18 +1487,23 @@ fn body_payloads(out: &DocumentOutput) -> Vec<BodyPayload> {
             visible: b.visible,
             suppressed: b.suppressed,
             mesh: mesh_payload(&b.mesh),
-            metrics: metrics_payload(&b.metrics),
+            metrics: metrics_payload(&b.metrics, units),
         })
         .collect()
 }
 
-fn document_run_response(output: DocumentOutput) -> RunResponse {
+fn document_run_response(
+    output: DocumentOutput,
+    units: &Units,
+    verification: Option<&VerificationReport>,
+) -> RunResponse {
     let combined = output.clone().into_model_output().ok();
     RunResponse {
         success: true,
         mesh: combined.as_ref().map(|o| mesh_payload(&o.mesh)),
-        metrics: Some(metrics_payload(&output.metrics)),
-        bodies: body_payloads(&output),
+        metrics: Some(metrics_payload(&output.metrics, units)),
+        verification: verification.map(verification_payload),
+        bodies: body_payloads(&output, units),
         error: None,
     }
 }
@@ -1367,6 +1556,8 @@ async fn main() {
     let app = Router::new()
         .route("/api/health", get(health_handler))
         .route("/api/run", post(run_handler))
+        .route("/api/topology", post(topology_handler))
+        .route("/api/verify", post(verify_handler))
         .route("/api/export", post(export_handler))
         .route("/api/chat", post(chat_handler))
         .layer(cors)

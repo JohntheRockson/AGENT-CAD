@@ -116,6 +116,10 @@ impl Engine {
         Engine { use_occt: false }
     }
 
+    pub fn uses_occt(&self) -> bool {
+        self.use_occt
+    }
+
     /// Compile the OCCT WASM module (once per process) and instantiate a kernel
     /// on this thread. Call at server startup so the first `/api/run` is not
     /// blocked on Cranelift.
@@ -420,6 +424,16 @@ pub(crate) mod occt_backend {
         face:  Option<u32>,   // raw arena ID, not ShapeHandle (avoids Send/Sync issues)
         solid: Option<u32>,
         plane: SketchPlane,
+        last_tool: Option<u32>,
+        last_boolean: Option<LastBoolean>,
+        face_normal: Option<[f64; 3]>,
+        base_before_face_sketch: Option<u32>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LastBoolean {
+        Cut,
+        Fuse,
     }
 
     thread_local! {
@@ -789,6 +803,13 @@ pub(crate) mod occt_backend {
         current_face: Option<Handle>,
         current_solid: Option<Handle>,
         active_plane: SketchPlane,
+        /// Tool shape from the last cut/fuse/hole (for feature-scope patterns).
+        last_tool: Option<Handle>,
+        last_boolean: Option<LastBoolean>,
+        /// When sketching on a face, extrude along this world normal.
+        face_normal: Option<[f64; 3]>,
+        /// Solid that existed before a face-based sketch (fused after extrude).
+        base_before_face_sketch: Option<Handle>,
     }
 
     impl Default for ExecState {
@@ -797,6 +818,10 @@ pub(crate) mod occt_backend {
                 current_face: None,
                 current_solid: None,
                 active_plane: SketchPlane::XY,
+                last_tool: None,
+                last_boolean: None,
+                face_normal: None,
+                base_before_face_sketch: None,
             }
         }
     }
@@ -1187,6 +1212,10 @@ pub(crate) mod occt_backend {
                 state.current_face  = e.face.map(id_to_handle);
                 state.current_solid = e.solid.map(id_to_handle);
                 state.active_plane  = e.plane.clone();
+                state.last_tool = e.last_tool.map(id_to_handle);
+                state.last_boolean = e.last_boolean;
+                state.face_normal = e.face_normal;
+                state.base_before_face_sketch = e.base_before_face_sketch.map(id_to_handle);
                 resume_from = i + 1;
             } else {
                 break;
@@ -1201,6 +1230,7 @@ pub(crate) mod occt_backend {
                 Feature::Revolve(op)       => handle_revolve(k, &mut state, op)?,
                 Feature::Cut(op)           => handle_cut(k, &mut state, op)?,
                 Feature::Fuse(op)          => handle_fuse(k, &mut state, op)?,
+                Feature::Common(op)        => handle_common(k, &mut state, op)?,
                 Feature::Hole(op)          => handle_hole(k, &mut state, op)?,
                 Feature::Fillet(op)        => handle_fillet(k, &mut state, op)?,
                 Feature::Chamfer(op)       => handle_chamfer(k, &mut state, op)?,
@@ -1215,6 +1245,11 @@ pub(crate) mod occt_backend {
                 Feature::Pattern(op)       => handle_pattern(k, &mut state, op)?,
                 Feature::Shell(op)         => handle_shell(k, &mut state, op)?,
                 Feature::DraftExtrude(op)  => handle_draft_extrude(k, &mut state, op)?,
+                Feature::Sweep(op)         => handle_sweep(k, &mut state, op)?,
+                Feature::Pipe(op)          => handle_pipe(k, &mut state, op)?,
+                Feature::Thicken(op)       => handle_thicken(k, &mut state, op)?,
+                Feature::Helix(op)         => handle_helix(k, &mut state, op)?,
+                Feature::Draft(op)         => handle_draft(k, &mut state, op)?,
             }
 
             // Evict oldest entry when the cache is full.
@@ -1227,6 +1262,10 @@ pub(crate) mod occt_backend {
                 face:  state.current_face.map(handle_to_id),
                 solid: state.current_solid.map(handle_to_id),
                 plane: state.active_plane.clone(),
+                last_tool: state.last_tool.map(handle_to_id),
+                last_boolean: state.last_boolean,
+                face_normal: state.face_normal,
+                base_before_face_sketch: state.base_before_face_sketch.map(handle_to_id),
             });
         }
 
@@ -1244,12 +1283,27 @@ pub(crate) mod occt_backend {
         state: &mut ExecState,
         op: &SketchOp,
     ) -> Result<(), KernelError> {
-        // Always build the profile on XY. The plane is applied after the 3-D
-        // operation (extrude/revolve/draft) so OCCT never has to prism a
-        // face along +Y/+X — that path produced perpendicular "cross" solids.
         let face = make_profile_face(k, &op.profile, op.origin)?;
-        state.current_face = Some(face);
-        state.active_plane = op.plane.clone();
+
+        if let Some(ref face_ref) = op.face {
+            let solid = state.current_solid.ok_or_else(|| {
+                KernelError::InvalidState("sketch on face requires an existing solid".into())
+            })?;
+            let frame = resolve_face_frame(k, solid, face_ref)?;
+            let placed = place_xy_shape_on_frame(k, face, &frame)?;
+            state.base_before_face_sketch = Some(solid);
+            state.face_normal = Some(frame.normal);
+            state.current_face = Some(placed);
+            state.active_plane = dominant_plane(&frame.normal);
+        } else {
+            // Always build the profile on XY. The plane is applied after the 3-D
+            // operation (extrude/revolve/draft) so OCCT never has to prism a
+            // face along +Y/+X — that path produced perpendicular "cross" solids.
+            state.current_face = Some(face);
+            state.active_plane = op.plane.clone();
+            state.face_normal = None;
+            state.base_before_face_sketch = None;
+        }
         Ok(())
     }
 
@@ -1262,23 +1316,49 @@ pub(crate) mod occt_backend {
             .current_face
             .ok_or_else(|| KernelError::InvalidState("extrude requires a preceding sketch".into()))?;
 
-        // Prism along +Z (the plane the face actually lives on), then rotate
-        // the solid onto the requested construction plane.
-        let solid = k
-            .extrude(face, 0.0, 0.0, op.depth)
-            .map_err(|e| occt_err(format!("extrude: {:?}", e)))?;
-
-        let solid = if op.symmetric {
-            k.translate(solid, 0.0, 0.0, -op.depth / 2.0)
-                .map_err(|e| occt_err(format!("extrude symmetric translate: {:?}", e)))?
+        let solid = if let Some(n) = state.face_normal {
+            let (dx, dy, dz) = if op.symmetric {
+                (n[0] * op.depth, n[1] * op.depth, n[2] * op.depth)
+            } else {
+                (n[0] * op.depth, n[1] * op.depth, n[2] * op.depth)
+            };
+            let mut solid = k
+                .extrude(face, dx, dy, dz)
+                .map_err(|e| occt_err(format!("extrude on face: {:?}", e)))?;
+            if op.symmetric {
+                solid = k
+                    .translate(solid, -n[0] * op.depth / 2.0, -n[1] * op.depth / 2.0, -n[2] * op.depth / 2.0)
+                    .map_err(|e| occt_err(format!("extrude symmetric translate: {:?}", e)))?;
+            }
+            if let Some(base) = state.base_before_face_sketch {
+                let raw = k
+                    .fuse(base, solid)
+                    .map_err(|e| occt_err(format!("fuse face extrude: {:?}", e)))?;
+                unwrap_to_solid(k, raw)
+            } else {
+                solid
+            }
         } else {
-            solid
-        };
+            // Prism along +Z (the plane the face actually lives on), then rotate
+            // the solid onto the requested construction plane.
+            let solid = k
+                .extrude(face, 0.0, 0.0, op.depth)
+                .map_err(|e| occt_err(format!("extrude: {:?}", e)))?;
 
-        let solid = rotate_to_plane(k, solid, &state.active_plane)?;
+            let solid = if op.symmetric {
+                k.translate(solid, 0.0, 0.0, -op.depth / 2.0)
+                    .map_err(|e| occt_err(format!("extrude symmetric translate: {:?}", e)))?
+            } else {
+                solid
+            };
+
+            rotate_to_plane(k, solid, &state.active_plane)?
+        };
 
         state.current_solid = Some(solid);
         state.current_face = None;
+        state.face_normal = None;
+        state.base_before_face_sketch = None;
         Ok(())
     }
 
@@ -1330,7 +1410,13 @@ pub(crate) mod occt_backend {
             .current_solid
             .ok_or_else(|| KernelError::InvalidState("cut requires an existing solid".into()))?;
 
-        let tool = make_tool_solid(k, &op.profile, op.depth, op.at, &op.plane, op.through, Some(base))?;
+        let tool = if let Some(ref face_ref) = op.face {
+            make_tool_on_face(k, base, face_ref, &op.profile, op.depth, op.at, op.through)?
+        } else {
+            make_tool_solid(k, &op.profile, op.depth, op.at, &op.plane, op.through, Some(base))?
+        };
+        state.last_tool = Some(tool);
+        state.last_boolean = Some(LastBoolean::Cut);
         let raw = k
             .cut(base, tool)
             .map_err(|e| occt_err(format!("cut: {:?}", e)))?;
@@ -1347,11 +1433,41 @@ pub(crate) mod occt_backend {
             .current_solid
             .ok_or_else(|| KernelError::InvalidState("fuse requires an existing solid".into()))?;
 
-        let addend = make_tool_solid(k, &op.profile, op.depth, op.at, &op.plane, false, None)?;
+        let addend = if let Some(ref face_ref) = op.face {
+            make_tool_on_face(k, base, face_ref, &op.profile, op.depth, op.at, false)?
+        } else {
+            make_tool_solid(k, &op.profile, op.depth, op.at, &op.plane, false, None)?
+        };
+        state.last_tool = Some(addend);
+        state.last_boolean = Some(LastBoolean::Fuse);
         let raw = k
             .fuse(base, addend)
             .map_err(|e| occt_err(format!("fuse: {:?}", e)))?;
         state.current_solid = Some(unwrap_to_solid(k, raw));
+        Ok(())
+    }
+
+    fn handle_common(
+        k: &mut occt_wasm::OcctKernel,
+        state: &mut ExecState,
+        op: &CommonOp,
+    ) -> Result<(), KernelError> {
+        let base = state
+            .current_solid
+            .ok_or_else(|| KernelError::InvalidState("common requires an existing solid".into()))?;
+
+        let tool = if let Some(ref face_ref) = op.face {
+            make_tool_on_face(k, base, face_ref, &op.profile, op.depth, op.at, false)?
+        } else {
+            make_tool_solid(k, &op.profile, op.depth, op.at, &op.plane, false, None)?
+        };
+        let raw = k
+            .common(base, tool)
+            .map_err(|e| occt_err(format!("common: {:?}", e)))?;
+        let solid = unwrap_to_solid(k, raw);
+        state.current_solid = Some(heal_shape(k, solid));
+        state.last_tool = None;
+        state.last_boolean = None;
         Ok(())
     }
 
@@ -1365,19 +1481,40 @@ pub(crate) mod occt_backend {
             .ok_or_else(|| KernelError::InvalidState("hole requires an existing solid".into()))?;
 
         let radius = op.diameter / 2.0;
-        let (length, z0) = cutter_span(k, Some(base), op.depth, op.through);
-        let cyl = k
-            .make_cylinder(radius, length)
-            .map_err(|e| occt_err(format!("make_cylinder (hole): {:?}", e)))?;
+        let cyl = if let Some(ref face_ref) = op.face {
+            let frame = resolve_face_frame(k, base, face_ref)?;
+            let (length, z0) = cutter_span(k, Some(base), op.depth, op.through);
+            let cyl = k
+                .make_cylinder(radius, length)
+                .map_err(|e| occt_err(format!("make_cylinder (hole): {:?}", e)))?;
+            let cyl = k
+                .translate(cyl, 0.0, 0.0, z0)
+                .map_err(|e| occt_err(format!("translate hole: {:?}", e)))?;
+            let u = op.center[0];
+            let v = op.center[1];
+            let ox = frame.origin[0] + frame.x_dir[0] * u + frame.y_dir[0] * v;
+            let oy = frame.origin[1] + frame.x_dir[1] * u + frame.y_dir[1] * v;
+            let oz = frame.origin[2] + frame.x_dir[2] * u + frame.y_dir[2] * v;
+            let cyl = rotate_z_to_dir(k, cyl, frame.normal)?;
+            k.translate(cyl, ox, oy, oz)
+                .map_err(|e| occt_err(format!("place hole on face: {:?}", e)))?
+        } else {
+            let (length, z0) = cutter_span(k, Some(base), op.depth, op.through);
+            let cyl = k
+                .make_cylinder(radius, length)
+                .map_err(|e| occt_err(format!("make_cylinder (hole): {:?}", e)))?;
 
-        // Built along +Z starting at 0. Shift so it covers both sides of the
-        // profile plane, then rotate onto the hole's plane.
-        let [cx, cy] = map_uv(&op.plane, op.center[0], op.center[1]);
-        let cyl = k
-            .translate(cyl, cx, cy, z0)
-            .map_err(|e| occt_err(format!("translate hole: {:?}", e)))?;
-        let cyl = rotate_to_plane(k, cyl, &op.plane)?;
+            // Built along +Z starting at 0. Shift so it covers both sides of the
+            // profile plane, then rotate onto the hole's plane.
+            let [cx, cy] = map_uv(&op.plane, op.center[0], op.center[1]);
+            let cyl = k
+                .translate(cyl, cx, cy, z0)
+                .map_err(|e| occt_err(format!("translate hole: {:?}", e)))?;
+            rotate_to_plane(k, cyl, &op.plane)?
+        };
 
+        state.last_tool = Some(cyl);
+        state.last_boolean = Some(LastBoolean::Cut);
         let raw = k
             .cut(base, cyl)
             .map_err(|e| occt_err(format!("cut (hole): {:?}", e)))?;
@@ -1404,7 +1541,9 @@ pub(crate) mod occt_backend {
         }
 
         let candidate_ids: Vec<u32> = match &op.edges {
-            crate::ir::EdgeSelection::Named(_) => edge_ids,
+            crate::ir::EdgeSelection::Named(name) => {
+                filter_edges_by_name(k, solid, &edge_ids, name, op.radius)
+            }
             crate::ir::EdgeSelection::Indices(idxs) => idxs
                 .iter()
                 .filter_map(|&i| edge_ids.get(i).copied())
@@ -1456,7 +1595,9 @@ pub(crate) mod occt_backend {
         }
 
         let candidate_ids: Vec<u32> = match &op.edges {
-            crate::ir::EdgeSelection::Named(_) => edge_ids,
+            crate::ir::EdgeSelection::Named(name) => {
+                filter_edges_by_name(k, solid, &edge_ids, name, op.distance)
+            }
             crate::ir::EdgeSelection::Indices(idxs) => idxs
                 .iter()
                 .filter_map(|&i| edge_ids.get(i).copied())
@@ -1668,6 +1809,49 @@ pub(crate) mod occt_backend {
             .current_solid
             .ok_or_else(|| KernelError::InvalidState("pattern requires an existing solid".into()))?;
         let count = op.count as i32;
+
+        if matches!(op.scope, PatternScope::Feature) {
+            let tool = state.last_tool.ok_or_else(|| {
+                KernelError::InvalidState(
+                    "pattern scope=feature requires a preceding cut/fuse/hole".into(),
+                )
+            })?;
+            let mode = state.last_boolean.unwrap_or(LastBoolean::Cut);
+            let mut result = solid;
+            // Instance 0 is already in the solid; apply 1..count-1.
+            for i in 1..op.count {
+                let instance = match op.kind {
+                    PatternKind::Linear => {
+                        let [dx, dy, dz] = op.direction.unwrap_or([1.0, 0.0, 0.0]);
+                        let spacing = op.spacing.unwrap_or(1.0);
+                        let t = i as f64 * spacing;
+                        k.translate(tool, dx * t, dy * t, dz * t)
+                            .map_err(|e| occt_err(format!("pattern feature translate: {:?}", e)))?
+                    }
+                    PatternKind::Circular => {
+                        let [cx, cy, cz] = op.center;
+                        let axis = op.axis.clone().unwrap_or(RevolveAxis::Z);
+                        let (ax, ay, az) = axis_dir(&axis);
+                        let angle_deg = op.angle.unwrap_or(360.0 / op.count as f64);
+                        let angle_rad = (i as f64) * angle_deg * PI / 180.0;
+                        k.rotate(tool, cx, cy, cz, ax, ay, az, angle_rad)
+                            .map_err(|e| occt_err(format!("pattern feature rotate: {:?}", e)))?
+                    }
+                };
+                let raw = match mode {
+                    LastBoolean::Cut => k
+                        .cut(result, instance)
+                        .map_err(|e| occt_err(format!("pattern feature cut: {:?}", e)))?,
+                    LastBoolean::Fuse => k
+                        .fuse(result, instance)
+                        .map_err(|e| occt_err(format!("pattern feature fuse: {:?}", e)))?,
+                };
+                result = unwrap_to_solid(k, raw);
+            }
+            set_solid(state, result);
+            return Ok(());
+        }
+
         let result = match op.kind {
             PatternKind::Linear => {
                 let [dx, dy, dz] = op.direction.unwrap_or([1.0, 0.0, 0.0]);
@@ -1737,7 +1921,502 @@ pub(crate) mod occt_backend {
         Ok(())
     }
 
+    fn handle_sweep(
+        k: &mut occt_wasm::OcctKernel,
+        state: &mut ExecState,
+        op: &SweepOp,
+    ) -> Result<(), KernelError> {
+        let profile = make_profile_face(k, &op.profile, [0.0, 0.0])?;
+        let spine = make_sweep_path(k, &op.path)?;
+        let swept = k
+            .pipe(profile, spine)
+            .or_else(|_| k.simple_pipe(profile, spine))
+            .map_err(|e| occt_err(format!("sweep/pipe: {:?}", e)))?;
+        let solid = unwrap_to_solid(k, swept);
+        absorb_solid(k, state, solid, op.fuse)?;
+        Ok(())
+    }
+
+    fn handle_pipe(
+        k: &mut occt_wasm::OcctKernel,
+        state: &mut ExecState,
+        op: &PipeOp,
+    ) -> Result<(), KernelError> {
+        let profile = make_profile_face(
+            k,
+            &Profile::Circle(CircleProfile {
+                d: op.diameter,
+                at: [0.0, 0.0],
+            }),
+            [0.0, 0.0],
+        )?;
+        let spine = make_sweep_path(k, &op.path)?;
+        // Place profile near the path start so the pipe starts cleanly.
+        let start = path_start(&op.path);
+        let profile = k
+            .translate(profile, start[0], start[1], start[2])
+            .map_err(|e| occt_err(format!("pipe profile translate: {:?}", e)))?;
+        let swept = k
+            .pipe(profile, spine)
+            .or_else(|_| k.simple_pipe(profile, spine))
+            .map_err(|e| occt_err(format!("pipe: {:?}", e)))?;
+        let solid = unwrap_to_solid(k, swept);
+        absorb_solid(k, state, solid, op.fuse)?;
+        Ok(())
+    }
+
+    fn handle_thicken(
+        k: &mut occt_wasm::OcctKernel,
+        state: &mut ExecState,
+        op: &ThickenOp,
+    ) -> Result<(), KernelError> {
+        let shape = if let Some(ref face_ref) = op.face {
+            let solid = state.current_solid.ok_or_else(|| {
+                KernelError::InvalidState("thicken face requires an existing solid".into())
+            })?;
+            resolve_face_handle(k, solid, face_ref)?
+        } else {
+            state.current_face.ok_or_else(|| {
+                KernelError::InvalidState(
+                    "thicken requires a preceding sketch or a face selector".into(),
+                )
+            })?
+        };
+        let solid = k
+            .thicken(shape, op.thickness, 1e-3)
+            .map_err(|e| occt_err(format!("thicken: {:?}", e)))?;
+        let solid = unwrap_to_solid(k, solid);
+        absorb_solid(k, state, solid, op.fuse)?;
+        state.current_face = None;
+        Ok(())
+    }
+
+    fn handle_helix(
+        k: &mut occt_wasm::OcctKernel,
+        state: &mut ExecState,
+        op: &HelixOp,
+    ) -> Result<(), KernelError> {
+        let path = SweepPath::Helix {
+            pitch: op.pitch,
+            height: op.height,
+            radius: op.radius,
+            center: op.center,
+            axis: op.axis.clone(),
+        };
+        handle_pipe(
+            k,
+            state,
+            &PipeOp {
+                diameter: op.diameter,
+                path,
+                fuse: op.fuse,
+            },
+        )
+    }
+
+    fn handle_draft(
+        k: &mut occt_wasm::OcctKernel,
+        state: &mut ExecState,
+        op: &DraftOp,
+    ) -> Result<(), KernelError> {
+        let solid = state
+            .current_solid
+            .ok_or_else(|| KernelError::InvalidState("draft requires an existing solid".into()))?;
+        let face_ids = k
+            .get_sub_shapes(solid, "face")
+            .map_err(|e| occt_err(format!("get_sub_shapes (draft): {:?}", e)))?;
+        let selected = match &op.faces {
+            EdgeSelection::Named(name) => select_faces_by_name(k, solid, &face_ids, name),
+            EdgeSelection::Indices(idxs) => idxs
+                .iter()
+                .filter_map(|&i| face_ids.get(i).copied())
+                .collect(),
+        };
+        if selected.is_empty() {
+            return Err(KernelError::InvalidState(
+                "draft found no matching faces".into(),
+            ));
+        }
+        let angle_rad = op.angle * PI / 180.0;
+        let [dx, dy, dz] = op.direction;
+        let mut result = solid;
+        for id in selected {
+            result = k
+                .draft(result, id_to_handle(id), angle_rad, dx, dy, dz)
+                .map_err(|e| occt_err(format!("draft: {:?}", e)))?;
+        }
+        set_solid(state, unwrap_to_solid(k, result));
+        Ok(())
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn absorb_solid(
+        k: &mut occt_wasm::OcctKernel,
+        state: &mut ExecState,
+        solid: Handle,
+        fuse: bool,
+    ) -> Result<(), KernelError> {
+        if fuse {
+            if let Some(base) = state.current_solid {
+                let raw = k
+                    .fuse(base, solid)
+                    .map_err(|e| occt_err(format!("fuse absorb: {:?}", e)))?;
+                set_solid(state, unwrap_to_solid(k, raw));
+                return Ok(());
+            }
+        }
+        set_solid(state, solid);
+        Ok(())
+    }
+
+    fn path_start(path: &SweepPath) -> [f64; 3] {
+        match path {
+            SweepPath::Polyline { points } => points.first().copied().unwrap_or([0.0; 3]),
+            SweepPath::Helix { center, radius, axis, .. } => {
+                let (dx, dy, dz) = axis_dir(axis);
+                // Point offset from axis by radius in a perpendicular direction.
+                let (px, py, pz) = if dx.abs() < 0.9 {
+                    (0.0, 0.0, 1.0)
+                } else {
+                    (0.0, 1.0, 0.0)
+                };
+                let cxp = dy * pz - dz * py;
+                let cyp = dz * px - dx * pz;
+                let czp = dx * py - dy * px;
+                let len = (cxp * cxp + cyp * cyp + czp * czp).sqrt().max(1e-9);
+                [
+                    center[0] + radius * cxp / len,
+                    center[1] + radius * cyp / len,
+                    center[2] + radius * czp / len,
+                ]
+            }
+        }
+    }
+
+    fn make_sweep_path(
+        k: &mut occt_wasm::OcctKernel,
+        path: &SweepPath,
+    ) -> Result<Handle, KernelError> {
+        match path {
+            SweepPath::Polyline { points } => {
+                let mut edges = Vec::with_capacity(points.len().saturating_sub(1));
+                for w in points.windows(2) {
+                    let a = w[0];
+                    let b = w[1];
+                    let e = k
+                        .make_line_edge(a[0], a[1], a[2], b[0], b[1], b[2])
+                        .map_err(|e| occt_err(format!("path edge: {:?}", e)))?;
+                    edges.push(e);
+                }
+                k.make_wire(&edges)
+                    .map_err(|e| occt_err(format!("path wire: {:?}", e)))
+            }
+            SweepPath::Helix {
+                pitch,
+                height,
+                radius,
+                center,
+                axis,
+            } => {
+                let (dx, dy, dz) = axis_dir(axis);
+                k.make_helix_wire(
+                    center[0], center[1], center[2], dx, dy, dz, *pitch, *height, *radius,
+                )
+                .map_err(|e| occt_err(format!("make_helix_wire: {:?}", e)))
+            }
+        }
+    }
+
+    struct FaceFrame {
+        origin: [f64; 3],
+        normal: [f64; 3],
+        x_dir: [f64; 3],
+        y_dir: [f64; 3],
+        face: Handle,
+    }
+
+    fn resolve_face_handle(
+        k: &mut occt_wasm::OcctKernel,
+        solid: Handle,
+        face_ref: &FaceRef,
+    ) -> Result<Handle, KernelError> {
+        Ok(resolve_face_frame(k, solid, face_ref)?.face)
+    }
+
+    fn resolve_face_frame(
+        k: &mut occt_wasm::OcctKernel,
+        solid: Handle,
+        face_ref: &FaceRef,
+    ) -> Result<FaceFrame, KernelError> {
+        let face_ids = k
+            .get_sub_shapes(solid, "face")
+            .map_err(|e| occt_err(format!("get_sub_shapes (face): {:?}", e)))?;
+        if face_ids.is_empty() {
+            return Err(KernelError::InvalidState("solid has no faces".into()));
+        }
+        let id = match face_ref {
+            FaceRef::Index(i) => face_ids.get(*i).copied().ok_or_else(|| {
+                KernelError::InvalidState(format!("face index {i} out of range (0..{})", face_ids.len()))
+            })?,
+            FaceRef::Named(name) => {
+                let selected = select_faces_by_name(k, solid, &face_ids, name);
+                selected.into_iter().next().ok_or_else(|| {
+                    KernelError::InvalidState(format!("no face matched '{name}'"))
+                })?
+            }
+        };
+        let face = id_to_handle(id);
+        let center = k
+            .get_surface_center_of_mass(face)
+            .or_else(|_| {
+                k.get_bounding_box(face, false).map(|bb| {
+                    vec![
+                        0.5 * (bb.min.x + bb.max.x),
+                        0.5 * (bb.min.y + bb.max.y),
+                        0.5 * (bb.min.z + bb.max.z),
+                    ]
+                })
+            })
+            .map_err(|e| occt_err(format!("face center: {:?}", e)))?;
+        let origin = [
+            *center.first().unwrap_or(&0.0),
+            *center.get(1).unwrap_or(&0.0),
+            *center.get(2).unwrap_or(&0.0),
+        ];
+        let uv = k.uv_bounds(face).unwrap_or(vec![0.0, 1.0, 0.0, 1.0]);
+        let u_mid = 0.5 * (uv.first().copied().unwrap_or(0.0) + uv.get(1).copied().unwrap_or(1.0));
+        let v_mid = 0.5 * (uv.get(2).copied().unwrap_or(0.0) + uv.get(3).copied().unwrap_or(1.0));
+        let normal_v = k
+            .surface_normal(face, u_mid, v_mid)
+            .unwrap_or(vec![0.0, 0.0, 1.0]);
+        let mut normal = [
+            *normal_v.first().unwrap_or(&0.0),
+            *normal_v.get(1).unwrap_or(&0.0),
+            *normal_v.get(2).unwrap_or(&1.0),
+        ];
+        let nlen = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        if nlen > 1e-12 {
+            normal[0] /= nlen;
+            normal[1] /= nlen;
+            normal[2] /= nlen;
+        }
+        let (x_dir, y_dir) = orthonormal_basis(normal);
+        Ok(FaceFrame {
+            origin,
+            normal,
+            x_dir,
+            y_dir,
+            face,
+        })
+    }
+
+    fn select_faces_by_name(
+        k: &mut occt_wasm::OcctKernel,
+        solid: Handle,
+        face_ids: &[u32],
+        name: &str,
+    ) -> Vec<u32> {
+        let name = name.to_ascii_lowercase();
+        let mut scored: Vec<(u32, f64, [f64; 3], [f64; 3])> = face_ids
+            .iter()
+            .filter_map(|&id| {
+                let h = id_to_handle(id);
+                let area = k.get_surface_area(h).unwrap_or(0.0);
+                let center = k.get_surface_center_of_mass(h).ok().or_else(|| {
+                    k.get_bounding_box(h, false).ok().map(|bb| {
+                        vec![
+                            0.5 * (bb.min.x + bb.max.x),
+                            0.5 * (bb.min.y + bb.max.y),
+                            0.5 * (bb.min.z + bb.max.z),
+                        ]
+                    })
+                })?;
+                let c = [
+                    center.first().copied().unwrap_or(0.0),
+                    center.get(1).copied().unwrap_or(0.0),
+                    center.get(2).copied().unwrap_or(0.0),
+                ];
+                let uv = k.uv_bounds(h).unwrap_or(vec![0.0, 1.0, 0.0, 1.0]);
+                let u_mid = 0.5 * (uv.first().copied().unwrap_or(0.0) + uv.get(1).copied().unwrap_or(1.0));
+                let v_mid = 0.5 * (uv.get(2).copied().unwrap_or(0.0) + uv.get(3).copied().unwrap_or(1.0));
+                let n = k.surface_normal(h, u_mid, v_mid).unwrap_or(vec![0.0, 0.0, 1.0]);
+                let normal = [
+                    n.first().copied().unwrap_or(0.0),
+                    n.get(1).copied().unwrap_or(0.0),
+                    n.get(2).copied().unwrap_or(1.0),
+                ];
+                Some((id, area, c, normal))
+            })
+            .collect();
+        if scored.is_empty() {
+            return face_ids.to_vec();
+        }
+        match name.as_str() {
+            "largest" | "all" => {
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                if name == "all" {
+                    scored.into_iter().map(|s| s.0).collect()
+                } else {
+                    vec![scored[0].0]
+                }
+            }
+            "top" => {
+                scored.sort_by(|a, b| b.2[2].partial_cmp(&a.2[2]).unwrap_or(std::cmp::Ordering::Equal));
+                vec![scored[0].0]
+            }
+            "bottom" => {
+                scored.sort_by(|a, b| a.2[2].partial_cmp(&b.2[2]).unwrap_or(std::cmp::Ordering::Equal));
+                vec![scored[0].0]
+            }
+            "side" | "sides" => {
+                let solid_bb = k.get_bounding_box(solid, false).ok();
+                scored
+                    .into_iter()
+                    .filter(|(_, _, _, n)| n[2].abs() < 0.5)
+                    .map(|s| s.0)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .chain(solid_bb.map(|_| vec![]).unwrap_or_default())
+                    .collect()
+            }
+            _ => face_ids.to_vec(),
+        }
+    }
+
+    fn filter_edges_by_name(
+        k: &mut occt_wasm::OcctKernel,
+        solid: Handle,
+        edge_ids: &[u32],
+        name: &str,
+        blend: f64,
+    ) -> Vec<u32> {
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
+            "all" => select_blend_edges(k, solid, edge_ids.to_vec(), blend),
+            "top" => {
+                let Ok(bb) = k.get_bounding_box(solid, false) else {
+                    return edge_ids.to_vec();
+                };
+                let edges = classify_line_edges(k, &bb, edge_ids);
+                edges
+                    .into_iter()
+                    .filter(|e| e.is_top && !e.is_thickness)
+                    .map(|e| e.id)
+                    .collect()
+            }
+            "longest" | "outer" => longest_edges(k, edge_ids, 4.max(edge_ids.len().min(8))),
+            _ => edge_ids.to_vec(),
+        }
+    }
+
+    fn orthonormal_basis(n: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+        let helper = if n[0].abs() < 0.9 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let mut x = [
+            n[1] * helper[2] - n[2] * helper[1],
+            n[2] * helper[0] - n[0] * helper[2],
+            n[0] * helper[1] - n[1] * helper[0],
+        ];
+        let xl = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt().max(1e-12);
+        x[0] /= xl;
+        x[1] /= xl;
+        x[2] /= xl;
+        let y = [
+            n[1] * x[2] - n[2] * x[1],
+            n[2] * x[0] - n[0] * x[2],
+            n[0] * x[1] - n[1] * x[0],
+        ];
+        (x, y)
+    }
+
+    fn dominant_plane(n: &[f64; 3]) -> SketchPlane {
+        let ax = n[0].abs();
+        let ay = n[1].abs();
+        let az = n[2].abs();
+        if az >= ax && az >= ay {
+            SketchPlane::XY
+        } else if ay >= ax {
+            SketchPlane::XZ
+        } else {
+            SketchPlane::YZ
+        }
+    }
+
+    fn rotate_z_to_dir(
+        k: &mut occt_wasm::OcctKernel,
+        shape: Handle,
+        dir: [f64; 3],
+    ) -> Result<Handle, KernelError> {
+        let mut d = dir;
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if len < 1e-12 {
+            return Ok(shape);
+        }
+        d[0] /= len;
+        d[1] /= len;
+        d[2] /= len;
+        let z = [0.0, 0.0, 1.0];
+        let dot = (z[0] * d[0] + z[1] * d[1] + z[2] * d[2]).clamp(-1.0, 1.0);
+        if (dot - 1.0).abs() < 1e-9 {
+            return Ok(shape);
+        }
+        if (dot + 1.0).abs() < 1e-9 {
+            return k
+                .rotate(shape, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, PI)
+                .map_err(|e| occt_err(format!("rotate 180: {:?}", e)));
+        }
+        let axis = [
+            z[1] * d[2] - z[2] * d[1],
+            z[2] * d[0] - z[0] * d[2],
+            z[0] * d[1] - z[1] * d[0],
+        ];
+        let angle = dot.acos();
+        k.rotate(shape, 0.0, 0.0, 0.0, axis[0], axis[1], axis[2], angle)
+            .map_err(|e| occt_err(format!("rotate_z_to_dir: {:?}", e)))
+    }
+
+    fn place_xy_shape_on_frame(
+        k: &mut occt_wasm::OcctKernel,
+        shape: Handle,
+        frame: &FaceFrame,
+    ) -> Result<Handle, KernelError> {
+        let shape = rotate_z_to_dir(k, shape, frame.normal)?;
+        // After rotating +Z → normal, +X may not align with frame.x_dir.
+        // For agentic prismatic work, aligning the normal + translating to the
+        // face center is enough; UV offsets are applied in make_tool_on_face.
+        k.translate(shape, frame.origin[0], frame.origin[1], frame.origin[2])
+            .map_err(|e| occt_err(format!("place on face: {:?}", e)))
+    }
+
+    fn make_tool_on_face(
+        k: &mut occt_wasm::OcctKernel,
+        base: Handle,
+        face_ref: &FaceRef,
+        profile: &Profile,
+        depth: f64,
+        at: [f64; 3],
+        through: bool,
+    ) -> Result<Handle, KernelError> {
+        let frame = resolve_face_frame(k, base, face_ref)?;
+        let face = make_profile_face(k, profile, [0.0, 0.0])?;
+        let (length, z0) = cutter_span(k, Some(base), depth, through);
+        let solid = k
+            .extrude(face, 0.0, 0.0, length)
+            .map_err(|e| occt_err(format!("extrude (face tool): {:?}", e)))?;
+        let solid = k
+            .translate(solid, 0.0, 0.0, z0)
+            .map_err(|e| occt_err(format!("translate face tool: {:?}", e)))?;
+        let solid = rotate_z_to_dir(k, solid, frame.normal)?;
+        let ox = frame.origin[0] + at[0];
+        let oy = frame.origin[1] + at[1];
+        let oz = frame.origin[2] + at[2];
+        k.translate(solid, ox, oy, oz)
+            .map_err(|e| occt_err(format!("place face tool: {:?}", e)))
+    }
 
     fn make_tool_solid(
         k: &mut occt_wasm::OcctKernel,
@@ -1872,6 +2551,22 @@ pub(crate) mod occt_backend {
                     .map_err(|e| occt_err(format!("make_wire (arc): {:?}", e)))?;
                 k.make_face(wire)
                     .map_err(|e| occt_err(format!("make_face (arc): {:?}", e)))
+            }
+            Profile::Compound(c) => {
+                let outer = make_profile_face(k, &c.outer, origin)?;
+                if c.holes.is_empty() {
+                    return Ok(outer);
+                }
+                let mut hole_wires = Vec::with_capacity(c.holes.len());
+                for hole in &c.holes {
+                    let hole_face = make_profile_face(k, hole, origin)?;
+                    let wire = k
+                        .outer_wire(hole_face)
+                        .map_err(|e| occt_err(format!("outer_wire (hole): {:?}", e)))?;
+                    hole_wires.push(wire);
+                }
+                k.add_holes_in_face(outer, &hole_wires)
+                    .map_err(|e| occt_err(format!("add_holes_in_face: {:?}", e)))
             }
         }
     }
@@ -2024,6 +2719,157 @@ pub(crate) mod occt_backend {
             )));
         }
         Ok(())
+    }
+
+    pub(crate) fn list_topology_with_occt(
+        program: &CadProgram,
+    ) -> Result<crate::topology::TopologyReport, KernelError> {
+        with_kernel(|k| {
+            let solid = STEP_CACHE.with(|c| execute_in_kernel(k, program, &mut c.borrow_mut()))?;
+            let solid = heal_shape(k, solid);
+            let face_ids = k
+                .get_sub_shapes(solid, "face")
+                .map_err(|e| occt_err(format!("faces: {:?}", e)))?;
+            let edge_ids = k
+                .get_sub_shapes(solid, "edge")
+                .map_err(|e| occt_err(format!("edges: {:?}", e)))?;
+
+            let mut faces = Vec::with_capacity(face_ids.len());
+            for (index, &id) in face_ids.iter().enumerate() {
+                let h = id_to_handle(id);
+                let area = k.get_surface_area(h).unwrap_or(0.0);
+                let center_v = k.get_surface_center_of_mass(h).unwrap_or(vec![0.0, 0.0, 0.0]);
+                let center = [
+                    center_v.first().copied().unwrap_or(0.0),
+                    center_v.get(1).copied().unwrap_or(0.0),
+                    center_v.get(2).copied().unwrap_or(0.0),
+                ];
+                let uv = k.uv_bounds(h).unwrap_or(vec![0.0, 1.0, 0.0, 1.0]);
+                let u_mid = 0.5 * (uv.first().copied().unwrap_or(0.0) + uv.get(1).copied().unwrap_or(1.0));
+                let v_mid = 0.5 * (uv.get(2).copied().unwrap_or(0.0) + uv.get(3).copied().unwrap_or(1.0));
+                let n = k.surface_normal(h, u_mid, v_mid).unwrap_or(vec![0.0, 0.0, 1.0]);
+                let normal = [
+                    n.first().copied().unwrap_or(0.0),
+                    n.get(1).copied().unwrap_or(0.0),
+                    n.get(2).copied().unwrap_or(1.0),
+                ];
+                let surface_type = k.surface_type(h).unwrap_or_else(|_| "unknown".into());
+                let mut tags = Vec::new();
+                if normal[2].abs() > 0.85 {
+                    if center[2]
+                        >= faces
+                            .iter()
+                            .map(|f: &crate::topology::FaceInfo| f.center[2])
+                            .fold(f64::NEG_INFINITY, f64::max)
+                    {
+                        tags.push("top_candidate".into());
+                    }
+                    if center[2]
+                        <= faces
+                            .iter()
+                            .map(|f: &crate::topology::FaceInfo| f.center[2])
+                            .fold(f64::INFINITY, f64::min)
+                    {
+                        tags.push("bottom_candidate".into());
+                    }
+                } else {
+                    tags.push("side".into());
+                }
+                if surface_type.to_ascii_lowercase().contains("plane") {
+                    tags.push("planar".into());
+                }
+                faces.push(crate::topology::FaceInfo {
+                    index,
+                    area,
+                    center,
+                    normal,
+                    surface_type,
+                    tags,
+                });
+            }
+
+            let mut edges = Vec::with_capacity(edge_ids.len());
+            for (index, &id) in edge_ids.iter().enumerate() {
+                let h = id_to_handle(id);
+                let length = k.get_length(h).unwrap_or(0.0);
+                let bb = k.get_bounding_box(h, false).ok();
+                let mid = bb
+                    .map(|b| {
+                        [
+                            0.5 * (b.min.x + b.max.x),
+                            0.5 * (b.min.y + b.max.y),
+                            0.5 * (b.min.z + b.max.z),
+                        ]
+                    })
+                    .unwrap_or([0.0; 3]);
+                let curve_type = k.curve_type(h).unwrap_or_else(|_| "unknown".into());
+                let mut tags = Vec::new();
+                if curve_type.eq_ignore_ascii_case("line") {
+                    tags.push("line".into());
+                } else if curve_type.to_ascii_lowercase().contains("circle") {
+                    tags.push("circle".into());
+                }
+                edges.push(crate::topology::EdgeInfo {
+                    index,
+                    length,
+                    mid,
+                    curve_type,
+                    tags,
+                });
+            }
+
+            let largest_face = faces
+                .iter()
+                .max_by(|a, b| a.area.partial_cmp(&b.area).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|f| f.index);
+            let top_face = faces
+                .iter()
+                .max_by(|a, b| a.center[2].partial_cmp(&b.center[2]).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|f| f.index);
+            let bottom_face = faces
+                .iter()
+                .min_by(|a, b| a.center[2].partial_cmp(&b.center[2]).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|f| f.index);
+            let longest_edge = edges
+                .iter()
+                .max_by(|a, b| a.length.partial_cmp(&b.length).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|e| e.index);
+
+            // Finalize top/bottom tags using the chosen indices.
+            for f in &mut faces {
+                if Some(f.index) == top_face {
+                    f.tags.push("top".into());
+                }
+                if Some(f.index) == bottom_face {
+                    f.tags.push("bottom".into());
+                }
+                if Some(f.index) == largest_face {
+                    f.tags.push("largest".into());
+                }
+            }
+            if let Some(i) = longest_edge {
+                if let Some(e) = edges.get_mut(i) {
+                    e.tags.push("longest".into());
+                }
+            }
+
+            Ok(crate::topology::TopologyReport {
+                summary: crate::topology::TopologySummary {
+                    face_count: faces.len(),
+                    edge_count: edges.len(),
+                    largest_face,
+                    top_face,
+                    bottom_face,
+                    longest_edge,
+                    tip: "Use face: \"largest\"|\"top\"|\"bottom\"|<index> on cut/fuse/hole/sketch. \
+                          Use edges: \"all\"|\"top\"|\"longest\"|[indices] on fillet/chamfer. \
+                          Pattern holes with scope:\"feature\" after hole/cut."
+                        .into(),
+                },
+                faces,
+                edges,
+            })
+        })
     }
 }
 

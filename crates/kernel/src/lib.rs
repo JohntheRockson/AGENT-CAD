@@ -17,12 +17,22 @@
 //! println!("volume = {:.1} mm³", output.metrics.volume);
 //! ```
 
+pub mod params;
 pub mod engine;
 pub mod export;
 pub mod ir;
+pub mod topology;
+pub mod units;
+pub mod verify;
 
 pub use engine::{
     BodyOutput, DocumentOutput, Engine, ExportFormat, KernelError, MeshData, MetricsData,
     ModelOutput,
 };
-pub use ir::{CadBody, CadDocument, CadProgram, ValidationError};
+pub use ir::{CadBody, CadDocument, CadProgram, Units, ValidationError};
+pub use topology::{EdgeInfo, FaceInfo, TopologyReport, TopologySummary};
+pub use units::{UnitContext, MM_PER_INCH};
+pub use verify::{
+    verify_document, verify_parameters, verify_program, verify_structure, VerificationCheck,
+    VerificationReport,
+};

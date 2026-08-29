@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   Send, Bot, User, Brain, PenLine, Box, Cpu, ScanSearch, RotateCcw, ChevronRight, Loader2,
+  CheckCircle2, XCircle,
 } from 'lucide-react'
 import { useCadStore } from '../store/useStore'
-import type { ActivityKind, ActivityStep } from '../types/cad'
+import type { ActivityKind, ActivityStep, VerificationCheck } from '../types/cad'
 
 export function ChatPanel() {
   const messages        = useCadStore((s) => s.messages)
@@ -171,7 +172,7 @@ function LiveElapsed({ startedAt }: { startedAt: number }) {
 
 const KIND_META: Record<
   ActivityKind,
-  { icon: typeof Brain; running: string; done: (ms?: number) => string }
+  { icon: typeof Brain; running: string; done: (ms?: number, step?: ActivityStep) => string }
 > = {
   thinking: {
     icon: Brain,
@@ -190,8 +191,16 @@ const KIND_META: Record<
   },
   verifying: {
     icon: ScanSearch,
-    running: 'Checking result',
-    done: (ms) => (ms != null ? `Checked in ${formatMs(ms)}` : 'Checked'),
+    running: 'Checking geometry',
+    done: (ms, step) => {
+      const base = ms != null ? `Checked in ${formatMs(ms)}` : 'Checked'
+      if (step?.checks?.length) {
+        const failed = step.checks.filter((c) => !c.passed).length
+        if (failed === 0) return `${base} — ${step.checks.length} passed`
+        return `${base} — ${failed} failed`
+      }
+      return base
+    },
   },
   rendering: {
     icon: Box,
@@ -219,23 +228,37 @@ function ActivityRow({ step }: { step: ActivityStep }) {
   const meta = KIND_META[step.kind]
   const Icon = meta.icon
   const hasThoughts = step.kind === 'thinking' && !!step.detail?.trim()
-  const [open, setOpen] = useState(step.status === 'running')
+  const hasChecks = step.kind === 'verifying' && !!step.checks?.length
+  const expandable = hasThoughts || hasChecks
+  const [open, setOpen] = useState(step.status === 'running' && expandable)
 
   useEffect(() => {
-    if (step.status === 'running' && hasThoughts) setOpen(true)
-  }, [step.status, hasThoughts])
+    if (step.status === 'running' && expandable) setOpen(true)
+  }, [step.status, expandable])
 
   const label =
     step.status === 'running'
       ? meta.running
       : step.kind === 'repair'
         ? `Retry — ${step.detail ?? 'repairing'}`
-        : meta.done(step.ms)
+        : meta.done(step.ms, step)
 
   const row = (
-    <div className="flex items-center gap-2 text-xs text-muted min-w-0">
+    <div className={`flex items-center gap-2 text-xs min-w-0 ${
+      step.kind === 'verifying' && step.checks?.some((c) => !c.passed)
+        ? 'text-yellow-400/90'
+        : step.kind === 'verifying' && step.status === 'done'
+          ? 'text-green-400/90'
+          : 'text-muted'
+    }`}>
       {step.status === 'running' ? (
         <Loader2 size={12} className="animate-spin text-accent flex-shrink-0" />
+      ) : step.kind === 'verifying' && step.checks?.length ? (
+        step.checks.every((c) => c.passed) ? (
+          <CheckCircle2 size={12} className="flex-shrink-0 opacity-80" />
+        ) : (
+          <XCircle size={12} className="flex-shrink-0 opacity-80" />
+        )
       ) : (
         <Icon size={12} className="flex-shrink-0 opacity-70" />
       )}
@@ -245,7 +268,7 @@ function ActivityRow({ step }: { step: ActivityStep }) {
           <LiveElapsed startedAt={step.startedAt} />
         </span>
       )}
-      {hasThoughts && (
+      {expandable && (
         <ChevronRight
           size={12}
           className={`ml-auto flex-shrink-0 opacity-50 transition-transform ${open ? 'rotate-90' : ''}`}
@@ -254,7 +277,7 @@ function ActivityRow({ step }: { step: ActivityStep }) {
     </div>
   )
 
-  if (!hasThoughts) return row
+  if (!expandable) return row
 
   return (
     <div>
@@ -265,11 +288,35 @@ function ActivityRow({ step }: { step: ActivityStep }) {
       >
         {row}
       </button>
-      {open && (
+      {open && hasThoughts && (
         <pre className="mt-1 mb-1 ml-5 whitespace-pre-wrap text-[11px] leading-relaxed text-muted/90 font-sans border-l border-border pl-2.5 max-h-48 overflow-y-auto">
           {step.detail}
         </pre>
       )}
+      {open && hasChecks && (
+        <VerificationCheckList checks={step.checks!} />
+      )}
     </div>
+  )
+}
+
+function VerificationCheckList({ checks }: { checks: VerificationCheck[] }) {
+  return (
+    <ul className="mt-1 mb-1 ml-5 space-y-1 border-l border-border pl-2.5 max-h-56 overflow-y-auto">
+      {checks.map((c) => (
+        <li key={c.name} className="flex gap-2 text-[11px] leading-snug min-w-0">
+          {c.passed ? (
+            <CheckCircle2 size={11} className="text-green-400/80 flex-shrink-0 mt-0.5" />
+          ) : (
+            <XCircle size={11} className="text-yellow-400/90 flex-shrink-0 mt-0.5" />
+          )}
+          <span className={c.passed ? 'text-muted/90' : 'text-yellow-400/90'}>
+            <span className="font-mono text-[10px] opacity-70">{c.name}</span>
+            {' — '}
+            {c.message}
+          </span>
+        </li>
+      ))}
+    </ul>
   )
 }
