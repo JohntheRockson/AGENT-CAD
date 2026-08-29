@@ -253,6 +253,10 @@ pub(crate) mod mock_backend {
                         w = c.d;
                         h = c.d;
                     }
+                    Profile::Hex(hx) => {
+                        w = hx.across_flats;
+                        h = hx.across_flats;
+                    }
                     _ => {}
                 },
                 Feature::Extrude(op) => depth = op.depth,
@@ -2188,8 +2192,84 @@ pub(crate) mod occt_backend {
         }
     }
 
-    /// External threaded cylinder along +Z from the origin (revolve fallback is the
-    /// reliable path; a helical pipe is tried first).
+    fn thread_cutter(
+        k: &mut occt_wasm::OcctKernel,
+        major: f64,
+        pitch: f64,
+        length: f64,
+        internal: bool,
+        z0: f64,
+    ) -> Result<Handle, KernelError> {
+        helical_thread_cutter(k, major, pitch, length, internal, z0)
+            .or_else(|_| helical_round_groove(k, major, pitch, length, internal, z0))
+    }
+
+    /// True helical V-groove (not a lathe/revolve of stacked rings).
+    fn helical_thread_cutter(
+        k: &mut occt_wasm::OcctKernel,
+        major: f64,
+        pitch: f64,
+        length: f64,
+        internal: bool,
+        z0: f64,
+    ) -> Result<Handle, KernelError> {
+        let depth = crate::thread::external_depth(pitch);
+        let half = pitch * 0.48;
+        let (r_out, r_in) = if internal {
+            let r_hole = crate::thread::tap_drill_diameter(major, pitch) / 2.0;
+            (major / 2.0 + 0.12 * pitch, (r_hole - 0.12 * pitch).max(0.05))
+        } else {
+            (major / 2.0 + 0.18 * pitch, major / 2.0 - depth)
+        };
+        let r_h = 0.5 * (r_out + r_in);
+        let z_start = z0 - half;
+        let height = (length + pitch * 1.25).max(pitch * 2.0);
+        let pts = [
+            [r_out, 0.0, z_start],
+            [r_out, 0.0, z_start + pitch * 0.92],
+            [r_in, 0.0, z_start + half],
+        ];
+        if let Ok(spine) = k.make_helix_wire(0.0, 0.0, z_start, 0.0, 0.0, 1.0, pitch, height, r_h) {
+            if let Ok(face) = face_from_polygon_3d(k, &pts) {
+                if let Ok(s) = pipe_along(k, face, spine) {
+                    return Ok(s);
+                }
+            }
+        }
+        let mut path = helix_polyline(r_h, pitch, height, 36);
+        for p in &mut path {
+            p[2] += z_start;
+        }
+        let poly = wire_from_polyline3(k, &path)?;
+        if let Ok(face) = face_from_polygon_3d(k, &pts) {
+            if let Ok(s) = pipe_along(k, face, poly) {
+                return Ok(s);
+            }
+        }
+        Err(occt_err("helical V-thread sweep failed"))
+    }
+
+    /// Helical circular groove — still a helix, never stacked rings.
+    fn helical_round_groove(
+        k: &mut occt_wasm::OcctKernel,
+        major: f64,
+        pitch: f64,
+        length: f64,
+        internal: bool,
+        z0: f64,
+    ) -> Result<Handle, KernelError> {
+        let depth = crate::thread::external_depth(pitch);
+        let r_h = if internal {
+            crate::thread::tap_drill_diameter(major, pitch) / 2.0
+        } else {
+            major / 2.0 - depth * 0.45
+        };
+        let sec_r = (depth * 0.55).max(pitch * 0.22);
+        let height = (length + pitch).max(pitch * 2.0);
+        let spine = helix_spine(k, pitch, height, r_h, [0.0, 0.0, z0], &RevolveAxis::Z)?;
+        helix_solid(k, spine, r_h, pitch, height, sec_r)
+    }
+
     fn threaded_rod(
         k: &mut occt_wasm::OcctKernel,
         major: f64,
@@ -2204,127 +2284,11 @@ pub(crate) mod occt_backend {
                 return Ok(drawable_shape(k, cut));
             }
         }
-        revolved_thread_solid(k, major, pitch, length)
+        Err(occt_err(
+            "could not cut a helical thread (revolve-ring fallback is disabled)",
+        ))
     }
 
-    fn thread_cutter(
-        k: &mut occt_wasm::OcctKernel,
-        major: f64,
-        pitch: f64,
-        length: f64,
-        internal: bool,
-        z0: f64,
-    ) -> Result<Handle, KernelError> {
-        helical_thread_cutter(k, major, pitch, length, internal, z0)
-            .or_else(|_| revolved_thread_cutter(k, major, pitch, length, internal, z0))
-    }
-
-    fn helical_thread_cutter(
-        k: &mut occt_wasm::OcctKernel,
-        major: f64,
-        pitch: f64,
-        length: f64,
-        internal: bool,
-        z0: f64,
-    ) -> Result<Handle, KernelError> {
-        let depth = crate::thread::external_depth(pitch);
-        let half = pitch * 0.5;
-        let (r_out, r_in) = if internal {
-            let r_hole = crate::thread::tap_drill_diameter(major, pitch) / 2.0;
-            (major / 2.0, (r_hole - 0.12 * pitch).max(0.05))
-        } else {
-            (major / 2.0 + 0.18 * pitch, major / 2.0 - depth)
-        };
-        let r_h = 0.5 * (r_out + r_in);
-        let z_start = z0 - half;
-        let pts = [
-            [r_out, 0.0, z_start],
-            [r_out, 0.0, z_start + pitch],
-            [r_in, 0.0, z_start + half],
-        ];
-        let face = face_from_polygon_3d(k, &pts)?;
-        let height = length + pitch;
-        let spine = k
-            .make_helix_wire(0.0, 0.0, z_start, 0.0, 0.0, 1.0, pitch, height, r_h)
-            .map_err(|e| occt_err(format!("thread helix: {e}")))?;
-        pipe_along(k, face, spine)
-    }
-
-    fn revolved_thread_cutter(
-        k: &mut occt_wasm::OcctKernel,
-        major: f64,
-        pitch: f64,
-        length: f64,
-        internal: bool,
-        z0: f64,
-    ) -> Result<Handle, KernelError> {
-        let depth = crate::thread::external_depth(pitch);
-        let n = ((length / pitch).ceil() as i32 + 2).max(2);
-        let (r_a, r_b) = if internal {
-            let r_hole = crate::thread::tap_drill_diameter(major, pitch) / 2.0;
-            ((r_hole - 0.08 * pitch).max(0.05), major / 2.0 + 0.05 * pitch)
-        } else {
-            (major / 2.0 + 0.2 * pitch, major / 2.0 - depth)
-        };
-        let mut pts: Vec<[f64; 2]> = Vec::new();
-        let z_lo = z0 - pitch;
-        pts.push([r_a, z_lo]);
-        for i in 0..=n {
-            let z = z_lo + i as f64 * pitch;
-            pts.push([r_a, z]);
-            pts.push([r_b, z + pitch * 0.5]);
-        }
-        let z_hi = z_lo + (n as f64 + 1.0) * pitch;
-        pts.push([r_a, z_hi]);
-        let pad = (r_a - r_b).abs() + pitch;
-        if internal {
-            pts.push([(r_a - pad).max(0.02), z_hi]);
-            pts.push([(r_a - pad).max(0.02), z_lo]);
-        } else {
-            pts.push([r_a + pad, z_hi]);
-            pts.push([r_a + pad, z_lo]);
-        }
-        revolve_xz_polyline(k, &pts)
-    }
-
-    fn revolved_thread_solid(
-        k: &mut occt_wasm::OcctKernel,
-        major: f64,
-        pitch: f64,
-        length: f64,
-    ) -> Result<Handle, KernelError> {
-        let depth = crate::thread::external_depth(pitch);
-        let r_crest = major / 2.0;
-        let r_root = (r_crest - depth).max(major * 0.15);
-        let mut pts: Vec<[f64; 2]> = vec![[0.0, 0.0], [0.0, length], [r_crest, length]];
-        let mut z = length;
-        while z > 1e-9 {
-            let z_mid = (z - pitch * 0.5).max(0.0);
-            let z_next = (z - pitch).max(0.0);
-            pts.push([r_root, z_mid]);
-            pts.push([r_crest, z_next]);
-            if z_next <= 0.0 {
-                break;
-            }
-            z = z_next;
-        }
-        revolve_xz_polyline(k, &pts)
-    }
-
-    fn revolve_xz_polyline(
-        k: &mut occt_wasm::OcctKernel,
-        pts: &[[f64; 2]],
-    ) -> Result<Handle, KernelError> {
-        let profile = Profile::Polyline(PolylineProfile {
-            points: pts.to_vec(),
-            closed: true,
-        });
-        let face = make_profile_face(k, &profile, [0.0, 0.0])?;
-        let face = place_sketch_on_plane(k, face, &SketchPlane::XZ)?;
-        k.revolve(face, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0 * PI)
-            .map_err(|e| occt_err(format!("revolve thread: {e}")))
-            .map(|s| unwrap_to_solid(k, s))
-    }
 
     fn handle_sweep(
         k: &mut occt_wasm::OcctKernel,
@@ -3222,6 +3186,16 @@ pub(crate) mod occt_backend {
                 }
                 k.add_holes_in_face(outer, &hole_wires)
                     .map_err(|e| occt_err(format!("add_holes_in_face: {:?}", e)))
+            }
+            Profile::Hex(hx) => {
+                let poly = Profile::Polyline(PolylineProfile {
+                    points: crate::ir::hex_vertices(
+                        hx.across_flats,
+                        [origin[0] + hx.at[0], origin[1] + hx.at[1]],
+                    ),
+                    closed: true,
+                });
+                make_profile_face(k, &poly, [0.0, 0.0])
             }
             Profile::Ellipse(e) => {
                 let cx = origin[0] + e.at[0];

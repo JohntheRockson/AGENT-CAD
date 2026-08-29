@@ -78,13 +78,131 @@ export function setDocumentParameter(
   name: string,
   value: number,
 ): CadDocument {
-  return {
+  const old = doc.parameters?.[name]
+  let next: CadDocument = {
     ...doc,
     parameters: {
       ...(doc.parameters ?? {}),
       [name]: value,
     },
   }
+  if (old != null && Number.isFinite(old) && Math.abs(old - value) > 1e-12) {
+    const replaced = { v: false }
+    next = rewriteNumbers(next, old, value, undefined, replaced) as CadDocument
+    next.parameters = { ...(doc.parameters ?? {}), [name]: value }
+    if (isAxialOverallName(name) && !replaced.v) {
+      const target = maxAxial(next)
+      if (target > 0.05) {
+        next = bumpLargestAxial(next, target, value - old) as CadDocument
+        next.parameters = { ...(doc.parameters ?? {}), [name]: value }
+      }
+    }
+  }
+  return next
+}
+
+const AXIAL_KEYS = new Set(['length', 'depth', 'height'])
+
+/** Scale numbers that match common ratios of the old parameter (hex vertices, halves). */
+function scaleLike(v: number, oldVal: number, newVal: number, key?: string): number | null {
+  const tol = Math.max(Math.abs(oldVal) * 0.002, 0.02)
+  const axial = key === 'length' || key === 'depth' || key === 'height'
+  const ratios = axial
+    ? [1, 0.5]
+    : [1, 0.5, 1 / Math.sqrt(3), Math.sqrt(3) / 2, 2 / Math.sqrt(3), 0.25]
+  const sign = v < 0 ? -1 : 1
+  const mag = Math.abs(v)
+  for (const r of ratios) {
+    if (Math.abs(mag - Math.abs(oldVal) * r) <= Math.max(tol, Math.abs(oldVal) * r * 0.002)) {
+      return sign * Math.abs(newVal) * r
+    }
+  }
+  return null
+}
+
+function rewriteNumbers(node: unknown, oldVal: number, newVal: number, key?: string, replaced?: { v: boolean }): unknown {
+  if (node && typeof node === 'object') {
+    if (Array.isArray(node)) {
+      return node.map((item) => rewriteNumbers(item, oldVal, newVal, key, replaced))
+    }
+    const rec = node as Record<string, unknown>
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(rec)) {
+      if (k === 'parameters') {
+        out[k] = v
+        continue
+      }
+      out[k] = rewriteNumbers(v, oldVal, newVal, k, replaced)
+    }
+    return out
+  }
+  if (typeof node === 'number') {
+    if (key && ['op', 'bodyId', 'documentId', 'name', 'units', 'plane', 'axis', 'kind', 'id', 'hand'].includes(key)) {
+      return node
+    }
+    const nv = scaleLike(node, oldVal, newVal, key)
+    if (nv != null) {
+      if (Math.abs(node - oldVal) <= Math.max(Math.abs(oldVal) * 0.002, 0.02)) {
+        if (replaced) replaced.v = true
+      }
+      return nv
+    }
+  }
+  return node
+}
+
+function bumpLargestAxial(node: unknown, target: number, delta: number, key?: string): unknown {
+  if (node && typeof node === 'object') {
+    if (Array.isArray(node)) {
+      return node.map((item) => bumpLargestAxial(item, target, delta, key))
+    }
+    const rec = node as Record<string, unknown>
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(rec)) {
+      if (k === 'parameters') {
+        out[k] = v
+        continue
+      }
+      out[k] = bumpLargestAxial(v, target, delta, k)
+    }
+    return out
+  }
+  if (typeof node === 'number' && key && AXIAL_KEYS.has(key) && Math.abs(node - target) < 1e-9) {
+    return Math.max(0.05, node + delta)
+  }
+  return node
+}
+
+function maxAxial(node: unknown, key?: string): number {
+  let best = 0
+  const walk = (n: unknown, k?: string) => {
+    if (n && typeof n === 'object') {
+      if (Array.isArray(n)) {
+        n.forEach((item) => walk(item, k))
+        return
+      }
+      for (const [ck, v] of Object.entries(n as Record<string, unknown>)) {
+        if (ck === 'parameters') continue
+        walk(v, ck)
+      }
+      return
+    }
+    if (typeof n === 'number' && k && AXIAL_KEYS.has(k) && n > best) best = n
+  }
+  walk(node, key)
+  return best
+}
+
+function isAxialOverallName(name: string): boolean {
+  const n = name.toLowerCase()
+  return (
+    n === 'length' ||
+    n === 'height' ||
+    n === 'bolt_length' ||
+    n === 'overall_length' ||
+    n === 'total_length' ||
+    (n.endsWith('_length') && !n.includes('head') && !n.includes('pitch'))
+  )
 }
 
 export function parameterEntries(doc: CadDocument): Array<[string, number]> {

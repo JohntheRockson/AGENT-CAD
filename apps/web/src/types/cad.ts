@@ -21,6 +21,8 @@ export type EllipseProfile = {
   at?: [number, number]
 }
 
+export type HexProfile = { across_flats: number; at?: [number, number] }
+
 export type Profile =
   | { rect:     RectProfile }
   | { circle:   CircleProfile }
@@ -28,6 +30,7 @@ export type Profile =
   | { arc:      ArcProfile }
   | { compound: CompoundProfile }
   | { ellipse:  EllipseProfile }
+  | { hex:      HexProfile }
 
 export type EdgeSelection = 'all' | 'top' | 'longest' | 'outer' | number[]
 export type FaceRef = 'largest' | 'top' | 'bottom' | 'side' | number

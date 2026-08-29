@@ -72,12 +72,17 @@ Convert the user's description into a CadDocument: one or more independent bodie
 - Feature ops still use `"op"` (not `"type"`). Sizes > 0. Coordinates MAY be negative.
 
 ## Parameters (CRITICAL for verification)
-- Put every important dimension in `"parameters": { "name": number, ... }` at document root.
-- Reference parameters by name (string) anywhere a number is allowed:
-  `"size": ["plate_width", "plate_depth", "plate_thickness"]`, `"depth": "plate_thickness"`, `"diameter": "hole_dia"`.
-- Use descriptive snake_case names (`plate_width`, `hole_dia`, `boss_height`). All values > 0.
-- When editing one dimension, update the parameter value — features should keep referencing the name.
-- Deterministic verification checks each parameter against measured geometry; do not rely on chat prose for sizes.
+- Put every important **overall** dimension in `"parameters"` (`bolt_length`, `head_width`, `plate_thickness`).
+- Reference parameters by name OR a simple expression anywhere a number is allowed:
+  `"size": ["plate_width", "plate_depth", "plate_thickness"]`, `"depth": "head_height"`, `"length": "bolt_length - head_height"`.
+- Hex heads: `{ "hex": { "across_flats": "head_width" } }` — do NOT hard-code hex polyline points.
+- Internal dims (`head_height`, pitch) may be parameters if they are referenced in features. Do not expect them to match the overall bounding box.
+- When editing one dimension, change the parameter value and keep feature fields as names/expressions.
+
+## Threads (CRITICAL)
+- External/internal threads MUST use `{ "op": "thread", "kind": "external"|"internal", "size": "M8", "length": <or expression> }`.
+- `size` is an ISO/UN designation (`M8`, `M8x1`, `1/4-20`). The kernel cuts a **helix**, not stacked rings.
+- M8 coarse is Ø8 × 1.25 mm (ISO 261). Do not fake threads with patterned tori or revolved grooves.
 
 ## Multi-body (CRITICAL)
 - Assemblies and multi-part designs MUST be separate bodies (base plate, bracket, shaft, fasteners, lid, …) — never one fused blob.
@@ -118,6 +123,7 @@ Convert the user's description into a CadDocument: one or more independent bodie
 { "compound": { "outer": <Profile>, "holes": [ <Profile>, ... ] } }
           Multi-contour: outer profile with inner holes (flange with cutouts, pocket islands).
 { "ellipse":  { "major": <d1>, "minor": <d2>, "at": [x,y] } } — full widths, like circle `d`
+{ "hex":      { "across_flats": <wrench size>, "at": [x,y] } } — regular hex (M8 head = 13)
 
 Set `"centered": false` on a rect ONLY when `at` should be the min-corner, not the center.
 

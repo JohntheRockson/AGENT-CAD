@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{DocumentOutput, MetricsData};
-use crate::ir::{CadDocument, CadProgram, Feature, Units};
+use crate::ir::{CadDocument, CadProgram, Feature, ThreadKind, Units};
 use crate::units::UnitContext;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -133,12 +133,18 @@ pub fn verify_structure(document: &CadDocument, output: &DocumentOutput) -> Veri
     }
 
     checks.extend(verify_parameters(document, output));
+    checks.extend(verify_threads(document, output));
 
     let passed = checks.iter().all(|c| c.passed);
     VerificationReport { passed, checks }
 }
 
-/// Compare named `parameters` against measured geometry (no natural-language parsing).
+/// Compare named `parameters` against measured geometry.
+///
+/// Only **envelope** dimensions (overall length/width/height/thickness/diameter)
+/// are required to match a bbox extent. Internal dims like `head_height` or
+/// `shank_length` are not bbox-gated — they failed verification before because
+/// they are parts of a larger solid, not the bounding box.
 pub fn verify_parameters(document: &CadDocument, output: &DocumentOutput) -> Vec<VerificationCheck> {
     if document.parameters.is_empty() {
         return Vec::new();
@@ -159,36 +165,126 @@ pub fn verify_parameters(document: &CadDocument, output: &DocumentOutput) -> Vec
             .iter()
             .position(|ext| ctx.tolerant_eq(*expected, *ext));
 
-        let passed = matched_idx.is_some();
-        let message = if passed {
-            let ext = unmatched_extents[matched_idx.unwrap()];
-            format!(
-                "parameter `{name}` = {:.1} {} matches bbox extent {:.1} {}",
-                expected,
-                ctx.units.length_suffix(),
-                ext,
-                ctx.units.length_suffix()
-            )
-        } else {
-            format!(
-                "parameter `{name}` = {:.1} {} — no bbox extent in [{:.1}, {:.1}, {:.1}] {}",
-                expected,
-                ctx.units.length_suffix(),
-                dx,
-                dy,
-                dz,
-                ctx.units.length_suffix()
-            )
-        };
-
-        checks.push(check(format!("param_{name}"), passed, message));
-
         if let Some(i) = matched_idx {
-            unmatched_extents.remove(i);
+            let ext = unmatched_extents.remove(i);
+            checks.push(check(
+                format!("param_{name}"),
+                true,
+                format!(
+                    "parameter `{name}` = {:.1} {} matches bbox extent {:.1} {}",
+                    expected,
+                    ctx.units.length_suffix(),
+                    ext,
+                    ctx.units.length_suffix()
+                ),
+            ));
+            continue;
         }
+
+        if is_envelope_param(name) {
+            checks.push(check(
+                format!("param_{name}"),
+                false,
+                format!(
+                    "parameter `{name}` = {:.1} {} — no bbox extent in [{:.1}, {:.1}, {:.1}] {}",
+                    expected,
+                    ctx.units.length_suffix(),
+                    dx,
+                    dy,
+                    dz,
+                    ctx.units.length_suffix()
+                ),
+            ));
+        }
+        // Internal dimensions: skip. They are not overall extents.
     }
 
     checks
+}
+
+fn is_envelope_param(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "length" | "width" | "height" | "depth" | "thickness" | "diameter" | "bolt_length"
+            | "overall_length" | "total_length"
+    ) || n.ends_with("_width")
+        || n.ends_with("_thickness")
+        || (n.ends_with("_length") && !n.contains("shank") && !n.contains("head") && !n.contains("thread"))
+        || (n.ends_with("_diameter") && !n.contains("hole") && !n.contains("tap"))
+}
+
+/// ISO thread-size checks from the IR (M8 → Ø8 × 1.25 mm coarse, etc.).
+fn verify_threads(document: &CadDocument, output: &DocumentOutput) -> Vec<VerificationCheck> {
+    let ctx = UnitContext::new(document.units);
+    let inch = matches!(document.units, Units::Inch);
+    let mut checks = Vec::new();
+
+    for body in &document.bodies {
+        for feat in &body.features {
+            let Feature::Thread(op) = feat else {
+                continue;
+            };
+            let Some(size) = op.size.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            match crate::thread::parse_size(size) {
+                Ok(spec) => {
+                    let spec = crate::thread::to_units(&spec, inch);
+                    checks.push(check(
+                        format!("thread_{size}_iso"),
+                        true,
+                        format!(
+                            "{size} → major Ø{:.2} {} × pitch {:.2} {} ({})",
+                            spec.major_diameter,
+                            ctx.units.length_suffix(),
+                            spec.pitch,
+                            ctx.units.length_suffix(),
+                            spec.designation
+                        ),
+                    ));
+                    if matches!(op.kind, ThreadKind::External) && body_is_thread_only(body) {
+                        let [xmin, ymin, _, xmax, ymax, _] = output.metrics.bbox;
+                        let dia = (xmax - xmin).abs().max((ymax - ymin).abs());
+                        let ok = ctx.tolerant_eq(spec.major_diameter, dia)
+                            || ((dia - spec.major_diameter).abs() / spec.major_diameter) < 0.15;
+                        checks.push(check(
+                            format!("thread_{size}_major_bbox"),
+                            ok,
+                            format!(
+                                "external {size} major Ø{:.2} vs XY span {:.2} {}",
+                                spec.major_diameter,
+                                dia,
+                                ctx.units.length_suffix()
+                            ),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    checks.push(check(
+                        format!("thread_{size}_iso"),
+                        false,
+                        format!("could not parse thread size '{size}': {e}"),
+                    ));
+                }
+            }
+        }
+    }
+    checks
+}
+
+fn body_is_thread_only(body: &crate::ir::CadBody) -> bool {
+    let solids: Vec<_> = body
+        .features
+        .iter()
+        .filter(|f| {
+            !matches!(
+                f,
+                Feature::Chamfer(_) | Feature::Fillet(_) | Feature::Transform(_)
+            )
+        })
+        .collect();
+    solids.len() == 1 && matches!(solids.first(), Some(Feature::Thread(_)))
 }
 
 /// Full verification used by the agent repair loop.
@@ -572,6 +668,36 @@ mod tests {
         );
         assert!(!report.passed);
         assert!(report.summary().contains("user_bbox_size"));
+    }
+
+    #[test]
+    fn internal_param_is_not_bbox_gated() {
+        let mut params = BTreeMap::new();
+        params.insert("head_height".into(), 5.3);
+        params.insert("plate_width".into(), 80.0);
+        let doc = CadDocument {
+            document_id: "t".into(),
+            units: Units::Mm,
+            parameters: params,
+            bodies: vec![CadBody {
+                body_id: "b".into(),
+                name: "B".into(),
+                visible: true,
+                suppressed: false,
+                transform: BodyTransform::default(),
+                features: vec![Feature::Box(BoxOp {
+                    size: [80.0, 40.0, 10.0],
+                    at: [0.0; 3],
+                    centered: true,
+                })],
+                references: vec![],
+            }],
+        };
+        let out = Engine::default().execute_document(&doc).unwrap();
+        let report = verify_document("", &doc, &out);
+        assert!(report.passed, "{}", report.summary());
+        assert!(!report.checks.iter().any(|c| c.name == "param_head_height"));
+        assert!(report.checks.iter().any(|c| c.name == "param_plate_width" && c.passed));
     }
 
     #[test]

@@ -450,7 +450,38 @@ fn m8_external_thread_builds() {
     assert!(dx > 6.0 && dy > 6.0, "expected ~8mm diameter, bbox={:?}", out.metrics.bbox);
     assert!(dz > 6.0, "expected ~8mm length, bbox={:?}", out.metrics.bbox);
     assert!(out.metrics.volume > 50.0, "volume vanished: {}", out.metrics.volume);
+    let major_cyl = std::f64::consts::PI * 4.0 * 4.0 * 8.0;
+    assert!(
+        out.metrics.volume < 0.97 * major_cyl,
+        "thread should cut below a smooth Ø8 cylinder, vol={} cyl={}",
+        out.metrics.volume,
+        major_cyl
+    );
     assert!(out.metrics.is_solid);
+    let variation = radius_variation_at_z(&out.mesh, (zmin + zmax) * 0.5, 0.2);
+    assert!(
+        variation > 0.08,
+        "thread should be helical (radius varies around a slice); variation={variation} — stacked rings are axisymmetric"
+    );
+}
+
+fn radius_variation_at_z(mesh: &kernel::engine::MeshData, z: f64, band: f64) -> f64 {
+    let mut rs = Vec::new();
+    for chunk in mesh.positions.chunks(3) {
+        if chunk.len() < 3 {
+            continue;
+        }
+        if (chunk[2] as f64 - z).abs() <= band {
+            let x = chunk[0] as f64;
+            let y = chunk[1] as f64;
+            rs.push((x * x + y * y).sqrt());
+        }
+    }
+    if rs.len() < 8 {
+        return 0.0;
+    }
+    let mean = rs.iter().sum::<f64>() / rs.len() as f64;
+    (rs.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rs.len() as f64).sqrt()
 }
 
 #[test]

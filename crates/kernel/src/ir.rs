@@ -295,6 +295,8 @@ pub enum Profile {
     /// Outer contour with inner holes (multi-contour / pocket-with-islands).
     Compound(CompoundProfile),
     Ellipse(EllipseProfile),
+    /// Regular hexagon. `across_flats` is the wrench size (ISO hex-head width).
+    Hex(HexProfile),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -318,6 +320,32 @@ pub struct RectProfile {
     /// quadrant. Set `false` to treat `at` as the min-corner (legacy).
     #[serde(default = "default_true")]
     pub centered: bool,
+}
+
+/// Regular hexagon in the sketch plane (flat-to-flat = wrench size).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HexProfile {
+    /// Distance between opposite flats (ISO hex-head width, e.g. 13 for M8).
+    pub across_flats: f64,
+    #[serde(default)]
+    pub at: [f64; 2],
+}
+
+impl HexProfile {
+    pub fn points(&self) -> Vec<[f64; 2]> {
+        hex_vertices(self.across_flats, self.at)
+    }
+}
+
+/// Vertex radius R = across_flats / √3 so opposite flats are `across_flats` apart.
+pub fn hex_vertices(across_flats: f64, at: [f64; 2]) -> Vec<[f64; 2]> {
+    let r = across_flats / 3.0_f64.sqrt();
+    (0..6)
+        .map(|i| {
+            let a = (i as f64) * std::f64::consts::PI / 3.0;
+            [at[0] + r * a.cos(), at[1] + r * a.sin()]
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1111,6 +1139,11 @@ impl Feature {
                         return Err(err("ellipse.major and ellipse.minor must be positive"));
                     }
                 }
+                Profile::Hex(h) => {
+                    if h.across_flats <= 0.0 {
+                        return Err(err("hex.across_flats must be positive"));
+                    }
+                }
             },
             Feature::Extrude(op) => {
                 if op.depth <= 0.0 {
@@ -1374,6 +1407,9 @@ fn validate_profile_nested(
         }
         Profile::Ellipse(e) if e.major <= 0.0 || e.minor <= 0.0 => {
             Err(err(format!("{label}: ellipse axes must be positive")))
+        }
+        Profile::Hex(h) if h.across_flats <= 0.0 => {
+            Err(err(format!("{label}: hex.across_flats must be positive")))
         }
         Profile::Polyline(_) => {
             if let Some(msg) = profile_polyline_error(profile, label) {
