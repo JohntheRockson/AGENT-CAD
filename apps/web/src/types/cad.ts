@@ -15,12 +15,19 @@ export type ArcProfile = {
 }
 export type CompoundProfile = { outer: Profile; holes?: Profile[] }
 
+export type EllipseProfile = {
+  major: number
+  minor: number
+  at?: [number, number]
+}
+
 export type Profile =
   | { rect:     RectProfile }
   | { circle:   CircleProfile }
   | { polyline: PolylineProfile }
   | { arc:      ArcProfile }
   | { compound: CompoundProfile }
+  | { ellipse:  EllipseProfile }
 
 export type EdgeSelection = 'all' | 'top' | 'longest' | 'outer' | number[]
 export type FaceRef = 'largest' | 'top' | 'bottom' | 'side' | number
@@ -96,6 +103,7 @@ export type FilletOp = {
 export type ChamferOp = {
   op: 'chamfer'
   distance: number
+  angle?: number
   edges?: EdgeSelection
 }
 
@@ -193,13 +201,14 @@ export type SweepPath =
         height: number
         radius: number
         center?: [number, number, number]
+        at?: [number, number, number]
         axis?: 'X' | 'Y' | 'Z'
       }
     }
 
 export type SweepOp = {
   op: 'sweep'
-  profile: Profile
+  profile?: Profile
   path: SweepPath
   fuse?: boolean
 }
@@ -218,22 +227,52 @@ export type ThickenOp = {
   fuse?: boolean
 }
 
+export type ThreadOp = {
+  op: 'thread'
+  kind: 'external' | 'internal' | 'die' | 'tap' | 'male' | 'bolt' | 'female' | 'nut'
+  size?: string
+  diameter?: number
+  pitch?: number
+  length?: number
+  depth?: number
+  at?: [number, number, number]
+  axis?: 'X' | 'Y' | 'Z'
+  center?: [number, number]
+  plane?: SketchPlane
+  through?: boolean
+  hand?: 'right' | 'left'
+}
+
 export type HelixOp = {
   op: 'helix'
   pitch: number
   height: number
   radius: number
-  diameter: number
+  diameter?: number
+  section_diameter?: number
   center?: [number, number, number]
+  at?: [number, number, number]
   axis?: 'X' | 'Y' | 'Z'
   fuse?: boolean
 }
 
+export type OffsetOp = {
+  op: 'offset'
+  distance: number
+}
+
+export type EllipsoidOp = {
+  op: 'ellipsoid'
+  radii: [number, number, number]
+  at?: [number, number, number]
+}
+
 export type DraftOp = {
   op: 'draft'
-  faces: EdgeSelection
   angle: number
+  faces?: EdgeSelection
   direction?: [number, number, number]
+  pull?: 'X' | 'Y' | 'Z'
 }
 
 export type Feature =
@@ -243,6 +282,7 @@ export type Feature =
   | BoxOp | CylinderOp | SphereOp | ConeOp | TorusOp
   | LoftOp | MirrorOp | PatternOp | ShellOp | DraftExtrudeOp
   | SweepOp | PipeOp | ThickenOp | HelixOp | DraftOp
+  | ThreadOp | OffsetOp | EllipsoidOp
 
 export interface CadProgram {
   units: Units

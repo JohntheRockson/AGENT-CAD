@@ -24,6 +24,7 @@ pub mod ir;
 pub mod topology;
 pub mod units;
 pub mod verify;
+pub mod thread;
 
 pub use engine::{
     BodyOutput, DocumentOutput, Engine, ExportFormat, KernelError, MeshData, MetricsData,

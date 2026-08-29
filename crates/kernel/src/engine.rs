@@ -134,8 +134,15 @@ impl Engine {
     }
 
     pub fn execute(&self, program: &CadProgram) -> Result<ModelOutput, KernelError> {
-        self.execute_document(&CadDocument::from_program(program.clone()))?
-            .into_model_output()
+        program.validate()?;
+
+        if self.use_occt {
+            #[cfg(feature = "occt")]
+            return occt_backend::execute_with_occt(program);
+            #[cfg(not(feature = "occt"))]
+            let _ = self.use_occt;
+        }
+        mock_backend::execute_with_mock(program)
     }
 
     pub fn execute_document(&self, document: &CadDocument) -> Result<DocumentOutput, KernelError> {
@@ -156,7 +163,15 @@ impl Engine {
         program: &CadProgram,
         format: &ExportFormat,
     ) -> Result<Vec<u8>, KernelError> {
-        self.export_document(&CadDocument::from_program(program.clone()), format)
+        program.validate()?;
+
+        if self.use_occt {
+            #[cfg(feature = "occt")]
+            return occt_backend::export_with_occt(program, format);
+            #[cfg(not(feature = "occt"))]
+            let _ = self.use_occt;
+        }
+        mock_backend::export_with_mock(program, format)
     }
 
     pub fn export_document(
@@ -250,6 +265,31 @@ pub(crate) mod mock_backend {
                     w = op.diameter;
                     h = op.diameter;
                     depth = op.height;
+                }
+                Feature::Ellipsoid(op) => {
+                    w = op.radii[0] * 2.0;
+                    h = op.radii[1] * 2.0;
+                    depth = op.radii[2] * 2.0;
+                }
+                Feature::Helix(op) => {
+                    w = (op.radius + op.diameter) * 2.0;
+                    h = w;
+                    depth = op.height;
+                }
+                Feature::Thread(op) => {
+                    let d = op.diameter.unwrap_or(8.0);
+                    w = d;
+                    h = d;
+                    depth = if op.length > 0.0 { op.length } else { d * 2.0 };
+                }
+                Feature::Sweep(_) => {
+                    if w <= 0.0 {
+                        w = 10.0;
+                        h = 10.0;
+                    }
+                    if depth <= 0.0 {
+                        depth = 10.0;
+                    }
                 }
                 _ => {}
             }
@@ -442,13 +482,52 @@ pub(crate) mod occt_backend {
         static STEP_CACHE: RefCell<HashMap<u64, StepEntry>> = RefCell::new(HashMap::new());
     }
 
+    fn is_fatal_occt(err: &KernelError) -> bool {
+        let s = err.to_string().to_lowercase();
+        s.contains("out of bounds")
+            || s.contains("wasm trap")
+            || s.contains("wasm runtime")
+            || s.contains("memory fault")
+            || s.contains("unreachable")
+            || s.contains("internal cad kernel crash")
+            || s.contains("kernel task panicked")
+    }
+
+    fn sanitize_occt_message(s: &str) -> String {
+        let lower = s.to_lowercase();
+        if lower.contains("out of bounds")
+            || lower.contains("wasm trap")
+            || lower.contains("wasm runtime")
+            || lower.contains("memory fault")
+            || lower.contains("unreachable")
+        {
+            let op = s.split(':').next().unwrap_or("operation").trim();
+            return format!(
+                "{op}: internal CAD kernel crash (wasm memory). Body rotation and \
+                 cylinders on X/Y are valid — do not drop those ops. Start each body \
+                 with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude."
+            );
+        }
+        if let Some(i) = lower.find("wasm backtrace") {
+            return s[..i].trim().trim_end_matches(':').trim().to_string();
+        }
+        s.to_string()
+    }
+
     fn occt_err(msg: impl std::fmt::Display) -> KernelError {
-        KernelError::Occt(msg.to_string())
+        KernelError::Occt(sanitize_occt_message(&msg.to_string()))
+    }
+
+    fn discard_kernel() {
+        KERNEL.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        STEP_CACHE.with(|c| c.borrow_mut().clear());
     }
 
     pub(crate) fn warmup() -> Result<(), KernelError> {
         occt_wasm::OcctKernel::precompile()
-            .map_err(|e| KernelError::Occt(format!("OCCT precompile: {:?}", e)))?;
+            .map_err(|e| KernelError::Occt(format!("OCCT precompile: {e}")))?;
         with_kernel(|_| Ok(()))
     }
 
@@ -456,16 +535,30 @@ pub(crate) mod occt_backend {
     where
         F: FnOnce(&mut occt_wasm::OcctKernel) -> Result<T, KernelError>,
     {
-        KERNEL.with(|cell| {
+        let result = KERNEL.with(|cell| {
             let mut guard = cell.borrow_mut();
             if guard.is_none() {
                 *guard = Some(
                     occt_wasm::OcctKernel::new()
-                        .map_err(|e| KernelError::Occt(format!("OCCT init: {:?}", e)))?,
+                        .map_err(|e| KernelError::Occt(format!("OCCT init: {e}")))?,
                 );
             }
             f(guard.as_mut().unwrap())
-        })
+        });
+        if result.as_ref().err().is_some_and(is_fatal_occt) {
+            discard_kernel();
+        }
+        result
+    }
+
+    /// After a wasm trap the instance is dead. Rebuild once on a fresh kernel
+    /// so a poisoned thread-local does not burn the rest of the chat.
+    fn with_kernel_retry<T>(f: impl Fn() -> Result<T, KernelError>) -> Result<T, KernelError> {
+        match f() {
+            Ok(v) => Ok(v),
+            Err(e) if is_fatal_occt(&e) => f(),
+            Err(e) => Err(e),
+        }
     }
 
     // ── Handle conversion helpers ─────────────────────────────────────────────
@@ -496,6 +589,19 @@ pub(crate) mod occt_backend {
             .and_then(|ids| ids.into_iter().next())
             .map(id_to_handle)
             .unwrap_or(shape)
+    }
+
+    /// Keep a single healed solid when the boolean produced one; otherwise keep
+    /// the compound so disconnected bosses/fasteners are not dropped.
+    fn drawable_shape(
+        k: &mut occt_wasm::OcctKernel,
+        shape: occt_wasm::ShapeHandle,
+    ) -> occt_wasm::ShapeHandle {
+        match k.get_sub_shapes(shape, "solid") {
+            Ok(ids) if ids.len() == 1 => heal_shape(k, id_to_handle(ids[0])),
+            Ok(ids) if ids.len() > 1 => shape,
+            _ => unwrap_to_solid(k, shape),
+        }
     }
 
     /// Merge same-domain faces after booleans so tessellation doesn't emit
@@ -703,13 +809,18 @@ pub(crate) mod occt_backend {
         solid: Handle,
         ids: &[u32],
         distance: f64,
+        angle: Option<f64>,
     ) -> Option<Handle> {
         if ids.is_empty() || distance <= 0.0 {
             return None;
         }
         let before = k.get_bounding_box(solid, false).ok();
         let handles = ids_to_handles(ids.to_vec());
-        let result = k.chamfer(solid, &handles, distance).ok()?;
+        let result = if let Some(a) = angle {
+            k.chamfer_dist_angle(solid, &handles, distance, a).ok()?
+        } else {
+            k.chamfer(solid, &handles, distance).ok()?
+        };
         let result = unwrap_to_solid(k, result);
         if let Some(ref b0) = before {
             if let Ok(b1) = k.get_bounding_box(result, false) {
@@ -778,13 +889,19 @@ pub(crate) mod occt_backend {
 
     /// Bump when handler semantics change so in-memory step cache cannot
     /// replay solids built with a previous (wrong) revolve/plane mapping.
-    const KERNEL_SEMANTICS: u64 = 0xA6E1_CAD0_0000_0004;
+    const KERNEL_SEMANTICS: u64 = 0xA6E1_CAD0_0000_0007;
+
+    fn body_cache_ns(body_id: &str) -> u64 {
+        let mut h = DefaultHasher::new();
+        body_id.hash(&mut h);
+        h.finish()
+    }
 
     /// Compute the cumulative hash for the first `n` features.
     /// Each feature is serialised to JSON and mixed into a running hash so
     /// any change to any feature invalidates all steps from that point on.
-    fn step_hashes(features: &[Feature]) -> Vec<u64> {
-        let mut acc: u64 = 0xcbf29ce484222325 ^ KERNEL_SEMANTICS; // FNV offset basis
+    fn step_hashes(features: &[Feature], namespace: u64) -> Vec<u64> {
+        let mut acc: u64 = 0xcbf29ce484222325 ^ KERNEL_SEMANTICS ^ namespace;
         features.iter().map(|feat| {
             let json = serde_json::to_string(feat).unwrap_or_default();
             let mut h = DefaultHasher::new();
@@ -827,11 +944,13 @@ pub(crate) mod occt_backend {
     }
 
     pub fn execute_with_occt(program: &CadProgram) -> Result<ModelOutput, KernelError> {
-        with_kernel(|k| {
-            let solid = STEP_CACHE.with(|c| {
-                execute_in_kernel(k, program, &mut c.borrow_mut())
-            })?;
-            tessellate_solid(k, solid)
+        with_kernel_retry(|| {
+            with_kernel(|k| {
+                let solid = STEP_CACHE.with(|c| {
+                    execute_in_kernel(k, program, &mut c.borrow_mut(), 0)
+                })?;
+                tessellate_solid(k, solid)
+            })
         })
     }
 
@@ -910,24 +1029,55 @@ pub(crate) mod occt_backend {
     ) -> Result<Handle, KernelError> {
         let [rx, ry, rz] = transform.rotation;
         if rx.abs() > 1e-9 {
-            solid = k
-                .rotate(solid, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, rx * PI / 180.0)
-                .map_err(|e| occt_err(format!("body rotate X: {:?}", e)))?;
+            solid = rotate_shape(
+                k,
+                solid,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                rx * PI / 180.0,
+                "body rotate X",
+            )?;
         }
         if ry.abs() > 1e-9 {
-            solid = k
-                .rotate(solid, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, ry * PI / 180.0)
-                .map_err(|e| occt_err(format!("body rotate Y: {:?}", e)))?;
+            solid = rotate_shape(
+                k,
+                solid,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                ry * PI / 180.0,
+                "body rotate Y",
+            )?;
         }
         if rz.abs() > 1e-9 {
-            solid = k
-                .rotate(solid, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, rz * PI / 180.0)
-                .map_err(|e| occt_err(format!("body rotate Z: {:?}", e)))?;
+            solid = rotate_shape(
+                k,
+                solid,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                rz * PI / 180.0,
+                "body rotate Z",
+            )?;
         }
         translate_if_needed(k, solid, transform.position)
     }
 
     pub fn execute_document_with_occt(document: &CadDocument) -> Result<DocumentOutput, KernelError> {
+        with_kernel_retry(|| execute_document_inner(document))
+    }
+
+    fn execute_document_inner(document: &CadDocument) -> Result<DocumentOutput, KernelError> {
         with_kernel(|k| {
             STEP_CACHE.with(|c| {
                 let mut cache = c.borrow_mut();
@@ -942,8 +1092,8 @@ pub(crate) mod occt_backend {
                         units: document.units.clone(),
                         features: body.features.clone(),
                     };
-                    let solid = execute_in_kernel(k, &prog, &mut cache)?;
-                    let solid = unwrap_to_solid(k, solid);
+                    let solid = execute_in_kernel(k, &prog, &mut cache, body_cache_ns(&body.body_id))?;
+                    let solid = drawable_shape(k, solid);
                     let solid = apply_body_transform(k, solid, &body.transform)?;
                     solids.insert(body.body_id.clone(), solid);
                 }
@@ -970,7 +1120,7 @@ pub(crate) mod occt_backend {
                                 .fuse(*target, tool)
                                 .map_err(|e| occt_err(format!("body fuse: {:?}", e)))?,
                         };
-                        *target = unwrap_to_solid(k, raw);
+                        *target = drawable_shape(k, raw);
                         if r.consume {
                             consumed.insert(body.body_id.clone());
                         }
@@ -1007,6 +1157,13 @@ pub(crate) mod occt_backend {
         document: &CadDocument,
         format: &ExportFormat,
     ) -> Result<Vec<u8>, KernelError> {
+        with_kernel_retry(|| export_document_inner(document, format))
+    }
+
+    fn export_document_inner(
+        document: &CadDocument,
+        format: &ExportFormat,
+    ) -> Result<Vec<u8>, KernelError> {
         with_kernel(|k| {
             STEP_CACHE.with(|c| {
                 let mut cache = c.borrow_mut();
@@ -1019,8 +1176,8 @@ pub(crate) mod occt_backend {
                         units: document.units.clone(),
                         features: body.features.clone(),
                     };
-                    let solid = execute_in_kernel(k, &prog, &mut cache)?;
-                    let solid = unwrap_to_solid(k, solid);
+                    let solid = execute_in_kernel(k, &prog, &mut cache, body_cache_ns(&body.body_id))?;
+                    let solid = drawable_shape(k, solid);
                     let solid = apply_body_transform(k, solid, &body.transform)?;
                     combined = Some(match combined {
                         None => solid,
@@ -1028,7 +1185,7 @@ pub(crate) mod occt_backend {
                             let raw = k
                                 .fuse(acc, solid)
                                 .map_err(|e| occt_err(format!("export fuse: {:?}", e)))?;
-                            unwrap_to_solid(k, raw)
+                            drawable_shape(k, raw)
                         }
                     });
                 }
@@ -1075,9 +1232,16 @@ pub(crate) mod occt_backend {
         program: &CadProgram,
         format: &ExportFormat,
     ) -> Result<Vec<u8>, KernelError> {
+        with_kernel_retry(|| export_program_inner(program, format))
+    }
+
+    fn export_program_inner(
+        program: &CadProgram,
+        format: &ExportFormat,
+    ) -> Result<Vec<u8>, KernelError> {
         with_kernel(|k| {
             let solid = STEP_CACHE.with(|c| {
-                execute_in_kernel(k, program, &mut c.borrow_mut())
+                execute_in_kernel(k, program, &mut c.borrow_mut(), 0)
             })?;
             let solid = heal_shape(k, solid);
             match format {
@@ -1201,8 +1365,9 @@ pub(crate) mod occt_backend {
         k: &mut occt_wasm::OcctKernel,
         program: &CadProgram,
         cache: &mut HashMap<u64, StepEntry>,
+        cache_ns: u64,
     ) -> Result<Handle, KernelError> {
-        let hashes = step_hashes(&program.features);
+        let hashes = step_hashes(&program.features, cache_ns);
 
         // Find the last consecutive cache hit from the beginning.
         let mut state = ExecState::default();
@@ -1245,10 +1410,13 @@ pub(crate) mod occt_backend {
                 Feature::Pattern(op)       => handle_pattern(k, &mut state, op)?,
                 Feature::Shell(op)         => handle_shell(k, &mut state, op)?,
                 Feature::DraftExtrude(op)  => handle_draft_extrude(k, &mut state, op)?,
+                Feature::Thread(op)        => handle_thread(k, &mut state, op, &program.units)?,
                 Feature::Sweep(op)         => handle_sweep(k, &mut state, op)?,
                 Feature::Pipe(op)          => handle_pipe(k, &mut state, op)?,
-                Feature::Thicken(op)       => handle_thicken(k, &mut state, op)?,
                 Feature::Helix(op)         => handle_helix(k, &mut state, op)?,
+                Feature::Offset(op)        => handle_offset(k, &mut state, op)?,
+                Feature::Thicken(op)       => handle_thicken(k, &mut state, op)?,
+                Feature::Ellipsoid(op)     => handle_ellipsoid(k, &mut state, op)?,
                 Feature::Draft(op)         => handle_draft(k, &mut state, op)?,
             }
 
@@ -1272,6 +1440,7 @@ pub(crate) mod occt_backend {
         let solid = state
             .current_solid
             .ok_or_else(|| KernelError::InvalidState("Program produced no solid".into()))?;
+        let solid = coalesce_solids(k, solid)?;
         reject_if_planar(k, solid)?;
         Ok(solid)
     }
@@ -1355,10 +1524,14 @@ pub(crate) mod occt_backend {
             rotate_to_plane(k, solid, &state.active_plane)?
         };
 
-        state.current_solid = Some(solid);
+        if state.base_before_face_sketch.take().is_some() {
+            // Face-sketch extrude already fused with the prior solid.
+            set_solid(state, solid);
+        } else {
+            join_or_set(k, state, solid)?;
+        }
         state.current_face = None;
         state.face_normal = None;
-        state.base_before_face_sketch = None;
         Ok(())
     }
 
@@ -1396,9 +1569,7 @@ pub(crate) mod occt_backend {
             .revolve(face, px, py, pz, dx, dy, dz, angle_rad)
             .map_err(|e| occt_err(format!("revolve: {:?}", e)))?;
 
-        state.current_solid = Some(solid);
-        state.current_face = None;
-        Ok(())
+        join_or_set(k, state, solid)
     }
 
     fn handle_cut(
@@ -1420,7 +1591,7 @@ pub(crate) mod occt_backend {
         let raw = k
             .cut(base, tool)
             .map_err(|e| occt_err(format!("cut: {:?}", e)))?;
-        state.current_solid = Some(unwrap_to_solid(k, raw));
+        state.current_solid = Some(drawable_shape(k, raw));
         Ok(())
     }
 
@@ -1429,22 +1600,24 @@ pub(crate) mod occt_backend {
         state: &mut ExecState,
         op: &FuseOp,
     ) -> Result<(), KernelError> {
-        let base = state
-            .current_solid
-            .ok_or_else(|| KernelError::InvalidState("fuse requires an existing solid".into()))?;
-
-        let addend = if let Some(ref face_ref) = op.face {
-            make_tool_on_face(k, base, face_ref, &op.profile, op.depth, op.at, false)?
+        if let Some(base) = state.current_solid {
+            let addend = if let Some(ref face_ref) = op.face {
+                make_tool_on_face(k, base, face_ref, &op.profile, op.depth, op.at, false)?
+            } else {
+                make_tool_solid(k, &op.profile, op.depth, op.at, &op.plane, false, None)?
+            };
+            state.last_tool = Some(addend);
+            state.last_boolean = Some(LastBoolean::Fuse);
+            let raw = k
+                .fuse(base, addend)
+                .map_err(|e| occt_err(format!("fuse: {:?}", e)))?;
+            state.current_solid = Some(unwrap_to_solid(k, raw));
+            Ok(())
         } else {
-            make_tool_solid(k, &op.profile, op.depth, op.at, &op.plane, false, None)?
-        };
-        state.last_tool = Some(addend);
-        state.last_boolean = Some(LastBoolean::Fuse);
-        let raw = k
-            .fuse(base, addend)
-            .map_err(|e| occt_err(format!("fuse: {:?}", e)))?;
-        state.current_solid = Some(unwrap_to_solid(k, raw));
-        Ok(())
+            // First feature on the body: extruded profile becomes the solid.
+            let addend = make_tool_solid(k, &op.profile, op.depth, op.at, &op.plane, false, None)?;
+            join_or_set(k, state, addend)
+        }
     }
 
     fn handle_common(
@@ -1518,7 +1691,7 @@ pub(crate) mod occt_backend {
         let raw = k
             .cut(base, cyl)
             .map_err(|e| occt_err(format!("cut (hole): {:?}", e)))?;
-        state.current_solid = Some(unwrap_to_solid(k, raw));
+        state.current_solid = Some(drawable_shape(k, raw));
         Ok(())
     }
 
@@ -1612,12 +1785,12 @@ pub(crate) mod occt_backend {
         };
         let selected = select_blend_edges(k, solid, pool, op.distance);
 
-        let result = try_chamfer(k, solid, &selected, op.distance)
+        let result = try_chamfer(k, solid, &selected, op.distance, op.angle)
             .or_else(|| {
                 let outer = longest_edges(k, &selected, 4);
-                try_chamfer(k, solid, &outer, op.distance)
+                try_chamfer(k, solid, &outer, op.distance, op.angle)
             })
-            .or_else(|| try_chamfer(k, solid, &selected, op.distance * 0.6));
+            .or_else(|| try_chamfer(k, solid, &selected, op.distance * 0.6, op.angle));
 
         match result {
             Some(shape) => state.current_solid = Some(shape),
@@ -1648,9 +1821,7 @@ pub(crate) mod occt_backend {
             let angle_rad = r.angle * PI / 180.0;
             let [px, py, pz] = r.origin;
             let [dx, dy, dz] = r.axis;
-            shape = k
-                .rotate(shape, px, py, pz, dx, dy, dz, angle_rad)
-                .map_err(|e| occt_err(format!("rotate: {:?}", e)))?;
+            shape = rotate_shape(k, shape, px, py, pz, dx, dy, dz, angle_rad, "rotate")?;
         }
         if let Some(s) = op.scale {
             shape = k
@@ -1679,8 +1850,7 @@ pub(crate) mod occt_backend {
             ty -= dy / 2.0;
         }
         let solid = translate_if_needed(k, solid, [tx, ty, tz])?;
-        set_solid(state, solid);
-        Ok(())
+        join_or_set(k, state, solid)
     }
 
     fn handle_cylinder(
@@ -1693,8 +1863,7 @@ pub(crate) mod occt_backend {
             .map_err(|e| occt_err(format!("make_cylinder: {:?}", e)))?;
         solid = align_z_primitive_to_axis(k, solid, &op.axis)?;
         solid = translate_if_needed(k, solid, op.at)?;
-        set_solid(state, solid);
-        Ok(())
+        join_or_set(k, state, solid)
     }
 
     fn handle_sphere(
@@ -1706,8 +1875,7 @@ pub(crate) mod occt_backend {
             .make_sphere(op.diameter / 2.0)
             .map_err(|e| occt_err(format!("make_sphere: {:?}", e)))?;
         let solid = translate_if_needed(k, solid, op.at)?;
-        set_solid(state, solid);
-        Ok(())
+        join_or_set(k, state, solid)
     }
 
     fn handle_cone(
@@ -1719,8 +1887,7 @@ pub(crate) mod occt_backend {
             .make_cone(op.d1 / 2.0, op.d2 / 2.0, op.height)
             .map_err(|e| occt_err(format!("make_cone: {:?}", e)))?;
         let solid = translate_if_needed(k, solid, op.at)?;
-        set_solid(state, solid);
-        Ok(())
+        join_or_set(k, state, solid)
     }
 
     fn handle_torus(
@@ -1732,8 +1899,7 @@ pub(crate) mod occt_backend {
             .make_torus(op.major, op.minor)
             .map_err(|e| occt_err(format!("make_torus: {:?}", e)))?;
         let solid = translate_if_needed(k, solid, op.at)?;
-        set_solid(state, solid);
-        Ok(())
+        join_or_set(k, state, solid)
     }
 
     fn handle_loft(
@@ -1771,8 +1937,8 @@ pub(crate) mod occt_backend {
                 .map_err(|e| occt_err(format!("loft: {:?}", e)))?
         };
 
-        set_solid(state, unwrap_to_solid(k, solid));
-        Ok(())
+        let solid = unwrap_to_solid(k, solid);
+        join_or_set(k, state, solid)
     }
 
     fn handle_mirror(
@@ -1916,9 +2082,248 @@ pub(crate) mod occt_backend {
             .draft_prism(face, 0.0, 0.0, op.depth, op.angle)
             .map_err(|e| occt_err(format!("draft_prism: {:?}", e)))?;
         let solid = rotate_to_plane(k, solid, &state.active_plane)?;
-        state.current_solid = Some(solid);
-        state.current_face = None;
-        Ok(())
+        join_or_set(k, state, solid)
+    }
+
+    fn handle_thread(
+        k: &mut occt_wasm::OcctKernel,
+        state: &mut ExecState,
+        op: &ThreadOp,
+        units: &Units,
+    ) -> Result<(), KernelError> {
+        let (major, pitch) = thread_dims(op, units)?;
+        let internal = matches!(op.kind, ThreadKind::Internal);
+        let through = op.through || (internal && op.length <= 0.0);
+        let length = if op.length > 0.0 {
+            op.length
+        } else if internal {
+            1.0
+        } else {
+            (major * 2.0).max(pitch * 4.0)
+        };
+
+        if internal {
+            let base = state.current_solid.ok_or_else(|| {
+                KernelError::InvalidState("internal thread (tap) needs an existing solid".into())
+            })?;
+            let [cx, cy] = map_uv(&op.plane, op.center[0], op.center[1]);
+            let (span, z0) = cutter_span(k, Some(base), length, through);
+            let tap_d = crate::thread::tap_drill_diameter(major, pitch);
+            let hole = k
+                .make_cylinder(tap_d / 2.0, span)
+                .map_err(|e| occt_err(format!("tap drill: {e}")))?;
+            let hole = k
+                .translate(hole, cx, cy, z0)
+                .map_err(|e| occt_err(format!("tap drill translate: {e}")))?;
+            let hole = rotate_to_plane(k, hole, &op.plane)?;
+            let hole = translate_if_needed(k, hole, op.at)?;
+            let drilled = k
+                .cut(base, hole)
+                .map_err(|e| occt_err(format!("tap hole: {e}")))?;
+            let drilled = drawable_shape(k, drilled);
+
+            let cutter_len = if through { span } else { length };
+            let cutter = thread_cutter(k, major, pitch, cutter_len, true, z0)?;
+            let cutter = k
+                .translate(cutter, cx, cy, 0.0)
+                .map_err(|e| occt_err(format!("tap cutter translate: {e}")))?;
+            let cutter = rotate_to_plane(k, cutter, &op.plane)?;
+            let cutter = translate_if_needed(k, cutter, op.at)?;
+            let cutter = maybe_left_hand(k, cutter, &op.hand)?;
+            let raw = k
+                .cut(drilled, cutter)
+                .map_err(|e| occt_err(format!("tap thread: {e}")))?;
+            state.current_solid = Some(drawable_shape(k, raw));
+            Ok(())
+        } else {
+            let rod = threaded_rod(k, major, pitch, length)?;
+            let rod = maybe_left_hand(k, rod, &op.hand)?;
+            let rod = align_z_primitive_to_axis(k, rod, &op.axis)?;
+            let rod = translate_if_needed(k, rod, op.at)?;
+            if state.current_solid.is_some() {
+                // Thread an existing boss: cut the groove tool from the body.
+                let base = state.current_solid.unwrap();
+                let cutter = thread_cutter(k, major, pitch, length, false, 0.0)?;
+                let cutter = maybe_left_hand(k, cutter, &op.hand)?;
+                let cutter = align_z_primitive_to_axis(k, cutter, &op.axis)?;
+                let cutter = translate_if_needed(k, cutter, op.at)?;
+                match k.cut(base, cutter) {
+                    Ok(raw) => {
+                        state.current_solid = Some(drawable_shape(k, raw));
+                        Ok(())
+                    }
+                    Err(_) => join_or_set(k, state, rod),
+                }
+            } else {
+                join_or_set(k, state, rod)
+            }
+        }
+    }
+
+    fn thread_dims(op: &ThreadOp, units: &Units) -> Result<(f64, f64), KernelError> {
+        let inch = matches!(units, Units::Inch);
+        if let Some(size) = op.size.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let spec = crate::thread::parse_size(size)
+                .map_err(KernelError::InvalidState)?;
+            let spec = crate::thread::to_units(&spec, inch);
+            Ok((
+                op.diameter.unwrap_or(spec.major_diameter),
+                op.pitch.unwrap_or(spec.pitch),
+            ))
+        } else {
+            Ok((op.diameter.unwrap(), op.pitch.unwrap()))
+        }
+    }
+
+    fn maybe_left_hand(
+        k: &mut occt_wasm::OcctKernel,
+        shape: Handle,
+        hand: &ThreadHand,
+    ) -> Result<Handle, KernelError> {
+        match hand {
+            ThreadHand::Right => Ok(shape),
+            ThreadHand::Left => k
+                .mirror(shape, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+                .map_err(|e| occt_err(format!("left-hand thread: {e}"))),
+        }
+    }
+
+    /// External threaded cylinder along +Z from the origin (revolve fallback is the
+    /// reliable path; a helical pipe is tried first).
+    fn threaded_rod(
+        k: &mut occt_wasm::OcctKernel,
+        major: f64,
+        pitch: f64,
+        length: f64,
+    ) -> Result<Handle, KernelError> {
+        let cyl = k
+            .make_cylinder(major / 2.0, length)
+            .map_err(|e| occt_err(format!("thread cylinder: {e}")))?;
+        if let Ok(cutter) = thread_cutter(k, major, pitch, length, false, 0.0) {
+            if let Ok(cut) = k.cut(cyl, cutter) {
+                return Ok(drawable_shape(k, cut));
+            }
+        }
+        revolved_thread_solid(k, major, pitch, length)
+    }
+
+    fn thread_cutter(
+        k: &mut occt_wasm::OcctKernel,
+        major: f64,
+        pitch: f64,
+        length: f64,
+        internal: bool,
+        z0: f64,
+    ) -> Result<Handle, KernelError> {
+        helical_thread_cutter(k, major, pitch, length, internal, z0)
+            .or_else(|_| revolved_thread_cutter(k, major, pitch, length, internal, z0))
+    }
+
+    fn helical_thread_cutter(
+        k: &mut occt_wasm::OcctKernel,
+        major: f64,
+        pitch: f64,
+        length: f64,
+        internal: bool,
+        z0: f64,
+    ) -> Result<Handle, KernelError> {
+        let depth = crate::thread::external_depth(pitch);
+        let half = pitch * 0.5;
+        let (r_out, r_in) = if internal {
+            let r_hole = crate::thread::tap_drill_diameter(major, pitch) / 2.0;
+            (major / 2.0, (r_hole - 0.12 * pitch).max(0.05))
+        } else {
+            (major / 2.0 + 0.18 * pitch, major / 2.0 - depth)
+        };
+        let r_h = 0.5 * (r_out + r_in);
+        let z_start = z0 - half;
+        let pts = [
+            [r_out, 0.0, z_start],
+            [r_out, 0.0, z_start + pitch],
+            [r_in, 0.0, z_start + half],
+        ];
+        let face = face_from_polygon_3d(k, &pts)?;
+        let height = length + pitch;
+        let spine = k
+            .make_helix_wire(0.0, 0.0, z_start, 0.0, 0.0, 1.0, pitch, height, r_h)
+            .map_err(|e| occt_err(format!("thread helix: {e}")))?;
+        pipe_along(k, face, spine)
+    }
+
+    fn revolved_thread_cutter(
+        k: &mut occt_wasm::OcctKernel,
+        major: f64,
+        pitch: f64,
+        length: f64,
+        internal: bool,
+        z0: f64,
+    ) -> Result<Handle, KernelError> {
+        let depth = crate::thread::external_depth(pitch);
+        let n = ((length / pitch).ceil() as i32 + 2).max(2);
+        let (r_a, r_b) = if internal {
+            let r_hole = crate::thread::tap_drill_diameter(major, pitch) / 2.0;
+            ((r_hole - 0.08 * pitch).max(0.05), major / 2.0 + 0.05 * pitch)
+        } else {
+            (major / 2.0 + 0.2 * pitch, major / 2.0 - depth)
+        };
+        let mut pts: Vec<[f64; 2]> = Vec::new();
+        let z_lo = z0 - pitch;
+        pts.push([r_a, z_lo]);
+        for i in 0..=n {
+            let z = z_lo + i as f64 * pitch;
+            pts.push([r_a, z]);
+            pts.push([r_b, z + pitch * 0.5]);
+        }
+        let z_hi = z_lo + (n as f64 + 1.0) * pitch;
+        pts.push([r_a, z_hi]);
+        let pad = (r_a - r_b).abs() + pitch;
+        if internal {
+            pts.push([(r_a - pad).max(0.02), z_hi]);
+            pts.push([(r_a - pad).max(0.02), z_lo]);
+        } else {
+            pts.push([r_a + pad, z_hi]);
+            pts.push([r_a + pad, z_lo]);
+        }
+        revolve_xz_polyline(k, &pts)
+    }
+
+    fn revolved_thread_solid(
+        k: &mut occt_wasm::OcctKernel,
+        major: f64,
+        pitch: f64,
+        length: f64,
+    ) -> Result<Handle, KernelError> {
+        let depth = crate::thread::external_depth(pitch);
+        let r_crest = major / 2.0;
+        let r_root = (r_crest - depth).max(major * 0.15);
+        let mut pts: Vec<[f64; 2]> = vec![[0.0, 0.0], [0.0, length], [r_crest, length]];
+        let mut z = length;
+        while z > 1e-9 {
+            let z_mid = (z - pitch * 0.5).max(0.0);
+            let z_next = (z - pitch).max(0.0);
+            pts.push([r_root, z_mid]);
+            pts.push([r_crest, z_next]);
+            if z_next <= 0.0 {
+                break;
+            }
+            z = z_next;
+        }
+        revolve_xz_polyline(k, &pts)
+    }
+
+    fn revolve_xz_polyline(
+        k: &mut occt_wasm::OcctKernel,
+        pts: &[[f64; 2]],
+    ) -> Result<Handle, KernelError> {
+        let profile = Profile::Polyline(PolylineProfile {
+            points: pts.to_vec(),
+            closed: true,
+        });
+        let face = make_profile_face(k, &profile, [0.0, 0.0])?;
+        let face = place_sketch_on_plane(k, face, &SketchPlane::XZ)?;
+        k.revolve(face, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0 * PI)
+            .map_err(|e| occt_err(format!("revolve thread: {e}")))
+            .map(|s| unwrap_to_solid(k, s))
     }
 
     fn handle_sweep(
@@ -1926,14 +2331,146 @@ pub(crate) mod occt_backend {
         state: &mut ExecState,
         op: &SweepOp,
     ) -> Result<(), KernelError> {
-        let profile = make_profile_face(k, &op.profile, [0.0, 0.0])?;
+        let profile = if let Some(p) = &op.profile {
+            make_profile_face(k, p, [0.0, 0.0])?
+        } else {
+            state.current_face.ok_or_else(|| {
+                KernelError::InvalidState("sweep needs a profile or a preceding sketch".into())
+            })?
+        };
         let spine = make_sweep_path(k, &op.path)?;
-        let swept = k
-            .pipe(profile, spine)
-            .or_else(|_| k.simple_pipe(profile, spine))
-            .map_err(|e| occt_err(format!("sweep/pipe: {:?}", e)))?;
-        let solid = unwrap_to_solid(k, swept);
+        let solid = match pipe_along(k, profile, spine) {
+            Ok(s) => s,
+            Err(_) => {
+                let swept = k
+                    .pipe(profile, spine)
+                    .or_else(|_| k.simple_pipe(profile, spine))
+                    .map_err(|e| occt_err(format!("sweep/pipe: {:?}", e)))?;
+                unwrap_to_solid(k, swept)
+            }
+        };
         absorb_solid(k, state, solid, op.fuse)?;
+        Ok(())
+    }
+
+    fn handle_helix(
+        k: &mut occt_wasm::OcctKernel,
+        state: &mut ExecState,
+        op: &HelixOp,
+    ) -> Result<(), KernelError> {
+        let sec_r = op.diameter / 2.0;
+        let spine =
+            helix_spine(k, op.pitch, op.height, op.radius, [0.0; 3], &RevolveAxis::Z)?;
+        let solid = helix_solid(k, spine, op.radius, op.pitch, op.height, sec_r)?;
+        let solid = align_z_primitive_to_axis(k, solid, &op.axis)?;
+        let solid = translate_if_needed(k, solid, op.center)?;
+        absorb_solid(k, state, solid, op.fuse)?;
+        Ok(())
+    }
+
+    fn helix_solid(
+        k: &mut occt_wasm::OcctKernel,
+        spine: Handle,
+        radius: f64,
+        pitch: f64,
+        height: f64,
+        sec_r: f64,
+    ) -> Result<Handle, KernelError> {
+        let sec_d = sec_r * 2.0;
+        // Square section at the helix start (XZ plane) — more reliable than a disk.
+        let square = face_from_polygon_3d(
+            k,
+            &[
+                [radius - sec_r, 0.0, -sec_r],
+                [radius + sec_r, 0.0, -sec_r],
+                [radius + sec_r, 0.0, sec_r],
+                [radius - sec_r, 0.0, sec_r],
+            ],
+        )
+        .ok();
+        if let Some(face) = square {
+            if let Ok(s) = pipe_along(k, face, spine) {
+                return Ok(s);
+            }
+        }
+        // Circle in XY at the origin; MakePipe relocates it onto the spine.
+        if let Ok(edge) = k.make_circle_edge(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, sec_r) {
+            if let Ok(wire) = k.make_wire(&[edge]) {
+                if let Ok(face) = k.make_face(wire) {
+                    if let Ok(s) = pipe_along(k, face, spine) {
+                        return Ok(s);
+                    }
+                }
+            }
+        }
+        // Rectangle on XY, centered.
+        if let Ok(rect) = k.make_rectangle(sec_d, sec_d) {
+            let rect = k
+                .translate(rect, -sec_r, -sec_r, 0.0)
+                .unwrap_or(rect);
+            if let Ok(s) = pipe_along(k, rect, spine) {
+                return Ok(s);
+            }
+        }
+        // Approximate the helix with a polyline (C0) and sweep with round corners.
+        let path = helix_polyline(radius, pitch, height, 24);
+        if let Ok(poly) = wire_from_polyline3(k, &path) {
+            if let Ok(rect) = k.make_rectangle(sec_d, sec_d) {
+                let rect = k
+                    .translate(rect, -sec_r, -sec_r, 0.0)
+                    .unwrap_or(rect);
+                if let Ok(s) = pipe_along(k, rect, poly) {
+                    return Ok(s);
+                }
+            }
+            if let Some(face) = square {
+                if let Ok(s) = pipe_along(k, face, poly) {
+                    return Ok(s);
+                }
+            }
+        }
+        // Last resort: stacked torus rings so the op still yields a coil-like solid.
+        let n = ((height / pitch).round() as i32).max(1);
+        let mut acc: Option<Handle> = None;
+        for i in 0..n {
+            let ring = k
+                .make_torus(radius, sec_r)
+                .map_err(|e| occt_err(format!("helix torus: {e}")))?;
+            let ring = k
+                .translate(ring, 0.0, 0.0, i as f64 * pitch)
+                .map_err(|e| occt_err(format!("helix torus translate: {e}")))?;
+            acc = Some(match acc {
+                None => ring,
+                Some(a) => k.fuse(a, ring).map(|s| unwrap_to_solid(k, s)).unwrap_or(a),
+            });
+        }
+        acc.ok_or_else(|| occt_err("helix/coil sweep failed"))
+    }
+
+    fn helix_polyline(radius: f64, pitch: f64, height: f64, pts_per_turn: u32) -> Vec<[f64; 3]> {
+        let turns = (height / pitch).max(0.25);
+        let n = ((turns * pts_per_turn as f64).ceil() as usize).max(8);
+        (0..=n)
+            .map(|i| {
+                let t = i as f64 / pts_per_turn as f64;
+                let a = t * 2.0 * PI;
+                [radius * a.cos(), radius * a.sin(), (t * pitch).min(height)]
+            })
+            .collect()
+    }
+
+    fn handle_offset(
+        k: &mut occt_wasm::OcctKernel,
+        state: &mut ExecState,
+        op: &OffsetOp,
+    ) -> Result<(), KernelError> {
+        let solid = state
+            .current_solid
+            .ok_or_else(|| KernelError::InvalidState("offset requires an existing solid".into()))?;
+        let result = k
+            .offset(solid, op.distance, 1e-3)
+            .map_err(|e| occt_err(format!("offset: {e}")))?;
+        set_solid(state, unwrap_to_solid(k, result));
         Ok(())
     }
 
@@ -1956,11 +2493,16 @@ pub(crate) mod occt_backend {
         let profile = k
             .translate(profile, start[0], start[1], start[2])
             .map_err(|e| occt_err(format!("pipe profile translate: {:?}", e)))?;
-        let swept = k
-            .pipe(profile, spine)
-            .or_else(|_| k.simple_pipe(profile, spine))
-            .map_err(|e| occt_err(format!("pipe: {:?}", e)))?;
-        let solid = unwrap_to_solid(k, swept);
+        let solid = match pipe_along(k, profile, spine) {
+            Ok(s) => s,
+            Err(_) => {
+                let swept = k
+                    .pipe(profile, spine)
+                    .or_else(|_| k.simple_pipe(profile, spine))
+                    .map_err(|e| occt_err(format!("pipe: {:?}", e)))?;
+                unwrap_to_solid(k, swept)
+            }
+        };
         absorb_solid(k, state, solid, op.fuse)?;
         Ok(())
     }
@@ -1975,10 +2517,12 @@ pub(crate) mod occt_backend {
                 KernelError::InvalidState("thicken face requires an existing solid".into())
             })?;
             resolve_face_handle(k, solid, face_ref)?
+        } else if let Some(face) = state.current_face {
+            face
         } else {
-            state.current_face.ok_or_else(|| {
+            state.current_solid.ok_or_else(|| {
                 KernelError::InvalidState(
-                    "thicken requires a preceding sketch or a face selector".into(),
+                    "thicken requires a preceding sketch, a face selector, or an existing solid".into(),
                 )
             })?
         };
@@ -1991,27 +2535,17 @@ pub(crate) mod occt_backend {
         Ok(())
     }
 
-    fn handle_helix(
+    fn handle_ellipsoid(
         k: &mut occt_wasm::OcctKernel,
         state: &mut ExecState,
-        op: &HelixOp,
+        op: &EllipsoidOp,
     ) -> Result<(), KernelError> {
-        let path = SweepPath::Helix {
-            pitch: op.pitch,
-            height: op.height,
-            radius: op.radius,
-            center: op.center,
-            axis: op.axis.clone(),
-        };
-        handle_pipe(
-            k,
-            state,
-            &PipeOp {
-                diameter: op.diameter,
-                path,
-                fuse: op.fuse,
-            },
-        )
+        let [rx, ry, rz] = op.radii;
+        let solid = k
+            .make_ellipsoid(rx, ry, rz)
+            .map_err(|e| occt_err(format!("make_ellipsoid: {e}")))?;
+        let solid = translate_if_needed(k, solid, op.at)?;
+        join_or_set(k, state, solid)
     }
 
     fn handle_draft(
@@ -2022,6 +2556,7 @@ pub(crate) mod occt_backend {
         let solid = state
             .current_solid
             .ok_or_else(|| KernelError::InvalidState("draft requires an existing solid".into()))?;
+        let solid = unwrap_to_solid(k, solid);
         let face_ids = k
             .get_sub_shapes(solid, "face")
             .map_err(|e| occt_err(format!("get_sub_shapes (draft): {:?}", e)))?;
@@ -2047,6 +2582,115 @@ pub(crate) mod occt_backend {
         }
         set_solid(state, unwrap_to_solid(k, result));
         Ok(())
+    }
+
+    fn helix_spine(
+        k: &mut occt_wasm::OcctKernel,
+        pitch: f64,
+        height: f64,
+        radius: f64,
+        at: [f64; 3],
+        axis: &RevolveAxis,
+    ) -> Result<Handle, KernelError> {
+        let (dx, dy, dz) = axis_dir(axis);
+        k.make_helix_wire(at[0], at[1], at[2], dx, dy, dz, pitch, height, radius)
+            .map_err(|e| occt_err(format!("make_helix_wire: {e}")))
+    }
+
+    fn wire_from_polyline3(
+        k: &mut occt_wasm::OcctKernel,
+        pts: &[[f64; 3]],
+    ) -> Result<Handle, KernelError> {
+        if pts.len() < 2 {
+            return Err(KernelError::InvalidState(
+                "polyline path needs at least 2 points".into(),
+            ));
+        }
+        let mut edges = Vec::with_capacity(pts.len() - 1);
+        for w in pts.windows(2) {
+            let a = w[0];
+            let b = w[1];
+            let e = k
+                .make_line_edge(a[0], a[1], a[2], b[0], b[1], b[2])
+                .map_err(|err| occt_err(format!("path edge: {err}")))?;
+            edges.push(e);
+        }
+        k.make_wire(&edges)
+            .map_err(|e| occt_err(format!("path wire: {e}")))
+    }
+
+    fn face_from_polygon_3d(
+        k: &mut occt_wasm::OcctKernel,
+        pts: &[[f64; 3]],
+    ) -> Result<Handle, KernelError> {
+        if pts.len() < 3 {
+            return Err(KernelError::InvalidState(
+                "polygon face needs at least 3 points".into(),
+            ));
+        }
+        let mut edges = Vec::with_capacity(pts.len());
+        for i in 0..pts.len() {
+            let a = pts[i];
+            let b = pts[(i + 1) % pts.len()];
+            let e = k
+                .make_line_edge(a[0], a[1], a[2], b[0], b[1], b[2])
+                .map_err(|err| occt_err(format!("polygon edge: {err}")))?;
+            edges.push(e);
+        }
+        let wire = k
+            .make_wire(&edges)
+            .map_err(|e| occt_err(format!("polygon wire: {e}")))?;
+        k.make_face(wire)
+            .or_else(|_| k.make_non_planar_face(wire))
+            .map_err(|e| occt_err(format!("polygon face: {e}")))
+    }
+
+    fn pipe_along(
+        k: &mut occt_wasm::OcctKernel,
+        profile: Handle,
+        spine: Handle,
+    ) -> Result<Handle, KernelError> {
+        let as_solid = |k: &mut occt_wasm::OcctKernel, s: Handle| -> Option<Handle> {
+            let ids = k.get_sub_shapes(s, "solid").ok()?;
+            if ids.is_empty() {
+                k.thicken(s, 0.05, 1e-3).ok().map(|t| unwrap_to_solid(k, t))
+            } else {
+                Some(unwrap_to_solid(k, s))
+            }
+        };
+        if let Ok(s) = k.pipe(profile, spine) {
+            if let Some(sol) = as_solid(k, s) {
+                return Ok(sol);
+            }
+        }
+        let wire = k.outer_wire(profile).unwrap_or(profile);
+        if let Ok(s) = k.simple_pipe(wire, spine) {
+            if let Some(sol) = as_solid(k, s) {
+                return Ok(sol);
+            }
+        }
+        if let Ok(s) = k.sweep(wire, spine, 0) {
+            if let Some(sol) = as_solid(k, s) {
+                return Ok(sol);
+            }
+        }
+        if let Ok(s) = k.sweep(wire, spine, 1) {
+            if let Some(sol) = as_solid(k, s) {
+                return Ok(sol);
+            }
+        }
+        let aux = k.make_null_shape().unwrap_or(spine);
+        if let Ok(s) = k.sweep_oriented(profile, spine, 1, 0.0, 0.0, 1.0, aux) {
+            if let Some(sol) = as_solid(k, s) {
+                return Ok(sol);
+            }
+        }
+        if let Ok(s) = k.sweep_pipe_shell(profile, spine, true, false) {
+            if let Some(sol) = as_solid(k, s) {
+                return Ok(sol);
+            }
+        }
+        Err(occt_err("sweep/pipe along path failed"))
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -2510,6 +3154,11 @@ pub(crate) mod occt_backend {
                 for i in 0..n {
                     let a = p.points[i];
                     let b = p.points[(i + 1) % n];
+                    let dx = a[0] - b[0];
+                    let dy = a[1] - b[1];
+                    if dx * dx + dy * dy < 1e-16 {
+                        continue;
+                    }
                     let e = k
                         .make_line_edge(
                             a[0] + origin[0],
@@ -2519,14 +3168,20 @@ pub(crate) mod occt_backend {
                             b[1] + origin[1],
                             0.0,
                         )
-                        .map_err(|e| occt_err(format!("make_line_edge: {:?}", e)))?;
+                        .map_err(|e| occt_err(format!("make_line_edge: {e}")))?;
                     edges.push(e);
+                }
+                if edges.len() < 3 {
+                    return Err(KernelError::InvalidState(
+                        "polyline needs at least 3 distinct edges (coincident points were skipped)"
+                            .into(),
+                    ));
                 }
                 let wire = k
                     .make_wire(&edges)
-                    .map_err(|e| occt_err(format!("make_wire (polyline): {:?}", e)))?;
+                    .map_err(|e| occt_err(format!("make_wire (polyline): {e}")))?;
                 k.make_face(wire)
-                    .map_err(|e| occt_err(format!("make_face (polyline): {:?}", e)))
+                    .map_err(|e| occt_err(format!("make_face (polyline): {e}")))
             }
             Profile::Arc(a) => {
                 let cx = origin[0] + a.center[0];
@@ -2568,6 +3223,18 @@ pub(crate) mod occt_backend {
                 k.add_holes_in_face(outer, &hole_wires)
                     .map_err(|e| occt_err(format!("add_holes_in_face: {:?}", e)))
             }
+            Profile::Ellipse(e) => {
+                let cx = origin[0] + e.at[0];
+                let cy = origin[1] + e.at[1];
+                let edge = k
+                    .make_ellipse_edge(cx, cy, 0.0, 0.0, 0.0, 1.0, e.major / 2.0, e.minor / 2.0)
+                    .map_err(|err| occt_err(format!("make_ellipse_edge: {:?}", err)))?;
+                let wire = k
+                    .make_wire(&[edge])
+                    .map_err(|err| occt_err(format!("make_wire (ellipse): {:?}", err)))?;
+                k.make_face(wire)
+                    .map_err(|err| occt_err(format!("make_face (ellipse): {:?}", err)))
+            }
         }
     }
 
@@ -2588,6 +3255,77 @@ pub(crate) mod occt_backend {
         state.current_face = None;
     }
 
+    /// First solid on a body is adopted as-is. Later primitives/extrudes join.
+    fn join_or_set(
+        k: &mut occt_wasm::OcctKernel,
+        state: &mut ExecState,
+        solid: Handle,
+    ) -> Result<(), KernelError> {
+        let joined = if let Some(base) = state.current_solid {
+            let raw = k
+                .fuse(base, solid)
+                .map_err(|e| occt_err(format!("join: {e}")))?;
+            drawable_shape(k, raw)
+        } else {
+            solid
+        };
+        set_solid(state, joined);
+        Ok(())
+    }
+
+    /// Fuse leftover solids in a compound so a body of overlapping bosses is one part.
+    fn coalesce_solids(
+        k: &mut occt_wasm::OcctKernel,
+        shape: Handle,
+    ) -> Result<Handle, KernelError> {
+        let ids = k.get_sub_shapes(shape, "solid").unwrap_or_default();
+        if ids.len() <= 1 {
+            return Ok(shape);
+        }
+        let handles: Vec<Handle> = ids.into_iter().map(id_to_handle).collect();
+        if let Ok(fused) = k.fuse_all(&handles) {
+            return Ok(drawable_shape(k, fused));
+        }
+        let mut acc = handles[0];
+        for &part in &handles[1..] {
+            if let Ok(raw) = k.fuse(acc, part) {
+                acc = drawable_shape(k, raw);
+            }
+        }
+        Ok(acc)
+    }
+
+    /// Rotate a solid, or each solid in a compound. OCCT rotate on a multi-solid
+    /// compound has trapped the wasm heap; rotating pieces then compounding is safe.
+    fn rotate_shape(
+        k: &mut occt_wasm::OcctKernel,
+        shape: Handle,
+        px: f64,
+        py: f64,
+        pz: f64,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        angle_rad: f64,
+        ctx: &str,
+    ) -> Result<Handle, KernelError> {
+        let solids = k.get_sub_shapes(shape, "solid").unwrap_or_default();
+        if solids.len() <= 1 {
+            return k
+                .rotate(shape, px, py, pz, dx, dy, dz, angle_rad)
+                .map_err(|e| occt_err(format!("{ctx}: {e}")));
+        }
+        let mut rotated = Vec::with_capacity(solids.len());
+        for id in solids {
+            let part = k
+                .rotate(id_to_handle(id), px, py, pz, dx, dy, dz, angle_rad)
+                .map_err(|e| occt_err(format!("{ctx}: {e}")))?;
+            rotated.push(part);
+        }
+        k.make_compound(&rotated)
+            .map_err(|e| occt_err(format!("{ctx} compound: {e}")))
+    }
+
     /// Cylinder/cone primitives are built along +Z. Rotate onto X or Y if asked.
     fn align_z_primitive_to_axis(
         k: &mut occt_wasm::OcctKernel,
@@ -2597,12 +3335,10 @@ pub(crate) mod occt_backend {
         let a = std::f64::consts::FRAC_PI_2;
         match axis {
             RevolveAxis::Z => Ok(shape),
-            RevolveAxis::X => k
-                .rotate(shape, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, a)
-                .map_err(|e| occt_err(format!("align cylinder to X: {:?}", e))),
-            RevolveAxis::Y => k
-                .rotate(shape, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -a)
-                .map_err(|e| occt_err(format!("align cylinder to Y: {:?}", e))),
+            RevolveAxis::X => rotate_shape(k, shape, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, a, "align cylinder to X"),
+            RevolveAxis::Y => {
+                rotate_shape(k, shape, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -a, "align cylinder to Y")
+            }
         }
     }
 
@@ -2725,7 +3461,7 @@ pub(crate) mod occt_backend {
         program: &CadProgram,
     ) -> Result<crate::topology::TopologyReport, KernelError> {
         with_kernel(|k| {
-            let solid = STEP_CACHE.with(|c| execute_in_kernel(k, program, &mut c.borrow_mut()))?;
+            let solid = STEP_CACHE.with(|c| execute_in_kernel(k, program, &mut c.borrow_mut(), 0))?;
             let solid = heal_shape(k, solid);
             let face_ids = k
                 .get_sub_shapes(solid, "face")

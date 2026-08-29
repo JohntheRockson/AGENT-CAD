@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 // ── Top-level program ────────────────────────────────────────────────────────
@@ -180,6 +180,7 @@ impl CadDocument {
             for (fi, feat) in body.features.iter().enumerate() {
                 feat.validate(fi)?;
             }
+            validate_solid_order(&body.features)?;
             for r in &body.references {
                 if r.target == body.body_id {
                     return Err(ValidationError::InvalidParameter {
@@ -237,10 +238,14 @@ pub enum Feature {
     Pattern(PatternOp),
     Shell(ShellOp),
     DraftExtrude(DraftExtrudeOp),
+    Thread(ThreadOp),
     Sweep(SweepOp),
     Pipe(PipeOp),
-    Thicken(ThickenOp),
+    #[serde(alias = "coil", alias = "spring")]
     Helix(HelixOp),
+    Offset(OffsetOp),
+    Thicken(ThickenOp),
+    Ellipsoid(EllipsoidOp),
     Draft(DraftOp),
 }
 
@@ -289,6 +294,7 @@ pub enum Profile {
     Arc(ArcProfile),
     /// Outer contour with inner holes (multi-contour / pocket-with-islands).
     Compound(CompoundProfile),
+    Ellipse(EllipseProfile),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -336,6 +342,78 @@ fn default_true() -> bool {
     true
 }
 
+fn default_cutter_depth() -> f64 {
+    1.0
+}
+
+/// Missing or null `depth` → 1. Explicit 0 / negative still fail validation.
+fn deserialize_cutter_depth<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(default_cutter_depth()),
+        Some(serde_json::Value::Number(n)) => n
+            .as_f64()
+            .ok_or_else(|| serde::de::Error::custom("depth must be a number")),
+        Some(_) => Err(serde::de::Error::custom("depth must be a number")),
+    }
+}
+
+/// Proper intersection of two closed-polyline edges, ignoring shared endpoints.
+pub fn polyline_self_intersection(points: &[[f64; 2]]) -> Option<(usize, usize)> {
+    let n = points.len();
+    if n < 4 {
+        return None;
+    }
+    for i in 0..n {
+        let j = (i + 1) % n;
+        for k in (i + 2)..n {
+            let l = (k + 1) % n;
+            // Closed ring: first and last edges are adjacent.
+            if i == l {
+                continue;
+            }
+            if segments_properly_intersect(points[i], points[j], points[k], points[l]) {
+                return Some((i, k));
+            }
+        }
+    }
+    None
+}
+
+fn orient(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+fn segments_properly_intersect(p1: [f64; 2], p2: [f64; 2], q1: [f64; 2], q2: [f64; 2]) -> bool {
+    let o1 = orient(p1, p2, q1);
+    let o2 = orient(p1, p2, q2);
+    let o3 = orient(q1, q2, p1);
+    let o4 = orient(q1, q2, p2);
+    o1 * o2 < 0.0 && o3 * o4 < 0.0
+}
+
+fn profile_polyline_error(profile: &Profile, label: &str) -> Option<String> {
+    let Profile::Polyline(p) = profile else {
+        return None;
+    };
+    if p.points.len() < 3 {
+        return Some(format!("{label}: polyline must have at least 3 points"));
+    }
+    if p.closed {
+        if let Some((i, k)) = polyline_self_intersection(&p.points) {
+            let j = (i + 1) % p.points.len();
+            let l = (k + 1) % p.points.len();
+            return Some(format!(
+                "{label}: polyline is self-intersecting (edge {i}-{j} crosses edge {k}-{l}). \
+                 That produces jagged disconnected bars, not a solid part. \
+                 Sketch a SIMPLE outer outline only. Cut inner pockets with hole/cut. \
+                 Do not trace around the inside of an A-arm/wishbone in the same closed polyline."
+            ));
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArcProfile {
     pub center: [f64; 2],
@@ -344,6 +422,16 @@ pub struct ArcProfile {
     pub start_angle: f64,
     /// End angle in degrees.
     pub end_angle: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EllipseProfile {
+    /// Full width along the plane's first axis (like circle `d`).
+    pub major: f64,
+    /// Full width along the plane's second axis.
+    pub minor: f64,
+    #[serde(default)]
+    pub at: [f64; 2],
 }
 
 // ── Extrude ──────────────────────────────────────────────────────────────────
@@ -403,6 +491,8 @@ pub struct CutOp {
     pub profile: Profile,
     /// Extrude depth of the tool solid. For through-cuts this is a minimum;
     /// the kernel extends the tool through the whole solid.
+    /// Omitted / null defaults to 1 so a through-cut still parses.
+    #[serde(default = "default_cutter_depth", deserialize_with = "deserialize_cutter_depth")]
     pub depth: f64,
     /// 3-D position of the tool profile.
     #[serde(default)]
@@ -421,9 +511,11 @@ pub struct CutOp {
 }
 
 /// Boolean union: adds an extruded solid to the current solid.
+/// Allowed as the first feature on a body (creates the solid).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FuseOp {
     pub profile: Profile,
+    #[serde(default = "default_cutter_depth", deserialize_with = "deserialize_cutter_depth")]
     pub depth: f64,
     #[serde(default)]
     pub at: [f64; 3],
@@ -439,6 +531,7 @@ pub struct FuseOp {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CommonOp {
     pub profile: Profile,
+    #[serde(default = "default_cutter_depth", deserialize_with = "deserialize_cutter_depth")]
     pub depth: f64,
     #[serde(default)]
     pub at: [f64; 3],
@@ -456,8 +549,11 @@ pub struct HoleOp {
     pub diameter: f64,
     /// Depth of the hole. Ignored when `through` is true (the default): the
     /// cutter is sized to the solid's bounding box so it always punches through.
+    /// Omitted / null defaults to 1.
+    #[serde(default = "default_cutter_depth", deserialize_with = "deserialize_cutter_depth")]
     pub depth: f64,
     /// 2-D center position on the hole plane / face UV.
+    #[serde(default)]
     pub center: [f64; 2],
     /// Plane the hole is normal to (default XY → hole goes in Z).
     #[serde(default)]
@@ -486,6 +582,9 @@ pub struct FilletOp {
 pub struct ChamferOp {
     /// Chamfer distance (must be positive).
     pub distance: f64,
+    /// Optional second distance, or used with `angle` (distance+angle chamfer).
+    #[serde(default)]
+    pub angle: Option<f64>,
     #[serde(default)]
     pub edges: EdgeSelection,
 }
@@ -696,10 +795,66 @@ pub struct DraftExtrudeOp {
     pub angle: f64,
 }
 
+// ── Thread (tap / die) ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadKind {
+    /// External thread (die / bolt / male).
+    #[serde(alias = "die", alias = "male", alias = "bolt")]
+    External,
+    /// Internal thread (tap / nut / female).
+    #[serde(alias = "tap", alias = "female", alias = "nut")]
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadHand {
+    #[default]
+    Right,
+    Left,
+}
+
+/// ISO / unified thread. `size` like `"M8"` looks up diameter and coarse pitch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThreadOp {
+    pub kind: ThreadKind,
+    /// `"M8"`, `"M8x1"`, `"1/4-20"`, `"#8-32"`. Optional if `diameter`+`pitch` given.
+    #[serde(default)]
+    pub size: Option<String>,
+    /// Override major diameter (document units).
+    pub diameter: Option<f64>,
+    /// Override pitch (document units).
+    pub pitch: Option<f64>,
+    /// Threaded length along `axis`. `0` = auto (external: 2×D; internal: through).
+    #[serde(default, alias = "depth")]
+    pub length: f64,
+    /// Origin of the thread axis (world). For internal, also the tap location.
+    #[serde(default)]
+    pub at: [f64; 3],
+    #[serde(default = "default_axis_z")]
+    pub axis: RevolveAxis,
+    /// 2-D center on `plane` (hole-style). Used when `at` is origin and center is set.
+    #[serde(default)]
+    pub center: [f64; 2],
+    #[serde(default)]
+    pub plane: SketchPlane,
+    /// Internal: punch through the solid (default false; true if `length` is 0).
+    #[serde(default)]
+    pub through: bool,
+    #[serde(default)]
+    pub hand: ThreadHand,
+}
+
+// ── Sweep / helix / offset / thicken / ellipsoid / draft ──────────────────────
+
 /// Sweep a profile along a 3-D path (polyline or helix).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SweepOp {
-    pub profile: Profile,
+    /// Profile to sweep. Omit to use the last sketch.
+    #[serde(default)]
+    pub profile: Option<Profile>,
     pub path: SweepPath,
     /// When true (default), fuse the swept solid into the current body if one exists.
     #[serde(default = "default_true")]
@@ -729,7 +884,7 @@ pub enum SweepPath {
         pitch: f64,
         height: f64,
         radius: f64,
-        #[serde(default)]
+        #[serde(default, alias = "at")]
         center: [f64; 3],
         #[serde(default)]
         axis: RevolveAxis,
@@ -756,8 +911,9 @@ pub struct HelixOp {
     /// Helix radius (centerline distance from axis).
     pub radius: f64,
     /// Wire / tube section diameter.
+    #[serde(alias = "section_diameter", alias = "section", alias = "wire")]
     pub diameter: f64,
-    #[serde(default)]
+    #[serde(default, alias = "at")]
     pub center: [f64; 3],
     #[serde(default)]
     pub axis: RevolveAxis,
@@ -765,10 +921,25 @@ pub struct HelixOp {
     pub fuse: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OffsetOp {
+    /// Positive grows the solid, negative shrinks it.
+    pub distance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EllipsoidOp {
+    /// Radii [rx, ry, rz].
+    pub radii: [f64; 3],
+    #[serde(default)]
+    pub at: [f64; 3],
+}
+
 /// Apply a draft angle to selected faces of the current solid.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DraftOp {
     /// Face indices or `"largest"` / `"side"`.
+    #[serde(default)]
     pub faces: EdgeSelection,
     /// Draft angle in degrees.
     pub angle: f64,
@@ -800,11 +971,104 @@ impl CadProgram {
         for (i, feat) in self.features.iter().enumerate() {
             feat.validate(i)?;
         }
+        validate_solid_order(&self.features)?;
         Ok(())
     }
 }
 
+/// cut/hole/fillet and similar ops need a solid already on the body.
+fn validate_solid_order(features: &[Feature]) -> Result<(), ValidationError> {
+    let mut has_solid = false;
+    for (index, feat) in features.iter().enumerate() {
+        match feat {
+            Feature::Box(_)
+            | Feature::Cylinder(_)
+            | Feature::Sphere(_)
+            | Feature::Cone(_)
+            | Feature::Torus(_)
+            | Feature::Loft(_)
+            | Feature::Fuse(_)
+            | Feature::Extrude(_)
+            | Feature::Revolve(_)
+            | Feature::DraftExtrude(_)
+            | Feature::Ellipsoid(_)
+            | Feature::Helix(_)
+            | Feature::Sweep(_)
+            | Feature::Pipe(_)
+            | Feature::Thicken(_)
+            | Feature::Thread(ThreadOp {
+                kind: ThreadKind::External,
+                ..
+            }) => {
+                has_solid = true;
+            }
+            Feature::Sketch(_) => {}
+            Feature::Cut(_)
+            | Feature::Hole(_)
+            | Feature::Fillet(_)
+            | Feature::Chamfer(_)
+            | Feature::Transform(_)
+            | Feature::Mirror(_)
+            | Feature::Pattern(_)
+            | Feature::Shell(_)
+            | Feature::Offset(_)
+            | Feature::Draft(_)
+            | Feature::Common(_)
+            | Feature::Thread(ThreadOp {
+                kind: ThreadKind::Internal,
+                ..
+            }) => {
+                if !has_solid {
+                    return Err(ValidationError::InvalidParameter {
+                        index,
+                        message: format!(
+                            "{} needs an existing solid. Start this body with box, cylinder, \
+                             sphere, cone, torus, ellipsoid, helix, thread (external), fuse, \
+                             or sketch+extrude.",
+                            feat.op_name()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Feature {
+    pub fn op_name(&self) -> &'static str {
+        match self {
+            Feature::Sketch(_) => "sketch",
+            Feature::Extrude(_) => "extrude",
+            Feature::Revolve(_) => "revolve",
+            Feature::Cut(_) => "cut",
+            Feature::Fuse(_) => "fuse",
+            Feature::Hole(_) => "hole",
+            Feature::Fillet(_) => "fillet",
+            Feature::Chamfer(_) => "chamfer",
+            Feature::Transform(_) => "transform",
+            Feature::Box(_) => "box",
+            Feature::Cylinder(_) => "cylinder",
+            Feature::Sphere(_) => "sphere",
+            Feature::Cone(_) => "cone",
+            Feature::Torus(_) => "torus",
+            Feature::Loft(_) => "loft",
+            Feature::Mirror(_) => "mirror",
+            Feature::Pattern(_) => "pattern",
+            Feature::Shell(_) => "shell",
+            Feature::DraftExtrude(_) => "draft_extrude",
+            Feature::Thread(_) => "thread",
+            Feature::Sweep(_) => "sweep",
+            Feature::Pipe(_) => "pipe",
+            Feature::Helix(_) => "helix",
+            Feature::Offset(_) => "offset",
+            Feature::Thicken(_) => "thicken",
+            Feature::Common(_) => "common",
+            Feature::Ellipsoid(_) => "ellipsoid",
+            Feature::Draft(_) => "draft",
+        }
+    }
+
     pub fn validate(&self, index: usize) -> Result<(), ValidationError> {
         let err = |msg: &str| ValidationError::InvalidParameter {
             index,
@@ -826,9 +1090,9 @@ impl Feature {
                         return Err(err("circle.d (diameter) must be positive"));
                     }
                 }
-                Profile::Polyline(p) => {
-                    if p.points.len() < 3 {
-                        return Err(err("polyline must have at least 3 points"));
+                Profile::Polyline(_) => {
+                    if let Some(msg) = profile_polyline_error(&op.profile, "sketch") {
+                        return Err(err(&msg));
                     }
                 }
                 Profile::Arc(a) => {
@@ -840,6 +1104,11 @@ impl Feature {
                     validate_profile_nested(&c.outer, index, "compound.outer")?;
                     for (hi, h) in c.holes.iter().enumerate() {
                         validate_profile_nested(h, index, &format!("compound.holes[{hi}]"))?;
+                    }
+                }
+                Profile::Ellipse(e) => {
+                    if e.major <= 0.0 || e.minor <= 0.0 {
+                        return Err(err("ellipse.major and ellipse.minor must be positive"));
                     }
                 }
             },
@@ -914,6 +1183,11 @@ impl Feature {
                         "chamfer.distance must be positive (got {})",
                         op.distance
                     )));
+                }
+                if let Some(a) = op.angle {
+                    if a <= 0.0 || a >= 90.0 {
+                        return Err(err("chamfer.angle must be in (0, 90) degrees"));
+                    }
                 }
             }
             Feature::Transform(op) => {
@@ -995,8 +1269,36 @@ impl Feature {
                     return Err(err("draft_extrude.depth must be positive"));
                 }
             }
+            Feature::Thread(op) => {
+                let sized = op
+                    .size
+                    .as_ref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if sized {
+                    if let Err(m) = crate::thread::parse_size(op.size.as_deref().unwrap()) {
+                        return Err(err(&m));
+                    }
+                } else if op.diameter.unwrap_or(0.0) <= 0.0 || op.pitch.unwrap_or(0.0) <= 0.0 {
+                    return Err(err(
+                        "thread needs size (e.g. \"M8\") or both diameter and pitch",
+                    ));
+                }
+                if let Some(d) = op.diameter {
+                    if d <= 0.0 {
+                        return Err(err("thread.diameter must be positive"));
+                    }
+                }
+                if let Some(p) = op.pitch {
+                    if p <= 0.0 {
+                        return Err(err("thread.pitch must be positive"));
+                    }
+                }
+            }
             Feature::Sweep(op) => {
-                validate_profile_nested(&op.profile, index, "sweep.profile")?;
+                if let Some(profile) = &op.profile {
+                    validate_profile_nested(profile, index, "sweep.profile")?;
+                }
                 validate_sweep_path(&op.path, index)?;
             }
             Feature::Pipe(op) => {
@@ -1004,6 +1306,11 @@ impl Feature {
                     return Err(err("pipe.diameter must be positive"));
                 }
                 validate_sweep_path(&op.path, index)?;
+            }
+            Feature::Offset(op) => {
+                if op.distance == 0.0 {
+                    return Err(err("offset.distance must be non-zero"));
+                }
             }
             Feature::Thicken(op) => {
                 if op.thickness == 0.0 {
@@ -1022,6 +1329,11 @@ impl Feature {
                 }
                 if op.diameter <= 0.0 {
                     return Err(err("helix.diameter must be positive"));
+                }
+            }
+            Feature::Ellipsoid(op) => {
+                if op.radii.iter().any(|&v| v <= 0.0) {
+                    return Err(err("ellipsoid.radii must all be positive"));
                 }
             }
             Feature::Draft(op) => {
@@ -1059,6 +1371,16 @@ fn validate_profile_nested(
                 validate_profile_nested(h, index, &format!("{label}.holes[{hi}]"))?;
             }
             Ok(())
+        }
+        Profile::Ellipse(e) if e.major <= 0.0 || e.minor <= 0.0 => {
+            Err(err(format!("{label}: ellipse axes must be positive")))
+        }
+        Profile::Polyline(_) => {
+            if let Some(msg) = profile_polyline_error(profile, label) {
+                Err(err(msg))
+            } else {
+                Ok(())
+            }
         }
         _ => Ok(()),
     }
@@ -1318,5 +1640,149 @@ mod tests {
             Feature::Box(b) => assert_eq!(b.size, [8.0, 8.0, 8.0]),
             other => panic!("expected box, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wishbone_return_path_is_self_intersecting() {
+        let points = vec![
+            [0.0, -140.0],
+            [0.0, -90.0],
+            [230.0, -30.0],
+            [275.0, -20.0],
+            [295.0, 0.0],
+            [275.0, 20.0],
+            [230.0, 30.0],
+            [0.0, 90.0],
+            [0.0, 140.0],
+            [35.0, 140.0],
+            [120.0, 45.0],
+            [255.0, 30.0],
+            [275.0, 0.0],
+            [255.0, -30.0],
+            [120.0, -45.0],
+            [35.0, -140.0],
+        ];
+        assert!(polyline_self_intersection(&points).is_some());
+
+        let doc: CadDocument = serde_json::from_str(
+            r#"{
+            "documentId": "arm",
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_lca",
+                "name": "Lower Control Arm",
+                "features": [
+                    { "op": "sketch", "plane": "XY", "profile": { "polyline": {
+                        "closed": true,
+                        "points": [
+                            [0,-140],[0,-90],[230,-30],[275,-20],[295,0],[275,20],[230,30],
+                            [0,90],[0,140],[35,140],[120,45],[255,30],[275,0],[255,-30],
+                            [120,-45],[35,-140]
+                        ]
+                    } } },
+                    { "op": "extrude", "depth": 24, "symmetric": true }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let err = doc.validate().unwrap_err().to_string();
+        assert!(
+            err.to_lowercase().contains("self-intersecting"),
+            "expected self-intersection error, got {err}"
+        );
+    }
+
+    #[test]
+    fn simple_closed_square_polyline_is_ok() {
+        assert!(polyline_self_intersection(&[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]).is_none());
+    }
+
+    #[test]
+    fn cut_omitted_depth_defaults_for_through_cut() {
+        let feat: Feature = serde_json::from_str(
+            r#"{ "op": "cut", "through": true, "profile": { "rect": { "w": 20, "h": 10, "centered": true } } }"#,
+        )
+        .unwrap();
+        match feat {
+            Feature::Cut(op) => {
+                assert!(op.depth > 0.0);
+                assert!(op.through);
+            }
+            _ => panic!("expected cut"),
+        }
+    }
+
+    #[test]
+    fn hole_omitted_depth_and_center_defaults() {
+        let feat: Feature = serde_json::from_str(r#"{ "op": "hole", "diameter": 8 }"#).unwrap();
+        match feat {
+            Feature::Hole(op) => {
+                assert!(op.depth > 0.0);
+                assert_eq!(op.center, [0.0, 0.0]);
+                assert!(op.through);
+            }
+            _ => panic!("expected hole"),
+        }
+    }
+
+    #[test]
+    fn cut_before_solid_is_rejected() {
+        let prog: CadProgram = serde_json::from_str(
+            r#"{
+              "units": "mm",
+              "features": [
+                { "op": "cut", "profile": { "circle": { "d": 10 } } }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let err = prog.validate().unwrap_err().to_string();
+        assert!(
+            err.to_lowercase().contains("existing solid"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn thread_m8_and_tap_alias_parse() {
+        let die: Feature = serde_json::from_str(
+            r#"{ "op": "thread", "kind": "die", "size": "M8", "length": 20 }"#,
+        )
+        .unwrap();
+        match die {
+            Feature::Thread(op) => {
+                assert_eq!(op.kind, ThreadKind::External);
+                assert_eq!(op.size.as_deref(), Some("M8"));
+                assert!((op.length - 20.0).abs() < 1e-9);
+            }
+            _ => panic!("expected thread"),
+        }
+        let tap: Feature = serde_json::from_str(
+            r#"{ "op": "thread", "kind": "tap", "size": "M8x1", "center": [10, 0] }"#,
+        )
+        .unwrap();
+        match tap {
+            Feature::Thread(op) => assert_eq!(op.kind, ThreadKind::Internal),
+            _ => panic!("expected thread"),
+        }
+        let prog: CadProgram = serde_json::from_str(
+            r#"{ "units": "mm", "features": [
+                { "op": "thread", "kind": "external", "size": "M8", "length": 16 }
+            ] }"#,
+        )
+        .unwrap();
+        assert!(prog.validate().is_ok());
+    }
+
+    #[test]
+    fn tap_before_solid_is_rejected() {
+        let prog: CadProgram = serde_json::from_str(
+            r#"{ "units": "mm", "features": [
+                { "op": "thread", "kind": "internal", "size": "M8" }
+            ] }"#,
+        )
+        .unwrap();
+        assert!(prog.validate().is_err());
     }
 }
