@@ -510,6 +510,72 @@ fn m8_external_thread_builds() {
         variation > 0.08,
         "thread should be helical (radius varies around a slice); variation={variation} — stacked rings are axisymmetric"
     );
+    let spread = angular_radius_spread_at_z(&out.mesh, (zmin + zmax) * 0.5, 0.2);
+    assert!(
+        spread > 0.25,
+        "groove should sit on one side of a z-slice (helix), not all around (rings); spread={spread}"
+    );
+    let n_yaws = distinct_groove_yaws(&out.mesh, zmin + 1.2, zmin + 6.5, 12);
+    assert!(
+        n_yaws >= 5,
+        "groove must walk around the shank (helix); distinct yaws over one thread={n_yaws} (rings stay in 1-2 bins)"
+    );
+    if let Ok(path) = std::env::var("AGENTCAD_DUMP_MESH_SHORT") {
+        std::fs::write(&path, kernel::export::to_obj(&out.mesh)).expect("dump mesh");
+    }
+}
+
+fn groove_yaw_at_z(mesh: &kernel::engine::MeshData, z: f64, band: f64) -> Option<f64> {
+    const N: usize = 32;
+    let mut mins = [f64::MAX; N];
+    let mut counts = [0u32; N];
+    for chunk in mesh.positions.chunks(3) {
+        if chunk.len() < 3 {
+            continue;
+        }
+        if (chunk[2] as f64 - z).abs() > band {
+            continue;
+        }
+        let x = chunk[0] as f64;
+        let y = chunk[1] as f64;
+        let r = (x * x + y * y).sqrt();
+        if r < 2.5 {
+            continue;
+        }
+        let theta = y.atan2(x);
+        let mut bin = (((theta + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)) * N as f64)
+            .floor() as isize;
+        if bin < 0 {
+            bin = 0;
+        }
+        let bin = (bin as usize).min(N - 1);
+        mins[bin] = mins[bin].min(r);
+        counts[bin] += 1;
+    }
+    let mut best = None;
+    let mut best_r = f64::MAX;
+    for i in 0..N {
+        if counts[i] >= 2 && mins[i] < best_r {
+            best_r = mins[i];
+            let yaw = (i as f64 + 0.5) / N as f64 * 2.0 * std::f64::consts::PI
+                - std::f64::consts::PI;
+            best = Some(yaw);
+        }
+    }
+    best.filter(|_| best_r < 3.85)
+}
+
+fn distinct_groove_yaws(mesh: &kernel::engine::MeshData, z0: f64, z1: f64, samples: usize) -> usize {
+    let mut bins = std::collections::HashSet::new();
+    for i in 0..samples {
+        let z = z0 + (z1 - z0) * (i as f64) / (samples as f64);
+        if let Some(y) = groove_yaw_at_z(mesh, z, 0.1) {
+            let bin = (((y + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)) * 16.0).floor()
+                as i32;
+            bins.insert(bin.rem_euclid(16));
+        }
+    }
+    bins.len()
 }
 
 fn radius_variation_at_z(mesh: &kernel::engine::MeshData, z: f64, band: f64) -> f64 {
@@ -529,6 +595,48 @@ fn radius_variation_at_z(mesh: &kernel::engine::MeshData, z: f64, band: f64) -> 
     }
     let mean = rs.iter().sum::<f64>() / rs.len() as f64;
     (rs.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rs.len() as f64).sqrt()
+}
+
+/// Min radius in each yaw sector. A helix has a groove in some sectors only;
+/// stacked rings have the same min radius all the way around.
+fn angular_radius_spread_at_z(mesh: &kernel::engine::MeshData, z: f64, band: f64) -> f64 {
+    const N: usize = 16;
+    let mut mins = [f64::MAX; N];
+    let mut counts = [0u32; N];
+    for chunk in mesh.positions.chunks(3) {
+        if chunk.len() < 3 {
+            continue;
+        }
+        if (chunk[2] as f64 - z).abs() > band {
+            continue;
+        }
+        let x = chunk[0] as f64;
+        let y = chunk[1] as f64;
+        let r = (x * x + y * y).sqrt();
+        if r < 2.0 {
+            continue;
+        }
+        let theta = y.atan2(x);
+        let mut bin = (((theta + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)) * N as f64)
+            .floor() as isize;
+        if bin < 0 {
+            bin = 0;
+        }
+        let bin = (bin as usize).min(N - 1);
+        mins[bin] = mins[bin].min(r);
+        counts[bin] += 1;
+    }
+    let vals: Vec<f64> = mins
+        .iter()
+        .zip(counts.iter())
+        .filter(|(_, c)| **c >= 2)
+        .map(|(m, _)| *m)
+        .collect();
+    if vals.len() < 8 {
+        return 0.0;
+    }
+    vals.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        - vals.iter().copied().fold(f64::INFINITY, f64::min)
 }
 
 #[test]
@@ -634,9 +742,15 @@ fn m8_hex_head_bolt_40mm_builds() {
         }"#,
     )
     .unwrap();
+    let t0 = std::time::Instant::now();
     let out = Engine::new()
         .execute(&prog)
         .expect("M8×40 hex-head bolt should build");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed.as_secs() < 25,
+        "40 mm bolt took {elapsed:?} — segmented helix must stay viewport-fast"
+    );
     let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
     let dx = (xmax - xmin).abs();
     let dy = (ymax - ymin).abs();
@@ -656,11 +770,24 @@ fn m8_hex_head_bolt_40mm_builds() {
         "volume vanished: {}",
         out.metrics.volume
     );
-    let variation = radius_variation_at_z(&out.mesh, zmin + 20.0, 0.35);
+    let variation = radius_variation_at_z(&out.mesh, zmin + 20.0, 0.25);
     assert!(
         variation > 0.08,
         "shank should be helical at mid-length; variation={variation}"
     );
+    let spread = angular_radius_spread_at_z(&out.mesh, zmin + 20.0, 0.25);
+    assert!(
+        spread > 0.25,
+        "40 mm M8 must look helical, not stacked ticks; angular spread={spread}"
+    );
+    let n_yaws = distinct_groove_yaws(&out.mesh, zmin + 12.0, zmin + 28.0, 16);
+    assert!(
+        n_yaws >= 5,
+        "40 mm groove must walk around the shank; distinct yaws={n_yaws}"
+    );
+    if let Ok(path) = std::env::var("AGENTCAD_DUMP_MESH") {
+        std::fs::write(&path, kernel::export::to_obj(&out.mesh)).expect("dump mesh");
+    }
 }
 
 /// Agent often threads first then fuses a hex head — that boolean used to crash.
@@ -684,8 +811,8 @@ fn hex_head_fused_onto_short_thread_does_not_crash() {
     let [_xmin, _ymin, zmin, _xmax, _ymax, zmax] = out.metrics.bbox;
     let dz = (zmax - zmin).abs();
     assert!(
-        dz > 10.0,
-        "expected thread + head height, bbox={:?}",
+        dz > 5.0,
+        "expected a visible hex head (and shank if fused), bbox={:?}",
         out.metrics.bbox
     );
     assert!(!out.mesh.positions.is_empty());

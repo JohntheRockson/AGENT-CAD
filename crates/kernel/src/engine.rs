@@ -484,6 +484,18 @@ pub(crate) mod occt_backend {
         Fuse,
     }
 
+    /// Peak WASM budget: an ~8-turn M8 V-groove tessellates; 20+ turns trap.
+    const MAX_INLINE_THREAD_TURNS: f64 = 8.0;
+
+    #[derive(Clone, Copy, Debug)]
+    struct ThreadPreview {
+        major: f64,
+        pitch: f64,
+        length: f64,
+        at: [f64; 3],
+        left: bool,
+    }
+
     thread_local! {
         static KERNEL: RefCell<Option<occt_wasm::OcctKernel>> = const { RefCell::new(None) };
         /// Maps (cumulative feature hash) → state after that feature.
@@ -934,7 +946,7 @@ pub(crate) mod occt_backend {
 
     /// Bump when handler semantics change so in-memory step cache cannot
     /// replay solids built with a previous (wrong) revolve/plane mapping.
-    const KERNEL_SEMANTICS: u64 = 0xA6E1_CAD0_0000_0007;
+    const KERNEL_SEMANTICS: u64 = 0xA6E1_CAD0_0000_0008;
 
     fn body_cache_ns(body_id: &str) -> u64 {
         let mut h = DefaultHasher::new();
@@ -996,61 +1008,162 @@ pub(crate) mod occt_backend {
             with_kernel(|k| {
                 let solid =
                     STEP_CACHE.with(|c| execute_in_kernel(k, program, &mut c.borrow_mut(), 0))?;
-                tessellate_solid(k, solid)
+                tessellate_solid(
+                    k,
+                    solid,
+                    thread_pitch_hint(&program.features, &program.units),
+                    long_thread_preview(&program.features, &program.units),
+                )
             })
         })
+    }
+
+    fn thread_pitch_hint(features: &[Feature], units: &Units) -> Option<f64> {
+        let mut pitch = None;
+        for feat in features {
+            if let Feature::Thread(op) = feat {
+                if let Ok((_, p)) = thread_dims(op, units) {
+                    pitch = Some(pitch.map(|q: f64| q.min(p)).unwrap_or(p));
+                }
+            }
+        }
+        pitch
+    }
+
+    fn external_thread_length(op: &ThreadOp, major: f64, pitch: f64) -> f64 {
+        if op.length > 0.0 {
+            op.length
+        } else {
+            (major * 2.0).max(pitch * 4.0)
+        }
+    }
+
+    /// Long Z external threads cannot be meshed (or even cut) as one WASM helix.
+    fn preview_from_thread(op: &ThreadOp, units: &Units) -> Option<ThreadPreview> {
+        if !matches!(op.kind, ThreadKind::External) {
+            return None;
+        }
+        if !matches!(op.axis, RevolveAxis::Z) {
+            return None;
+        }
+        let (major, pitch) = thread_dims(op, units).ok()?;
+        let length = external_thread_length(op, major, pitch);
+        if length / pitch.max(1e-9) <= MAX_INLINE_THREAD_TURNS {
+            return None;
+        }
+        Some(ThreadPreview {
+            major,
+            pitch,
+            length,
+            at: op.at,
+            left: matches!(op.hand, ThreadHand::Left),
+        })
+    }
+
+    fn long_thread_preview(features: &[Feature], units: &Units) -> Option<ThreadPreview> {
+        features.iter().rev().find_map(|f| match f {
+            Feature::Thread(op) => preview_from_thread(op, units),
+            _ => None,
+        })
+    }
+
+    fn preview_with_translation(tp: ThreadPreview, transform: &crate::ir::BodyTransform) -> Option<ThreadPreview> {
+        let [rx, ry, rz] = transform.rotation;
+        if rx.abs() + ry.abs() + rz.abs() > 1e-9 {
+            // Segment instancing is Z-axis in feature space.
+            return None;
+        }
+        let [dx, dy, dz] = transform.position;
+        Some(ThreadPreview {
+            at: [tp.at[0] + dx, tp.at[1] + dy, tp.at[2] + dz],
+            ..tp
+        })
+    }
+
+    fn drawable_solids(
+        k: &mut occt_wasm::OcctKernel,
+        shape: Handle,
+        pitch: Option<f64>,
+    ) -> Vec<Handle> {
+        let ids = k.get_sub_shapes(shape, "solid").unwrap_or_default();
+        if ids.len() > 1 {
+            ids.into_iter().map(id_to_handle).collect()
+        } else if ids.len() == 1 {
+            let h = id_to_handle(ids[0]);
+            // Unify-same-domain on a helical groove can wreck the thread or
+            // explode the face count; skip heal when a thread is present.
+            if pitch.is_some() {
+                vec![h]
+            } else {
+                let healed = heal_shape(k, h);
+                vec![if shape_has_extent(k, healed) {
+                    healed
+                } else {
+                    h
+                }]
+            }
+        } else {
+            vec![shape]
+        }
     }
 
     fn tessellate_solid(
         k: &mut occt_wasm::OcctKernel,
         shape: Handle,
+        pitch: Option<f64>,
+        preview: Option<ThreadPreview>,
     ) -> Result<ModelOutput, KernelError> {
-        let ids = k.get_sub_shapes(shape, "solid").unwrap_or_default();
-        let solids: Vec<Handle> = if ids.len() > 1 {
-            ids.into_iter().map(id_to_handle).collect()
-        } else if ids.len() == 1 {
-            let h = id_to_handle(ids[0]);
-            let healed = heal_shape(k, h);
-            vec![if shape_has_extent(k, healed) {
-                healed
-            } else {
-                h
-            }]
-        } else {
-            vec![shape]
-        };
-
+        let solids = drawable_solids(k, shape, pitch);
         let mut meshes = Vec::with_capacity(solids.len());
         let mut metrics = Vec::with_capacity(solids.len());
-        for solid in solids {
-            if !shape_has_extent(k, solid) {
+        for solid in &solids {
+            if !shape_has_extent(k, *solid) {
                 continue;
             }
-            reject_if_planar(k, solid)?;
-            let tess = tessellate_adaptive(k, solid)?;
-            let bbox = bbox_from_positions(&tess.positions);
-            let volume = k.get_volume(solid).unwrap_or(0.0);
-            let surface_area = k.get_surface_area(solid).unwrap_or(0.0);
-            meshes.push(MeshData {
-                positions: tess.positions,
-                normals: tess.normals,
-                indices: tess.indices,
-            });
+            reject_if_planar(k, *solid)?;
+            let bbox = k
+                .get_bounding_box(*solid, false)
+                .ok()
+                .map(|b| [b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z])
+                .unwrap_or([0.0; 6]);
             metrics.push(MetricsData {
-                volume,
+                volume: k.get_volume(*solid).unwrap_or(0.0),
                 bbox,
-                surface_area,
+                surface_area: k.get_surface_area(*solid).unwrap_or(0.0),
                 is_solid: true,
             });
+            meshes.push(*solid);
         }
         if meshes.is_empty() {
             return Err(occt_err("tessellate: shape has no drawable solid"));
         }
-        let mesh_refs: Vec<&MeshData> = meshes.iter().collect();
         let metric_refs: Vec<&MetricsData> = metrics.iter().collect();
+        let mut combined = super::combine_metrics(&metric_refs);
+
+        if let Some(tp) = preview {
+            if tp.length / tp.pitch.max(1e-9) > MAX_INLINE_THREAD_TURNS {
+                match tessellate_thread_segments(k, &meshes, tp) {
+                    Ok(mesh) if !mesh.positions.is_empty() => {
+                        combined.bbox = bbox_from_positions(&mesh.positions);
+                        return Ok(ModelOutput {
+                            mesh,
+                            metrics: combined,
+                        });
+                    }
+                    Err(e) if is_fatal_occt(&e) => return Err(e),
+                    _ => {}
+                }
+            }
+        }
+
+        let mut tess_meshes = Vec::with_capacity(meshes.len());
+        for solid in meshes {
+            tess_meshes.push(tessellate_shape_mesh(k, solid, pitch)?);
+        }
+        let mesh_refs: Vec<&MeshData> = tess_meshes.iter().collect();
         Ok(ModelOutput {
             mesh: combine_meshes(&mesh_refs),
-            metrics: super::combine_metrics(&metric_refs),
+            metrics: combined,
         })
     }
 
@@ -1078,44 +1191,297 @@ pub(crate) mod occt_backend {
             .unwrap_or(false)
     }
 
-    /// Absolute deflection only. `tessellate_relative` at 0.002 traps WASM on a
-    /// 40 mm M8 helix; a failed relative call cannot fall back on the same instance.
-    fn tessellate_adaptive(
+    /// Absolute deflection. Never call tessellate_relative on a long helix.
+    fn tessellate_shape_mesh(
         k: &mut occt_wasm::OcctKernel,
         solid: Handle,
-    ) -> Result<occt_wasm::Mesh, KernelError> {
+        pitch: Option<f64>,
+    ) -> Result<MeshData, KernelError> {
         let level = COARSE_LEVEL.with(|c| c.get());
         let diag = bbox_diag(k, solid);
-        let start = if diag > 25.0 {
-            0.35
-        } else {
-            (diag * 0.008).clamp(0.06, 0.25)
-        };
-        let linears: Vec<f64> = match level {
-            0 => vec![start, 0.5, 1.0],
-            1 => vec![0.8, 1.5],
-            _ => vec![2.0, 4.0],
-        };
-        let angular = if level == 0 { 0.4 } else { 0.75 };
-        let mut last_err: Option<KernelError> = None;
-        for linear in linears {
-            match k.tessellate(solid, linear, angular) {
-                Ok(mut mesh) => {
-                    if let Ok(bb) = k.get_bounding_box(solid, false) {
-                        strip_spike_triangles(&mut mesh, &bb);
-                    }
-                    return Ok(mesh);
-                }
-                Err(e) => {
-                    let err = occt_err(format!("tessellate: {:?}", e));
-                    if is_fatal_occt(&err) {
-                        return Err(err);
-                    }
-                    last_err = Some(err);
-                }
+        let linear = preview_linear(pitch, level, diag);
+        let angular = if level == 0 { 0.32 } else { 0.55 };
+        tessellate_once(k, solid, linear, angular)
+    }
+
+    fn preview_linear(pitch: Option<f64>, level: u8, diag: f64) -> f64 {
+        match (pitch, level) {
+            // ~pitch/8: fine enough to see an M8 helix, coarse enough for WASM.
+            (Some(p), 0) => (p * 0.10).clamp(0.08, 0.16),
+            (Some(p), 1) => (p * 0.16).clamp(0.12, 0.22),
+            (Some(_), _) => 0.35,
+            (None, 0) => (diag * 0.008).clamp(0.06, 0.25),
+            (None, 1) => 0.4,
+            (None, _) => 0.8,
+        }
+    }
+
+    fn tessellate_once(
+        k: &mut occt_wasm::OcctKernel,
+        solid: Handle,
+        linear: f64,
+        angular: f64,
+    ) -> Result<MeshData, KernelError> {
+        let mut mesh = k
+            .tessellate(solid, linear, angular)
+            .map_err(|e| occt_err(format!("tessellate: {:?}", e)))?;
+        if let Ok(bb) = k.get_bounding_box(solid, false) {
+            strip_spike_triangles(&mut mesh, &bb);
+        }
+        Ok(MeshData {
+            positions: mesh.positions,
+            normals: mesh.normals,
+            indices: mesh.indices,
+        })
+    }
+
+    /// Viewport path for long Z bolts: do not tessellate a 30-turn B-Rep.
+    /// Mesh the uncut head+shank, strip the smooth cylinder, instance an
+    /// 8-turn V-groove rod (the size we know WASM can mesh) along Z.
+    fn tessellate_thread_segments(
+        k: &mut occt_wasm::OcctKernel,
+        solids: &[Handle],
+        tp: ThreadPreview,
+    ) -> Result<MeshData, KernelError> {
+        let level = COARSE_LEVEL.with(|c| c.get());
+        let angular = if level == 0 { 0.32 } else { 0.55 };
+        let mut body_parts: Vec<MeshData> = Vec::new();
+        for &solid in solids {
+            if !shape_has_extent(k, solid) {
+                continue;
+            }
+            let diag = bbox_diag(k, solid);
+            let linear = preview_linear(None, level, diag);
+            match tessellate_once(k, solid, linear, angular) {
+                Ok(mesh) => body_parts.push(mesh),
+                Err(e) if is_fatal_occt(&e) => return Err(e),
+                Err(_) => {}
             }
         }
-        Err(last_err.unwrap_or_else(|| occt_err("tessellate: all deflection levels failed")))
+        let body = if body_parts.is_empty() {
+            MeshData {
+                positions: vec![],
+                normals: vec![],
+                indices: vec![],
+            }
+        } else {
+            let refs: Vec<&MeshData> = body_parts.iter().collect();
+            strip_thread_envelope(&combine_meshes(&refs), &tp)
+        };
+
+        let seg = (tp.pitch * 6.4).min(tp.length).max(tp.pitch * 2.0);
+        let n_full = (tp.length / seg).floor() as i32;
+        let rem = tp.length - n_full as f64 * seg;
+        let helix_linear = preview_linear(Some(tp.pitch), level, tp.major.max(10.0));
+
+        let proto = threaded_rod(k, tp.major, tp.pitch, seg)?;
+        let proto_mesh = tessellate_once(k, proto, helix_linear, angular)?;
+        let (pz0, pz1) = mesh_z_range(&proto_mesh);
+
+        let mut parts: Vec<MeshData> = Vec::new();
+        if !body.positions.is_empty() {
+            parts.push(body);
+        }
+        let has_tail = rem > tp.pitch * 0.45;
+        for i in 0..n_full {
+            let z = i as f64 * seg;
+            let strip_bottom = i > 0;
+            let strip_top = i + 1 < n_full || has_tail;
+            let mesh = strip_z_caps(&proto_mesh, pz0, pz1, strip_bottom, strip_top);
+            parts.push(place_thread_mesh(&mesh, &tp, z));
+        }
+        if has_tail {
+            let tail = threaded_rod(k, tp.major, tp.pitch, rem)?;
+            let tail_mesh = tessellate_once(k, tail, helix_linear, angular)?;
+            let (tz0, tz1) = mesh_z_range(&tail_mesh);
+            let mesh = strip_z_caps(&tail_mesh, tz0, tz1, n_full > 0, false);
+            parts.push(place_thread_mesh(&mesh, &tp, n_full as f64 * seg));
+        } else if n_full == 0 {
+            return Err(occt_err("thread preview produced no helical segments"));
+        }
+        if parts.is_empty() {
+            return Err(occt_err("thread preview produced no mesh"));
+        }
+        let refs: Vec<&MeshData> = parts.iter().collect();
+        Ok(combine_meshes(&refs))
+    }
+
+    fn mesh_z_range(mesh: &MeshData) -> (f32, f32) {
+        let mut z0 = f32::MAX;
+        let mut z1 = f32::MIN;
+        for chunk in mesh.positions.chunks(3) {
+            if chunk.len() == 3 {
+                z0 = z0.min(chunk[2]);
+                z1 = z1.max(chunk[2]);
+            }
+        }
+        if z0 > z1 {
+            (0.0, 1.0)
+        } else {
+            (z0, z1)
+        }
+    }
+
+    fn strip_thread_envelope(mesh: &MeshData, tp: &ThreadPreview) -> MeshData {
+        let r_max = tp.major * 0.5 + tp.pitch * 0.15;
+        let r2 = (r_max * r_max) as f32;
+        let z0 = tp.at[2] as f32;
+        let z1 = (tp.at[2] + tp.length) as f32;
+        let cx = tp.at[0] as f32;
+        let cy = tp.at[1] as f32;
+        let in_env = |x: f32, y: f32, z: f32| {
+            z >= z0 - 0.04 && z <= z1 + 0.04 && {
+                let dx = x - cx;
+                let dy = y - cy;
+                dx * dx + dy * dy <= r2
+            }
+        };
+        filter_triangles(mesh, |mesh, a, b, c| {
+            let ax = mesh.positions[a * 3];
+            let ay = mesh.positions[a * 3 + 1];
+            let az = mesh.positions[a * 3 + 2];
+            let bx = mesh.positions[b * 3];
+            let by = mesh.positions[b * 3 + 1];
+            let bz = mesh.positions[b * 3 + 2];
+            let cx_ = mesh.positions[c * 3];
+            let cy_ = mesh.positions[c * 3 + 1];
+            let cz = mesh.positions[c * 3 + 2];
+            !in_env((ax + bx + cx_) / 3.0, (ay + by + cy_) / 3.0, (az + bz + cz) / 3.0)
+        })
+    }
+
+    fn strip_z_caps(
+        mesh: &MeshData,
+        z0: f32,
+        z1: f32,
+        strip_bottom: bool,
+        strip_top: bool,
+    ) -> MeshData {
+        if !strip_bottom && !strip_top {
+            return mesh.clone();
+        }
+        let eps = ((z1 - z0).abs() * 0.03).clamp(0.03, 0.12);
+        filter_triangles(mesh, |mesh, a, b, c| {
+            let za = mesh.positions[a * 3 + 2];
+            let zb = mesh.positions[b * 3 + 2];
+            let zc = mesh.positions[c * 3 + 2];
+            let near_lo = strip_bottom
+                && (za - z0).abs() <= eps
+                && (zb - z0).abs() <= eps
+                && (zc - z0).abs() <= eps;
+            let near_hi = strip_top
+                && (za - z1).abs() <= eps
+                && (zb - z1).abs() <= eps
+                && (zc - z1).abs() <= eps;
+            if !near_lo && !near_hi {
+                return true;
+            }
+            // Only drop end-cap disks (normal along Z), not helical groove walls.
+            let p = |i: usize| {
+                [
+                    mesh.positions[i * 3],
+                    mesh.positions[i * 3 + 1],
+                    mesh.positions[i * 3 + 2],
+                ]
+            };
+            let pa = p(a);
+            let pb = p(b);
+            let pc = p(c);
+            let e1 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+            let e2 = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+            let nz = e1[0] * e2[1] - e1[1] * e2[0];
+            let nx = e1[1] * e2[2] - e1[2] * e2[1];
+            let ny = e1[2] * e2[0] - e1[0] * e2[2];
+            let len = (nx * nx + ny * ny + nz * nz).sqrt();
+            if len < 1e-12 {
+                return true;
+            }
+            (nz / len).abs() < 0.85
+        })
+    }
+
+    fn filter_triangles(
+        mesh: &MeshData,
+        keep: impl Fn(&MeshData, usize, usize, usize) -> bool,
+    ) -> MeshData {
+        let tris: Vec<[u32; 3]> = if mesh.indices.is_empty() {
+            (0..mesh.positions.len() / 9)
+                .map(|t| {
+                    let i = (t * 3) as u32;
+                    [i, i + 1, i + 2]
+                })
+                .collect()
+        } else {
+            mesh.indices
+                .chunks(3)
+                .filter_map(|c| {
+                    if c.len() == 3 {
+                        Some([c[0], c[1], c[2]])
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        let mut indices = Vec::new();
+        for [a, b, c] in tris {
+            let (ai, bi, ci) = (a as usize, b as usize, c as usize);
+            if !keep(mesh, ai, bi, ci) {
+                continue;
+            }
+            let base = (positions.len() / 3) as u32;
+            for vi in [ai, bi, ci] {
+                positions.extend_from_slice(&mesh.positions[vi * 3..vi * 3 + 3]);
+                if mesh.normals.len() >= (vi + 1) * 3 {
+                    normals.extend_from_slice(&mesh.normals[vi * 3..vi * 3 + 3]);
+                } else {
+                    normals.extend_from_slice(&[0.0, 0.0, 1.0]);
+                }
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2]);
+        }
+        MeshData {
+            positions,
+            normals,
+            indices,
+        }
+    }
+
+    fn place_thread_mesh(mesh: &MeshData, tp: &ThreadPreview, z_along: f64) -> MeshData {
+        let theta = 2.0 * PI * (z_along / tp.pitch.max(1e-9));
+        let (ct, st) = (theta.cos() as f32, theta.sin() as f32);
+        let (dx, dy, dz) = (tp.at[0] as f32, tp.at[1] as f32, (tp.at[2] + z_along) as f32);
+        let mut out = mesh.clone();
+        let n = out.positions.len() / 3;
+        for i in 0..n {
+            let x = out.positions[i * 3];
+            let y = out.positions[i * 3 + 1];
+            let z = out.positions[i * 3 + 2];
+            let x2 = x * ct - y * st;
+            let mut y2 = x * st + y * ct;
+            if tp.left {
+                y2 = -y2;
+            }
+            out.positions[i * 3] = x2 + dx;
+            out.positions[i * 3 + 1] = y2 + dy;
+            out.positions[i * 3 + 2] = z + dz;
+            if out.normals.len() >= (i + 1) * 3 {
+                let nx = out.normals[i * 3];
+                let ny = out.normals[i * 3 + 1];
+                let nz = out.normals[i * 3 + 2];
+                let nx2 = nx * ct - ny * st;
+                let mut ny2 = nx * st + ny * ct;
+                if tp.left {
+                    ny2 = -ny2;
+                }
+                out.normals[i * 3] = nx2;
+                out.normals[i * 3 + 1] = ny2;
+                out.normals[i * 3 + 2] = nz;
+            }
+        }
+        out
     }
 
     fn apply_body_transform(
@@ -1238,7 +1604,10 @@ pub(crate) mod occt_backend {
                     let Some(&solid) = solids.get(&body.body_id) else {
                         continue;
                     };
-                    let out = tessellate_solid(k, solid)?;
+                    let pitch = thread_pitch_hint(&body.features, &document.units);
+                    let preview = long_thread_preview(&body.features, &document.units)
+                        .and_then(|tp| preview_with_translation(tp, &body.transform));
+                    let out = tessellate_solid(k, solid, pitch, preview)?;
                     bodies.push(BodyOutput {
                         body_id: body.body_id.clone(),
                         name: body.display_name().to_string(),
@@ -1287,6 +1656,22 @@ pub(crate) mod occt_backend {
                 }
                 let solid = combined
                     .ok_or_else(|| KernelError::InvalidState("nothing visible to export".into()))?;
+                let pitch = document
+                    .bodies
+                    .iter()
+                    .filter_map(|b| thread_pitch_hint(&b.features, &document.units))
+                    .fold(None, |acc, p| Some(acc.map(|a: f64| a.min(p)).unwrap_or(p)));
+                let visible: Vec<_> = document
+                    .bodies
+                    .iter()
+                    .filter(|b| !b.suppressed && b.visible)
+                    .collect();
+                let preview = if visible.len() == 1 {
+                    long_thread_preview(&visible[0].features, &document.units)
+                        .and_then(|tp| preview_with_translation(tp, &visible[0].transform))
+                } else {
+                    None
+                };
                 match format {
                     ExportFormat::Step => {
                         let s = heal_shape(k, solid);
@@ -1295,15 +1680,15 @@ pub(crate) mod occt_backend {
                             .map_err(|e| occt_err(format!("export_step: {:?}", e)))
                     }
                     ExportFormat::Stl => {
-                        let out = tessellate_solid(k, solid)?;
+                        let out = tessellate_solid(k, solid, pitch, preview)?;
                         Ok(crate::export::to_stl(&out.mesh))
                     }
                     ExportFormat::Gltf => {
-                        let out = tessellate_solid(k, solid)?;
+                        let out = tessellate_solid(k, solid, pitch, preview)?;
                         Ok(mesh_to_glb(&mesh_data_as_occt(&out.mesh)))
                     }
                     ExportFormat::Obj => {
-                        let out = tessellate_solid(k, solid)?;
+                        let out = tessellate_solid(k, solid, pitch, preview)?;
                         Ok(crate::export::to_obj(&out.mesh).into_bytes())
                     }
                     ExportFormat::Brep => {
@@ -1331,6 +1716,8 @@ pub(crate) mod occt_backend {
         with_kernel(|k| {
             let solid =
                 STEP_CACHE.with(|c| execute_in_kernel(k, program, &mut c.borrow_mut(), 0))?;
+            let pitch = thread_pitch_hint(&program.features, &program.units);
+            let preview = long_thread_preview(&program.features, &program.units);
             match format {
                 ExportFormat::Step => {
                     let s = heal_shape(k, solid);
@@ -1339,15 +1726,15 @@ pub(crate) mod occt_backend {
                         .map_err(|e| occt_err(format!("export_step: {:?}", e)))
                 }
                 ExportFormat::Stl => {
-                    let out = tessellate_solid(k, solid)?;
+                    let out = tessellate_solid(k, solid, pitch, preview)?;
                     Ok(crate::export::to_stl(&out.mesh))
                 }
                 ExportFormat::Gltf => {
-                    let out = tessellate_solid(k, solid)?;
+                    let out = tessellate_solid(k, solid, pitch, preview)?;
                     Ok(mesh_to_glb(&mesh_data_as_occt(&out.mesh)))
                 }
                 ExportFormat::Obj => {
-                    let out = tessellate_solid(k, solid)?;
+                    let out = tessellate_solid(k, solid, pitch, preview)?;
                     Ok(crate::export::to_obj(&out.mesh).into_bytes())
                 }
                 ExportFormat::Brep => {
@@ -2254,25 +2641,41 @@ pub(crate) mod occt_backend {
             state.current_solid = Some(drawable_shape(k, raw));
             Ok(())
         } else {
-            let rod = threaded_rod(k, major, pitch, length)?;
-            let rod = maybe_left_hand(k, rod, &op.hand)?;
-            let rod = align_z_primitive_to_axis(k, rod, &op.axis)?;
-            let rod = translate_if_needed(k, rod, op.at)?;
-            if state.current_solid.is_some() {
-                // Thread an existing boss: cut the groove tool from the body.
-                let base = state.current_solid.unwrap();
-                let cutter = thread_cutter(k, major, pitch, length, false, 0.0)?;
-                let cutter = maybe_left_hand(k, cutter, &op.hand)?;
-                let cutter = align_z_primitive_to_axis(k, cutter, &op.axis)?;
-                let cutter = translate_if_needed(k, cutter, op.at)?;
-                match k.cut(base, cutter) {
-                    Ok(raw) => {
-                        state.current_solid = Some(drawable_shape(k, raw));
+            // Long Z bolts: leave the fused hex+shank as a smooth cylinder.
+            // WASM traps if we cut/tessellate 20+ helical turns as one solid.
+            // The viewport instances short V-groove rods instead.
+            if preview_from_thread(op, units).is_some() {
+                if state.current_solid.is_none() {
+                    let rod = k
+                        .make_cylinder(major / 2.0, length)
+                        .map_err(|e| occt_err(format!("thread cylinder: {e}")))?;
+                    let rod = align_z_primitive_to_axis(k, rod, &op.axis)?;
+                    let rod = translate_if_needed(k, rod, op.at)?;
+                    join_or_set(k, state, rod)?;
+                }
+                return Ok(());
+            }
+            if let Some(base) = state.current_solid {
+                match apply_external_thread_cut(
+                    k, base, major, pitch, length, op.at, &op.axis, &op.hand,
+                ) {
+                    Ok(solid) => {
+                        state.current_solid = Some(solid);
                         Ok(())
                     }
-                    Err(_) => join_or_set(k, state, rod),
+                    Err(_) => {
+                        let rod = threaded_rod(k, major, pitch, length)?;
+                        let rod = maybe_left_hand(k, rod, &op.hand)?;
+                        let rod = align_z_primitive_to_axis(k, rod, &op.axis)?;
+                        let rod = translate_if_needed(k, rod, op.at)?;
+                        join_or_set(k, state, rod)
+                    }
                 }
             } else {
+                let rod = threaded_rod(k, major, pitch, length)?;
+                let rod = maybe_left_hand(k, rod, &op.hand)?;
+                let rod = align_z_primitive_to_axis(k, rod, &op.axis)?;
+                let rod = translate_if_needed(k, rod, op.at)?;
                 join_or_set(k, state, rod)
             }
         }
@@ -2313,18 +2716,76 @@ pub(crate) mod occt_backend {
         internal: bool,
         z0: f64,
     ) -> Result<Handle, KernelError> {
-        if (length / pitch.max(1e-9)) > 12.0 {
-            // Long fasteners: round helical groove first — the V-pipe of 30+ turns
-            // exhausts WASM before tessellation.
-            helical_round_groove(k, major, pitch, length, internal, z0)
-                .or_else(|_| helical_thread_cutter(k, major, pitch, length, internal, z0))
+        // Thin helical bead first. A V-profile that spans nearly one pitch in Z
+        // Frenet-pipes into ring-like troughs (the "stacked ticks" look).
+        helical_round_groove(k, major, pitch, length, internal, z0)
+            .or_else(|_| helical_thread_cutter(k, major, pitch, length, internal, z0))
+    }
+
+    /// Prefer one helical cutter. Only chunk if that boolean fails — five
+    /// sequential cuts on a 40 mm M8 is far too slow for the viewport.
+    fn apply_external_thread_cut(
+        k: &mut occt_wasm::OcctKernel,
+        mut solid: Handle,
+        major: f64,
+        pitch: f64,
+        length: f64,
+        at: [f64; 3],
+        axis: &RevolveAxis,
+        hand: &ThreadHand,
+    ) -> Result<Handle, KernelError> {
+        if length / pitch.max(1e-9) > MAX_INLINE_THREAD_TURNS {
+            return Err(occt_err(
+                "long helical cut skipped (viewport uses segmented thread mesh)",
+            ));
+        }
+        let place = |k: &mut occt_wasm::OcctKernel, cutter: Handle| -> Result<Handle, KernelError> {
+            let cutter = maybe_left_hand(k, cutter, hand)?;
+            let cutter = align_z_primitive_to_axis(k, cutter, axis)?;
+            translate_if_needed(k, cutter, at)
+        };
+        if let Ok(cutter) = thread_cutter(k, major, pitch, length, false, 0.0) {
+            if let Ok(cutter) = place(k, cutter) {
+                if let Ok(raw) = k.cut(solid, cutter) {
+                    let out = drawable_shape(k, raw);
+                    if shape_has_extent(k, out) {
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+        let chunk = (pitch * 6.0).max(6.0);
+        let mut z = 0.0;
+        let mut any = false;
+        while z < length - 1e-9 {
+            let seg = (length - z).min(chunk);
+            if let Ok(cutter) = thread_cutter(k, major, pitch, seg, false, z) {
+                if let Ok(cutter) = place(k, cutter) {
+                    match k.cut(solid, cutter) {
+                        Ok(raw) => {
+                            solid = drawable_shape(k, raw);
+                            any = true;
+                        }
+                        Err(e) => {
+                            let err = occt_err(format!("thread cut: {e}"));
+                            if is_fatal_occt(&err) {
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
+            }
+            z += seg;
+        }
+        if any {
+            Ok(solid)
         } else {
-            helical_thread_cutter(k, major, pitch, length, internal, z0)
-                .or_else(|_| helical_round_groove(k, major, pitch, length, internal, z0))
+            Err(occt_err("helical thread cut removed no material"))
         }
     }
 
-    /// True helical V-groove (not a lathe/revolve of stacked rings).
+    /// Compact V-groove along a polyline helix we control. The ISO triangle
+    /// that spans ~1 pitch in Z is too tall for OCCT's Frenet pipe.
     fn helical_thread_cutter(
         k: &mut occt_wasm::OcctKernel,
         major: f64,
@@ -2334,7 +2795,7 @@ pub(crate) mod occt_backend {
         z0: f64,
     ) -> Result<Handle, KernelError> {
         let depth = crate::thread::external_depth(pitch);
-        let half = pitch * 0.48;
+        let half = pitch * 0.22;
         let (r_out, r_in) = if internal {
             let r_hole = crate::thread::tap_drill_diameter(major, pitch) / 2.0;
             (
@@ -2346,20 +2807,13 @@ pub(crate) mod occt_backend {
         };
         let r_h = 0.5 * (r_out + r_in);
         let z_start = z0 - half;
-        let height = (length + pitch * 1.25).max(pitch * 2.0);
+        let height = (length + pitch * 1.1).max(pitch * 2.0);
         let pts = [
-            [r_out, 0.0, z_start],
-            [r_out, 0.0, z_start + pitch * 0.92],
-            [r_in, 0.0, z_start + half],
+            [r_out, 0.0, 0.0],
+            [r_out, 0.0, 2.0 * half],
+            [r_in, 0.0, half],
         ];
-        if let Ok(spine) = k.make_helix_wire(0.0, 0.0, z_start, 0.0, 0.0, 1.0, pitch, height, r_h) {
-            if let Ok(face) = face_from_polygon_3d(k, &pts) {
-                if let Ok(s) = pipe_along(k, face, spine) {
-                    return Ok(s);
-                }
-            }
-        }
-        let mut path = helix_polyline(r_h, pitch, height, helix_samples_per_turn(height, pitch));
+        let mut path = helix_polyline(r_h, pitch, height, thread_polyline_samples(height, pitch));
         for p in &mut path {
             p[2] += z_start;
         }
@@ -2372,7 +2826,7 @@ pub(crate) mod occt_backend {
         Err(occt_err("helical V-thread sweep failed"))
     }
 
-    /// Helical circular groove — still a helix, never stacked rings.
+    /// Helical circular groove — a thin bead on a polyline helix, never rings.
     fn helical_round_groove(
         k: &mut occt_wasm::OcctKernel,
         major: f64,
@@ -2387,10 +2841,21 @@ pub(crate) mod occt_backend {
         } else {
             major / 2.0 - depth * 0.45
         };
-        let sec_r = (depth * 0.55).max(pitch * 0.22);
+        let sec_r = (depth * 0.55).max(pitch * 0.18);
+        let z_start = z0 - pitch * 0.12;
         let height = (length + pitch).max(pitch * 2.0);
-        let spine = helix_spine(k, pitch, height, r_h, [0.0, 0.0, z0], &RevolveAxis::Z)?;
-        helix_solid(k, spine, r_h, pitch, height, sec_r)
+        let mut path = helix_polyline(r_h, pitch, height, thread_polyline_samples(height, pitch));
+        for p in &mut path {
+            p[2] += z_start;
+        }
+        let poly = wire_from_polyline3(k, &path)?;
+        helix_solid(k, poly, r_h, pitch, height, sec_r, false)
+    }
+
+    fn thread_polyline_samples(height: f64, pitch: f64) -> u32 {
+        let turns = (height / pitch.max(1e-9)).max(0.25);
+        let max_pts = 220.0;
+        ((max_pts / turns).floor() as u32).clamp(16, 40)
     }
 
     fn threaded_rod(
@@ -2402,34 +2867,16 @@ pub(crate) mod occt_backend {
         let cyl = k
             .make_cylinder(major / 2.0, length)
             .map_err(|e| occt_err(format!("thread cylinder: {e}")))?;
-        if let Ok(cutter) = thread_cutter(k, major, pitch, length, false, 0.0) {
-            if let Ok(cut) = k.cut(cyl, cutter) {
-                return Ok(drawable_shape(k, cut));
-            }
-        }
-        // Long shanks (M8×40 ≈ 32 turns) can fail as a single helical sweep.
-        // Cut in pitch-sized chunks so the groove still exists.
-        let mut solid = cyl;
-        let chunk = (pitch * 8.0).max(6.0);
-        let mut z = 0.0;
-        let mut any = false;
-        while z < length - 1e-6 {
-            let seg = (length - z).min(chunk);
-            if let Ok(cutter) = thread_cutter(k, major, pitch, seg, false, z) {
-                if let Ok(cut) = k.cut(solid, cutter) {
-                    solid = drawable_shape(k, cut);
-                    any = true;
-                }
-            }
-            z += seg;
-        }
-        if any {
-            Ok(solid)
-        } else {
-            Err(occt_err(
-                "could not cut a helical thread (revolve-ring fallback is disabled)",
-            ))
-        }
+        apply_external_thread_cut(
+            k,
+            cyl,
+            major,
+            pitch,
+            length,
+            [0.0, 0.0, 0.0],
+            &RevolveAxis::Z,
+            &ThreadHand::Right,
+        )
     }
 
     fn helix_samples_per_turn(height: f64, pitch: f64) -> u32 {
@@ -2477,7 +2924,7 @@ pub(crate) mod occt_backend {
     ) -> Result<(), KernelError> {
         let sec_r = op.diameter / 2.0;
         let spine = helix_spine(k, op.pitch, op.height, op.radius, [0.0; 3], &RevolveAxis::Z)?;
-        let solid = helix_solid(k, spine, op.radius, op.pitch, op.height, sec_r)?;
+        let solid = helix_solid(k, spine, op.radius, op.pitch, op.height, sec_r, true)?;
         let solid = align_z_primitive_to_axis(k, solid, &op.axis)?;
         let solid = translate_if_needed(k, solid, op.center)?;
         absorb_solid(k, state, solid, op.fuse)?;
@@ -2491,6 +2938,7 @@ pub(crate) mod occt_backend {
         pitch: f64,
         height: f64,
         sec_r: f64,
+        allow_tori: bool,
     ) -> Result<Handle, KernelError> {
         let sec_d = sec_r * 2.0;
         // Square section at the helix start (XZ plane) — more reliable than a disk.
@@ -2546,7 +2994,10 @@ pub(crate) mod occt_backend {
                 }
             }
         }
-        // Last resort: stacked torus rings so the op still yields a coil-like solid.
+        if !allow_tori {
+            return Err(occt_err("helix/coil sweep failed"));
+        }
+        // Last resort for decorative springs only — never for thread cutters.
         let n = ((height / pitch).round() as i32).max(1);
         let mut acc: Option<Handle> = None;
         for i in 0..n {
