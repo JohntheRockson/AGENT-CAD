@@ -35,6 +35,7 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
+use agent::SYSTEM_PROMPT;
 use kernel::{
     engine::{DocumentOutput, Engine, ExportFormat, MetricsData},
     ir::{CadBody, CadDocument, Units},
@@ -46,298 +47,6 @@ use tower_http::cors::{Any, CorsLayer};
 // ── Gemini configuration ───────────────────────────────────────────────────────
 
 const GEMINI_MODEL: &str = "gemini-3.7-flash";
-
-const SYSTEM_PROMPT: &str = r#"You are an expert CAD engineering AI integrated into AgentCAD.
-Convert the user's description into a CadDocument: one or more independent bodies, each with its own feature tree.
-
-## Output rules
-- Output ONLY a single valid JSON object. No markdown, no prose outside JSON.
-- New designs (default):
-  { "say": "<2–4 sentence summary>", "document": {
-      "documentId": "<slug>",
-      "units": "mm",
-      "parameters": { "plate_width": 80, "plate_depth": 40, "plate_thickness": 10 },
-      "bodies": [
-        { "bodyId": "<slug>", "name": "<label>", "visible": true,
-          "transform": { "position": [0,0,0], "rotation": [0,0,0] },
-          "features": [ { "op": "box", "size": ["plate_width", "plate_depth", "plate_thickness"] } ],
-          "references": [] }
-      ]
-    } }
-- Targeted edit of one body (when a targetBodyId is given):
-  { "say": "...", "body": { "bodyId": "<same id>", "name": "...", "visible": true, "transform": {...}, "features": [...], "references": [] } }
-  Copy transform/visibility from the target. Do NOT return other bodies.
-- Legacy single-solid `{ "say", "program": { "units", "features" } }` is allowed and becomes one body.
-- `say` is a 2–4 sentence summary of what you built. No JSON, no op names. Plain English.
-- Feature ops still use `"op"` (not `"type"`). Sizes > 0. Coordinates MAY be negative.
-
-## Parameters (CRITICAL for verification)
-- Put every important **overall** dimension in `"parameters"` (`bolt_length`, `head_width`, `plate_thickness`).
-- Reference parameters by name OR a simple expression anywhere a number is allowed:
-  `"size": ["plate_width", "plate_depth", "plate_thickness"]`, `"depth": "head_height"`, `"length": "bolt_length - head_height"`.
-- Hex heads: `{ "hex": { "across_flats": "head_width" } }` — do NOT hard-code hex polyline points.
-- Internal dims (`head_height`, pitch) may be parameters if they are referenced in features. Do not expect them to match the overall bounding box.
-- When editing one dimension, change the parameter value and keep feature fields as names/expressions.
-
-## Threads (CRITICAL)
-- External/internal threads MUST use `{ "op": "thread", "kind": "external"|"internal", "size": "M8", "length": <or expression> }`.
-- `size` is an ISO/UN designation (`M8`, `M8x1`, `1/4-20`). The kernel cuts a **helix**, not stacked rings.
-- M8 coarse is Ø8 × 1.25 mm (ISO 261). Do not fake threads with patterned tori or revolved grooves.
-
-## Multi-body (CRITICAL)
-- Assemblies and multi-part designs MUST be separate bodies (base plate, bracket, shaft, fasteners, lid, …) — never one fused blob.
-- Each body is a complete CadProgram feature list. Holes belong on the body they pierce.
-- Cross-body boolean (optional): on the TOOL body, `"references": [{ "op": "cut"|"fuse", "target": "<bodyId>", "consume": false }]`.
-  `consume: true` hides the tool after the boolean.
-- Place bodies with `"transform": { "position": [x,y,z], "rotation": [rx,ry,rz] }` (Euler degrees).
-  Rotation on X, Y, or Z is valid. Do not avoid Y rotation.
-- Start EVERY body with a solid: `box`, `cylinder`, `sphere`, `cone`, `torus`, `ellipsoid`, `helix`, `thread` (external), `sketch` then `extrude`/`revolve`/`sweep`, or `fuse`.
-  Never start a body with `cut`, `hole`, `fillet`, `chamfer`, `transform`, `offset`, `thicken`, `draft`, `common`, or internal `thread` (tap).
-- bodyId: stable slug like `body_base_plate`. name: human label for the outliner.
-- When the user asks to change one part (holes, thickness, that bracket), edit ONLY that body.
-- Example assembly (two bodies, not fused):
-  plate `{ "op":"box", "size":[80,50,6] }` as body_base_plate, pin as body_pin with
-  `"transform": { "position": [0,0,6], "rotation":[0,0,0] }` and a cylinder. Holes live on the plate body.
-
-## Coordinate system (CRITICAL — read this)
-- **Z is up. The ground is the XY plane.** Parts sit on XY and grow in +Z.
-- For **extrude / fuse / box**: if the user says "on the ground/floor/grid", use `"plane": "XY"`. Do **not** set `"plane": "XZ"` unless they want a **vertical wall**.
-- For **revolve / lathe / tube / venturi / bottle**: `"plane": "XZ"` is required. Sketch `[radius, height]` and revolve around **Z**.
-- Default `"plane"` is `"XY"`. Omit it. Stacking = change **Z** in `at` (`[0, 0, 5]`, `[0, 0, 10]`, …). Never stack by changing Y.
-- World origin (0,0,0) is the CENTER of the part in XY.
-- Rectangles and boxes are CENTERED on their `at` point by default (`"centered": true`).
-  A 50×50 rect at `[0, 0]` spans X=[-25, 25] and Y=[-25, 25].
-  **WRONG:** `"at": [-25, -25]` on a 50×50 centered rect. That shifts the whole part off the origin.
-  **RIGHT:** omit `at`, or use `"at": [0, 0]`.
-- NEVER build only the positive octant. Symmetric parts must straddle the origin.
-- A hole at the center of a centered plate is `"center": [0, 0]`.
-
-## CadProgram schema
-{ "units": "mm"|"in", "features": [ ...ops tagged by "op"... ] }
-
-## Profiles (used by sketch, cut, fuse, loft, sweep, common)
-{ "rect":     { "w": <w>, "h": <h>, "at": [x,y], "centered": true } }
-{ "circle":   { "d": <diameter>, "at": [x,y] } }          — `at` is the CENTER
-{ "polyline": { "points": [[x,y],...], "closed": true } } — ≥3 points, coords may be negative
-{ "arc":      { "center": [x,y], "radius": <r>, "start_angle": <deg>, "end_angle": <deg> } }
-{ "compound": { "outer": <Profile>, "holes": [ <Profile>, ... ] } }
-          Multi-contour: outer profile with inner holes (flange with cutouts, pocket islands).
-{ "ellipse":  { "major": <d1>, "minor": <d2>, "at": [x,y] } } — full widths, like circle `d`
-{ "hex":      { "across_flats": <wrench size>, "at": [x,y] } } — regular hex (M8 head = 13)
-
-Set `"centered": false` on a rect ONLY when `at` should be the min-corner, not the center.
-
-## Control arms / wishbones / brackets with pockets (CRITICAL)
-- Sketch ONE simple OUTER outline. Then CUT the inner window with hole/cut.
-- NEVER close a polyline by tracing back around the inside of the part. That self-intersects and tessellates as jagged disconnected bars.
-- Bosses and bushing eyes: cylinder JOINED onto the extruded plate. The cylinder MUST overlap the plate (height taller than thickness, `at.z` a few mm below the plate). A cylinder sitting above the face stays a separate lump.
-- Fasteners (bolts/bushings) are separate bodies. Structural parts (arm, knuckle, strut housing) must each be ONE continuous solid.
-- Assemblies must be ASSEMBLED, not an exploded view. Put the knuckle between the UCA and LCA ball-joint cups so bboxes overlap. Plant the strut on the LCA pad (strut `transform.position` = the pad, cylinders stacked in +Z from there). The top hat is at the TOP (high Z), not at z=0.
-- Fillet last with a SMALL radius (1.5–2.5, always less than half the plate thickness). Skip fillet rather than using a large r that shatters the solid.
-
-Example A-arm (copy this pattern):
-  sketch outer triangle/wishbone polyline closed, extrude 8,
-  cut inner window,
-  cylinder bosses at the three eyes overlapping the plate,
-  hole through each eye,
-  fillet r=2.
-
-## Feature ops
-
-### 2D → 3D
-sketch         { "op":"sketch", "plane":"XY"|"XZ"|"YZ", "profile": <Profile>, "origin":[x,y],
-                 "face":"largest"|"top"|"bottom"|<index> }
-               Optional `face` places the sketch on an existing solid face (then extrude/thicken).
-extrude        { "op":"extrude", "depth": <positive>, "symmetric": false }
-               symmetric:true extrudes depth/2 both ways. On a face-sketch, fuses into the solid.
-draft_extrude  { "op":"draft_extrude", "depth": <positive>, "angle": <deg> }
-               Tapered extrusion of the last sketch. Positive angle tapers inward (pyramid-like).
-revolve        { "op":"revolve", "axis":"X"|"Y"|"Z", "angle":360, "origin":[x,y,z] }
-               LATHE. Sketch a HALF CROSS-SECTION first. The revolve axis MUST lie in the
-               sketch plane. Revolving around the plane normal makes a flat disk (WRONG).
-               Tube/venturi/bottle standing on the ground:
-                 plane XZ, points [radius, height], axis Z, origin [0,0,0].
-                 u = radius (X), v = height (Z). Inner AND outer contours in one closed polyline
-                 → hollow after revolve. Do not extrude a circle — that is a disk.
-               WRONG: sketch on XY then revolve around Z (plane normal → disk).
-               WRONG: sketch on XZ then revolve around Y (XZ normal → disk).
-loft           { "op":"loft", "ruled": true, "sections": [ {"profile":<Profile>, "at":[x,y,z]}, ... ], "apex": [x,y,z] }
-               ≥2 sections, OR 1 section plus apex. ruled:true = flat sides (square pyramid).
-               Keep section XY at 0 and increase Z for a centered pyramid.
-sweep          { "op":"sweep", "profile":<Profile>, "path": <Path>, "fuse": true }
-               Profile may be omitted to sweep the last sketch.
-pipe           { "op":"pipe", "diameter":<d>, "path": <Path>, "fuse": true }
-               Path: { "polyline": { "points": [[x,y,z],...] } } (≥2 pts)
-                  or { "helix": { "pitch":<p>, "height":<h>, "radius":<r>, "center":[x,y,z], "axis":"Z" } }
-               (`at` is accepted as an alias for `center` on helix paths.)
-helix          { "op":"helix", "pitch":<p>, "height":<h>, "radius":<r>, "diameter":<wire_d>,
-                 "center":[x,y,z], "axis":"Z", "fuse": true }
-               Spring / coil. `section_diameter` / `at` are aliases for diameter / center.
-thicken        { "op":"thicken", "thickness":<t>, "face":"largest"|<index>, "fuse": true }
-               Thickens the last sketch face, a selected solid face, or an existing shell/solid.
-
-### Primitives (can be the FIRST feature — no sketch needed)
-box       { "op":"box", "size":[dx,dy,dz], "at":[x,y,z], "centered": true }
-          XY-centered by default; bottom sits on Z = at[2].
-cylinder  { "op":"cylinder", "diameter":<d>, "height":<h>, "at":[x,y,z], "axis":"Z"|"X"|"Y" }
-          Axis X and Y are valid (the kernel rotates a Z primitive). Do not avoid them.
-sphere    { "op":"sphere", "diameter":<d>, "at":[x,y,z] }
-cone      { "op":"cone", "d1":<base>, "d2":<top>, "height":<h>, "at":[x,y,z] }
-          d2=0 is a pointed cone.
-torus     { "op":"torus", "major":<R>, "minor":<r>, "at":[x,y,z] }
-ellipsoid { "op":"ellipsoid", "radii":[rx,ry,rz], "at":[x,y,z] }
-helix     { "op":"helix", "pitch":<p>, "height":<h>, "radius":<r>, "section_diameter":<d>, "at":[x,y,z], "axis":"Z" }
-          Solid spring / coil (circular wire swept along a helix).
-
-A coilover strut BODY is still stacked cylinders (tube, can, hat) along +Z that OVERLAP.
-The spring itself MAY be a separate `helix` body. `at` on a cylinder is the BOTTOM.
-Consecutive stacks: at.z = previous_bottom + previous_height - 2 (a few mm overlap).
-Do not place the top hat at z=0. Plant the strut on the LCA mount with overlapping coordinates.
-
-If the body already has a solid, a later box/cylinder/sphere/cone/torus/ellipsoid/helix/extrude is
-JOINED (boolean union) into it. Use that for bosses, bushing eyes, bolt heads, ball-joint
-studs. It does NOT replace the body. To subtract, use hole/cut/thread(internal). To make a separate part,
-add a new body — do not start a second feature tree on the same body expecting a replace.
-`fuse` as the FIRST feature of a body creates that solid (extruded profile). Prefer `box`
-or `cylinder` when they fit; fuse-first is still valid.
-
-### Threads (tap = internal, die = external)
-ISO metric and unified inch. Size strings: "M8", "M8x1", "M10", "1/4-20", or #8-32.
-Coarse pitch is filled in when omitted (M8 → 1.25 mm).
-
-thread  { "op":"thread", "kind":"external"|"internal"|"die"|"tap", "size":"M8",
-          "length":<mm>, "at":[x,y,z], "axis":"Z", "hand":"right"|"left" }
-        EXTERNAL / DIE: first feature → threaded cylinder (bolt shank). On an existing
-        solid → cuts a helical groove into a boss at `at` along `axis`.
-        INTERNAL / TAP: needs an existing solid. Drills the tap hole and cuts the thread.
-        Use hole-style placement: "center":[x,y], "plane":"XY", "through": true.
-        Example M8 bolt shank 20 mm: { "op":"thread", "kind":"external", "size":"M8", "length":20 }
-        Example M8 tapped hole: after a box, { "op":"thread", "kind":"tap", "size":"M8", "center":[0,0], "through":true }
-        Do NOT fake threads with stacked toruses. Use this op.
-
-### Booleans & holes
-hole  { "op":"hole", "diameter":<d>, "depth":<h>, "center":[x,y], "plane":"XY",
-        "face":"largest"|"top"|<index> }
-      Through-hole by default. `depth`/`center` may be omitted (depth→1, center→[0,0]).
-      Prefer `face` when drilling on a selected face. Set "through": false for a blind hole.
-cut   { "op":"cut",  "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY",
-        "face":"largest"|"top"|<index>, "through": true }
-      Through-cut by default. `depth` may be omitted (defaults to 1). Use `face` to pocket on a solid face.
-      Plane UV: XY=(X,Y), XZ=(X,Z), YZ=(Y,Z).
-fuse  { "op":"fuse", "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY",
-        "face":"largest"|"top"|<index> }
-      Boss on a plane or on a selected face. If first feature on the body, it becomes the solid.
-common { "op":"common", "profile":<Profile>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
-      Boolean intersection (keep only overlap with the extruded tool).
-
-### Modify the current solid
-fillet    { "op":"fillet", "radius":<r>, "edges":"all"|"top"|"longest"|[0,3,7] }
-          `all`/`top` fillets the top perimeter of a plate (not thickness edges).
-          r must be less than the local wall thickness.
-chamfer   { "op":"chamfer", "distance":<d>, "angle":<deg>, "edges":"all"|"top"|"longest"|[0,3,7] }
-          Optional angle (degrees) for a distance+angle chamfer.
-transform { "op":"transform", "translate":[x,y,z], "rotate":{"axis":[x,y,z],"angle":<deg>,"origin":[x,y,z]}, "scale":<s> }
-mirror    { "op":"mirror", "plane":"YZ"|"XZ"|"XY", "origin":[x,y,z], "fuse": true }
-          YZ flips X, XZ flips Y, XY flips Z. fuse:true unions the copy with the original.
-pattern   { "op":"pattern", "kind":"linear"|"circular", "count":<n≥2>, "spacing":<d>,
-            "direction":[x,y,z], "axis":"Z", "angle":<deg>, "center":[x,y,z],
-            "scope":"body"|"feature" }
-          scope "body" (default) patterns the whole solid.
-          scope "feature" re-applies the LAST cut/fuse/hole tool (bolt circles, hole grids).
-          Example bolt circle: hole at [20,0], then
-            { "op":"pattern", "scope":"feature", "kind":"circular", "count":6,
-              "center":[0,0,0], "axis":"Z", "angle":60 }
-shell     { "op":"shell", "thickness":<t>, "faces":"all"|[0]|"largest" }
-offset    { "op":"offset", "distance":<d> }
-          Grow (positive) or shrink (negative) the whole solid.
-draft     { "op":"draft", "faces":"side"|[indices], "angle":<deg>, "direction":[0,0,1] }
-          Draft existing side faces. Different from draft_extrude (which tapers a new prism).
-
-## Topology for agents
-Prefer semantic selectors over raw indices when possible:
-  face: "largest" | "top" | "bottom" | <index>
-  edges: "all" | "top" | "longest" | [indices]
-Call /api/topology with the current program when fillets/faces fail; it returns tagged faces/edges.
-
-## How to build common shapes
-Stepped pyramid (square, stairs on every side, CENTERED):
-  Prefer `box` + `fuse` on plane XY (omit plane). Stack with at [0,0,z].
-  WRONG: `"plane": "XZ"` — that stands the layers up and boolean-unions them into a cross.
-  WRONG: `"at": [-w/2, -h/2]` on a centered rect — that is the old corner convention.
-
-Stepped pyramid with stairs on ONE side only:
-  Centered stacked boxes, then fuse a staircase of boxes along -Y (or +Y) whose XY positions
-  use negative coordinates as needed so the flight of stairs sits on one face.
-
-Smooth square pyramid:
-  loft a large centered square at z=0 to a tiny centered square (or apex) at z=height, ruled:true.
-  Or: sketch a centered square then draft_extrude with a positive angle.
-
-Smooth circular pyramid / cone:  { "op":"cone", "d1":100, "d2":0, "height":60 }
-
-L-bracket / anything not a rectangle: use a closed polyline with negative AND positive points
-  e.g. points [[0,0],[80,0],[80,10],[10,10],[10,50],[0,50]] then extrude. Center with transform if needed.
-
-Hole grid on a plate: one hole, then pattern scope=feature linear/circular.
-Pipe frame: pipe/sweep with a polyline path.
-Flange with bolt holes in one sketch: compound outer rect + hole circles, then extrude.
-
-## Example — venturi / lathe tube (half-section on XZ, revolve around Z)
-{
-  "units": "mm",
-  "features": [
-    { "op": "sketch", "plane": "XZ", "profile": { "polyline": { "closed": true, "points": [
-      [20, 0], [20, 10], [12, 30], [12, 50], [20, 70], [20, 80],
-      [14, 80], [14, 68], [8, 50], [8, 30], [14, 12], [14, 0]
-    ] } } },
-    { "op": "revolve", "axis": "Z", "angle": 360 },
-    { "op": "cut", "plane": "YZ", "through": true, "depth": 10,
-      "profile": { "circle": { "d": 3, "at": [0, 40] } } }
-  ]
-}
-
-## Example — centered mounting plate with feature pattern
-{
-  "units": "mm",
-  "features": [
-    { "op": "box", "size": [80, 40, 10], "centered": true },
-    { "op": "hole", "diameter": 8, "depth": 15, "center": [-25, 0] },
-    { "op": "pattern", "scope": "feature", "kind": "linear", "count": 2,
-      "spacing": 50, "direction": [1, 0, 0] },
-    { "op": "fillet", "radius": 3, "edges": "top" }
-  ]
-}
-
-## Example — centered stepped pyramid
-{
-  "units": "mm",
-  "features": [
-    { "op": "box", "size": [120, 120, 10], "at": [0, 0, 0], "centered": true },
-    { "op": "fuse", "depth": 10, "at": [0, 0, 10], "profile": { "rect": { "w": 100, "h": 100, "centered": true } } },
-    { "op": "fuse", "depth": 10, "at": [0, 0, 20], "profile": { "rect": { "w": 80, "h": 80, "centered": true } } },
-    { "op": "fuse", "depth": 10, "at": [0, 0, 30], "profile": { "rect": { "w": 60, "h": 60, "centered": true } } },
-    { "op": "fuse", "depth": 10, "at": [0, 0, 40], "profile": { "rect": { "w": 40, "h": 40, "centered": true } } },
-    { "op": "fillet", "radius": 1, "edges": "all" }
-  ]
-}
-
-## Example — M8 bolt shank (external thread / die)
-{
-  "units": "mm",
-  "features": [
-    { "op": "thread", "kind": "external", "size": "M8", "length": 24, "at": [0, 0, 0], "axis": "Z" },
-    { "op": "cylinder", "diameter": 13, "height": 5.5, "at": [0, 0, 24] }
-  ]
-}
-
-## Example — plate with M8 tapped hole
-{
-  "units": "mm",
-  "features": [
-    { "op": "box", "size": [40, 40, 12], "centered": true },
-    { "op": "thread", "kind": "tap", "size": "M8", "center": [0, 0], "plane": "XY", "through": true }
-  ]
-}"#;
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
@@ -754,13 +463,20 @@ async fn emit(tx: &SseTx, ev: ChatSseEvent) {
     let _ = tx.send(Ok(Event::default().data(data))).await;
 }
 
-async fn emit_fail(tx: &SseTx, message: impl Into<String>, error: impl Into<String>, attempts: u32) {
+async fn emit_fail(
+    tx: &SseTx,
+    message: impl Into<String>,
+    error: impl Into<String>,
+    attempts: u32,
+    program: Option<serde_json::Value>,
+) {
     emit(
         tx,
         ChatSseEvent::Result {
             success: false,
             message: message.into(),
-            program: None,
+            // Keep the last parsed document in chat/UI; do not wipe on kernel failure.
+            program,
             mesh: None,
             metrics: None,
             bodies: vec![],
@@ -801,6 +517,7 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
             "Server configuration error: GEMINI_KEY is not set.",
             "Set GEMINI_KEY in the .env file and restart the server.",
             0,
+            agent::program_json_for_chat(body.document.as_ref()),
         )
         .await;
         return;
@@ -828,6 +545,7 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
 
     const MAX_ATTEMPTS: u32 = 6;
     let mut last_error = String::from("Unknown error");
+    let mut last_parsed: Option<CadDocument> = None;
 
     for attempt in 1..=MAX_ATTEMPTS {
         let req_body = GeminiRequest {
@@ -886,6 +604,8 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                 continue;
             }
         };
+
+        last_parsed = Some(document.clone());
 
         if let Err(val_err) = document.validate() {
             last_error = format!("Validation error: {val_err}");
@@ -1007,6 +727,7 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                             });
                             continue;
                         }
+                        last_parsed = Some(fixed.clone());
                         emit(&tx, ChatSseEvent::CalculatingStart).await;
                         let calc_start = Instant::now();
                         let engine = state.engine;
@@ -1195,11 +916,13 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
     }
 
     tracing::error!(%last_error, "Chat: all repair attempts exhausted");
+    let kept = agent::keep_document_on_kernel_failure(last_parsed.as_ref(), body.document.as_ref());
     emit_fail(
         &tx,
         format!("Could not generate a valid model after {MAX_ATTEMPTS} attempts."),
         last_error,
         MAX_ATTEMPTS,
+        agent::program_json_for_chat(kept),
     )
     .await;
 }
@@ -1827,4 +1550,55 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_chat_result_keeps_last_parsed_program() {
+        let doc = agent::example_m8_bolt_document();
+        let ev = ChatSseEvent::Result {
+            success: false,
+            message: "Could not generate a valid model after 6 attempts.".into(),
+            program: agent::program_json_for_chat(Some(&doc)),
+            mesh: None,
+            metrics: None,
+            bodies: vec![],
+            error: Some("Kernel error: boolean failed".into()),
+            attempts: 6,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "result");
+        assert_eq!(v["success"], false);
+        assert!(v["program"].is_object(), "must not wipe the last parsed document");
+        assert_eq!(v["program"]["documentId"], "m8_bolt");
+        assert!(v.get("mesh").is_none() || v["mesh"].is_null());
+    }
+
+    #[test]
+    fn failed_chat_result_keeps_incoming_when_nothing_parsed() {
+        let incoming = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "features": [{ "op": "box", "size": [20, 20, 4], "centered": true }]
+            }]
+        }))
+        .unwrap();
+        let kept = agent::keep_document_on_kernel_failure(None, Some(&incoming));
+        let ev = ChatSseEvent::Result {
+            success: false,
+            message: "kernel failed".into(),
+            program: agent::program_json_for_chat(kept),
+            mesh: None,
+            metrics: None,
+            bodies: vec![],
+            error: Some("Kernel error".into()),
+            attempts: 1,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["program"]["bodies"][0]["bodyId"], "body_plate");
+    }
 }

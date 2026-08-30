@@ -1,14 +1,20 @@
-//! AgentCAD Agent crate — Phase 2 scaffold.
+//! Product agent for the shipping in-app chat (Recipe).
 //!
-//! This crate will contain the agentic tool-calling loop:
+//! Owns the system prompt and the JSON IR the single product agent should
+//! emit. The server chat loop calls Gemini with [`SYSTEM_PROMPT`] and must
+//! keep the last parsed document when the kernel fails.
 //!
-//!   User prompt → LLM generates JSON IR → kernel executes →
-//!   on error/geometry failure → feed exact error back → retry →
-//!   repeat until the solid is valid or retries exhausted.
-//!
-//! In Phase 1 the HTTP server handles the LLM stub. This crate exposes
-//! the type definitions so Phase 2 can wire them in without changing the
-//! public API of `server`.
+//! Tool-calling types below are reserved for a later loop; do not add
+//! gadgets or extra tooling here.
+
+mod ir_emit;
+mod prompt;
+
+pub use ir_emit::{
+    example_m8_bolt_document, example_m8_bolt_json, keep_document_on_kernel_failure,
+    program_json_for_chat,
+};
+pub use prompt::SYSTEM_PROMPT;
 
 use serde::{Deserialize, Serialize};
 
