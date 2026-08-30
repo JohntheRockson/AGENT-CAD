@@ -26,14 +26,14 @@ Put overall dims in "parameters". Reference by name or expression:
 "size": ["w","d","t"], "depth": "head_height", "length": "bolt_length - head_height".
 Hex heads: { "hex": { "across_flats": "head_width" } } — never hard-code hex points.
 
-## Default bolt (CRITICAL — look-right helix, not stacked ticks)
+## Default bolt recipe
 Recipe: hex extrude → overlapping cylinder → thread CUT.
 Never default to thread-first then fuse a head.
 1) sketch { "hex": { "across_flats": 13 } } (M8 wrench = 13), extrude head (~5.3).
 2) cylinder Ø major (M8 → 8) that OVERLAPS the head (at.z a few mm inside the hex) so they union.
-3) { "op": "thread", "kind": "external", "size": "M8", "length": <shank> } on that solid — the kernel CUTS a helix into the shank.
+3) { "op": "thread", "kind": "external", "size": "M8", "length": <shank> } after that solid exists (cuts the shank).
 size is an ISO/UN designation (M8, M8x1, 1/4-20). For M8, omit diameter and pitch (null/absent is correct; ISO 261 coarse is Ø8 × 1.25). Do not invent numeric diameter/pitch for M8.
-Do not fake threads with patterned tori, stacked rings, or revolved grooves.
+Do not fake threads with patterned tori, stacked rings, or revolved grooves. Do not invent a second Feature op if a thread cut fails.
 
 ## Multi-body
 Assemblies = separate bodies, not one fused blob. Holes live on the body they pierce.

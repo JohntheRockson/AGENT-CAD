@@ -3,6 +3,16 @@
 //! This is documentation and a golden example for the in-app agent — not a
 //! new Feature op. The kernel already accepts `size: "M8"` with
 //! `diameter`/`pitch` null (ISO 261 coarse Ø8 × 1.25).
+//!
+//! Recipe owns emit + parse + keep-last-document. Helix/B-Rep/tessellation
+//! honesty (a real helical groove vs stacked ticks, wasm traps) is Kernel.
+//!
+//! Probe (2026-08-30, OCCT wasm, not a Recipe fix):
+//! - thread-first `{ thread size:M8 }` builds (helical).
+//! - hex extrude + overlapping cylinder builds.
+//! - this golden hex→cylinder→thread CUT **tessellate-crashes**.
+//! - cylinder then thread CUT fails (`revolve-ring fallback is disabled`).
+//! Do not "fix" that by teaching thread-first in the prompt.
 
 use kernel::ir::CadDocument;
 
