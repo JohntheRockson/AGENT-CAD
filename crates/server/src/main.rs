@@ -84,6 +84,17 @@ Convert the user's description into a CadDocument: one or more independent bodie
 - `size` is an ISO/UN designation (`M8`, `M8x1`, `1/4-20`). The kernel cuts a **helix**, not stacked rings.
 - M8 coarse is Ø8 × 1.25 mm (ISO 261). Do not fake threads with patterned tori or revolved grooves.
 
+## Hex-head bolts / fasteners (CRITICAL — OCCT will fail otherwise)
+- NEVER start with `thread` and then fuse/extrude a hex head onto the threaded solid.
+  Helical end-caps cannot boolean-union with a prism (fuse fails). Sketch-on-face of a thread also fails.
+- Correct one-body recipe (copy this):
+  1. Sketch `{ "hex": { "across_flats": "head_width" } }` and extrude `head_height` (ISO M8 wrench size is 13 mm; use 10 mm if the user asked for a 10 mm head).
+  2. Cylinder for the shank that OVERLAPS the head by ~1 mm:
+     `"diameter": 8` (or the thread major), `"height": "bolt_length - head_height + 1"`, `"at": [0, 0, "head_height - 1"]`.
+  3. `{ "op": "thread", "kind": "external", "size": "M8", "length": "bolt_length - head_height", "at": [0, 0, "head_height"] }`
+     On an existing solid this CUTS the helical groove — it does not fuse a second rod.
+- Parameters: `bolt_length`, `head_width`, `head_height`. Reference them by name in features.
+
 ## Multi-body (CRITICAL)
 - Assemblies and multi-part designs MUST be separate bodies (base plate, bracket, shaft, fasteners, lid, …) — never one fused blob.
 - Each body is a complete CadProgram feature list. Holes belong on the body they pierce.
@@ -207,11 +218,12 @@ Coarse pitch is filled in when omitted (M8 → 1.25 mm).
 
 thread  { "op":"thread", "kind":"external"|"internal"|"die"|"tap", "size":"M8",
           "length":<mm>, "at":[x,y,z], "axis":"Z", "hand":"right"|"left" }
-        EXTERNAL / DIE: first feature → threaded cylinder (bolt shank). On an existing
-        solid → cuts a helical groove into a boss at `at` along `axis`.
+        EXTERNAL / DIE: first feature → threaded cylinder (shank only, no head).
+        On an existing solid → cuts a helical groove into a boss at `at` along `axis`.
         INTERNAL / TAP: needs an existing solid. Drills the tap hole and cuts the thread.
         Use hole-style placement: "center":[x,y], "plane":"XY", "through": true.
-        Example M8 bolt shank 20 mm: { "op":"thread", "kind":"external", "size":"M8", "length":20 }
+        WRONG: thread first, then fuse a hex/cylinder head on top (boolean fails).
+        RIGHT: hex extrude → overlapping cylinder → thread cut. See fastener section.
         Example M8 tapped hole: after a box, { "op":"thread", "kind":"tap", "size":"M8", "center":[0,0], "through":true }
         Do NOT fake threads with stacked toruses. Use this op.
 
@@ -321,12 +333,17 @@ Flange with bolt holes in one sketch: compound outer rect + hole circles, then e
   ]
 }
 
-## Example — M8 bolt shank (external thread / die)
+## Example — M8 hex-head bolt (hex first, overlapping shank, thread CUT)
 {
   "units": "mm",
+  "parameters": { "bolt_length": 40, "head_width": 10, "head_height": 5.5 },
   "features": [
-    { "op": "thread", "kind": "external", "size": "M8", "length": 24, "at": [0, 0, 0], "axis": "Z" },
-    { "op": "cylinder", "diameter": 13, "height": 5.5, "at": [0, 0, 24] }
+    { "op": "sketch", "plane": "XY", "profile": { "hex": { "across_flats": "head_width" } } },
+    { "op": "extrude", "depth": "head_height" },
+    { "op": "cylinder", "diameter": 8, "height": "bolt_length - head_height + 1",
+      "at": [0, 0, "head_height - 1"] },
+    { "op": "thread", "kind": "external", "size": "M8",
+      "length": "bolt_length - head_height", "at": [0, 0, "head_height"] }
   ]
 }
 
@@ -438,16 +455,16 @@ struct ChatRequest {
     /// Prior conversation turns sent by the frontend for multi-turn context.
     #[serde(default)]
     history: Vec<HistoryMessage>,
-  /// Current multi-body document so the agent can patch one body.
-  #[serde(default)]
-  document: Option<CadDocument>,
-  #[serde(default, alias = "targetBodyId")]
-  target_body_id: Option<String>,
-  /// When the user scrubbed the design timeline, this is the active step index.
-  #[serde(default, alias = "timelineStepIndex")]
-  timeline_step_index: Option<u32>,
-  #[serde(default, alias = "timelineStepLabel")]
-  timeline_step_label: Option<String>,
+    /// Current multi-body document so the agent can patch one body.
+    #[serde(default)]
+    document: Option<CadDocument>,
+    #[serde(default, alias = "targetBodyId")]
+    target_body_id: Option<String>,
+    /// When the user scrubbed the design timeline, this is the active step index.
+    #[serde(default, alias = "timelineStepIndex")]
+    timeline_step_index: Option<u32>,
+    #[serde(default, alias = "timelineStepLabel")]
+    timeline_step_label: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -462,13 +479,24 @@ struct HistoryMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ChatSseEvent {
     ThinkingStart,
-    ThinkingDelta { text: String },
-    ThinkingDone { ms: u64 },
+    ThinkingDelta {
+        text: String,
+    },
+    ThinkingDone {
+        ms: u64,
+    },
     WritingStart,
-    WritingDone { ms: u64 },
-    Repair { attempt: u32, error: String },
+    WritingDone {
+        ms: u64,
+    },
+    Repair {
+        attempt: u32,
+        error: String,
+    },
     CalculatingStart,
-    CalculatingDone { ms: u64 },
+    CalculatingDone {
+        ms: u64,
+    },
     VerifyingStart,
     VerifyingDone {
         ms: u64,
@@ -570,9 +598,7 @@ async fn health_handler() -> &'static str {
 }
 
 /// POST /api/verify — deterministic structural checks (no LLM).
-async fn verify_handler(
-    Json(body): Json<RunRequest>,
-) -> Json<serde_json::Value> {
+async fn verify_handler(Json(body): Json<RunRequest>) -> Json<serde_json::Value> {
     let document = match scene_from_values(body.document, body.program) {
         Ok(d) => d,
         Err(e) => {
@@ -754,13 +780,19 @@ async fn emit(tx: &SseTx, ev: ChatSseEvent) {
     let _ = tx.send(Ok(Event::default().data(data))).await;
 }
 
-async fn emit_fail(tx: &SseTx, message: impl Into<String>, error: impl Into<String>, attempts: u32) {
+async fn emit_fail(
+    tx: &SseTx,
+    message: impl Into<String>,
+    error: impl Into<String>,
+    attempts: u32,
+    program: Option<serde_json::Value>,
+) {
     emit(
         tx,
         ChatSseEvent::Result {
             success: false,
             message: message.into(),
-            program: None,
+            program,
             mesh: None,
             metrics: None,
             bodies: vec![],
@@ -801,6 +833,7 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
             "Server configuration error: GEMINI_KEY is not set.",
             "Set GEMINI_KEY in the .env file and restart the server.",
             0,
+            None,
         )
         .await;
         return;
@@ -828,6 +861,7 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
 
     const MAX_ATTEMPTS: u32 = 6;
     let mut last_error = String::from("Unknown error");
+    let mut last_document: Option<CadDocument> = None;
 
     for attempt in 1..=MAX_ATTEMPTS {
         let req_body = GeminiRequest {
@@ -886,6 +920,8 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                 continue;
             }
         };
+
+        last_document = Some(document.clone());
 
         if let Err(val_err) = document.validate() {
             last_error = format!("Validation error: {val_err}");
@@ -981,7 +1017,10 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                 }
 
                 match verdict {
-                    VerifyVerdict::Mismatch { reason, document: Some(fixed) } => {
+                    VerifyVerdict::Mismatch {
+                        reason,
+                        document: Some(fixed),
+                    } => {
                         last_error = format!("Result did not match the request: {reason}");
                         tracing::warn!(attempt, %last_error, "verify rejected geometry");
                         emit(
@@ -1064,8 +1103,7 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                                     });
                                     continue;
                                 }
-                                let program_val =
-                                    serde_json::to_value(&fixed).unwrap_or_default();
+                                let program_val = serde_json::to_value(&fixed).unwrap_or_default();
                                 let message = say
                                     .clone()
                                     .filter(|s| !s.trim().is_empty())
@@ -1108,7 +1146,10 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                             }
                         }
                     }
-                    VerifyVerdict::Mismatch { reason, document: None } => {
+                    VerifyVerdict::Mismatch {
+                        reason,
+                        document: None,
+                    } => {
                         last_error = format!("Result did not match the request: {reason}");
                         tracing::warn!(attempt, %last_error, "verify rejected geometry");
                         emit(
@@ -1151,15 +1192,8 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                             .or(say)
                             .filter(|s| !s.trim().is_empty())
                             .unwrap_or_else(|| "Updated the model.".to_string());
-                        emit_success(
-                            &tx,
-                            message,
-                            program_val,
-                            output,
-                            &document.units,
-                            attempt,
-                        )
-                        .await;
+                        emit_success(&tx, message, program_val, output, &document.units, attempt)
+                            .await;
                         return;
                     }
                 }
@@ -1177,9 +1211,10 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                 .await;
                 let topo_hint = topology_hint_for_document(&state.engine, &document).await;
                 let repair = format!(
-                    "The geometry kernel rejected the program: {}.                      Prefer face:\"largest\"|\"top\"|\"bottom\" and edges:\"top\"|\"longest\".                      For hole grids use pattern with scope:\"feature\" after the first hole.                      Body rotation (including Y) and cylinders on X/Y are valid.                      Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude.                      Use cut/hole only after a solid exists.                      {}Fix the CadDocument and return ONLY the corrected JSON object.",
+                    "The geometry kernel rejected the program: {}.                      Prefer face:\"largest\"|\"top\"|\"bottom\" and edges:\"top\"|\"longest\".                      For hole grids use pattern with scope:\"feature\" after the first hole.                      Body rotation (including Y) and cylinders on X/Y are valid.                      Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude.                      Use cut/hole only after a solid exists.                      {}{}Fix the CadDocument and return ONLY the corrected JSON object.",
                     kernel_error_for_model(&kern_err),
-                    topo_hint
+                    topo_hint,
+                    fastener_repair_hint(&last_error),
                 );
                 contents.push(GeminiContent {
                     role: "model".to_string(),
@@ -1195,11 +1230,15 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
     }
 
     tracing::error!(%last_error, "Chat: all repair attempts exhausted");
+    let leftover = last_document
+        .as_ref()
+        .and_then(|d| serde_json::to_value(d).ok());
     emit_fail(
         &tx,
         format!("Could not generate a valid model after {MAX_ATTEMPTS} attempts."),
         last_error,
         MAX_ATTEMPTS,
+        leftover,
     )
     .await;
 }
@@ -1230,8 +1269,12 @@ async fn emit_success(
 }
 
 enum VerifyVerdict {
-    Ok { say: Option<String> },
-    Skipped { say: Option<String> },
+    Ok {
+        say: Option<String>,
+    },
+    Skipped {
+        say: Option<String>,
+    },
     Mismatch {
         reason: String,
         document: Option<CadDocument>,
@@ -1360,7 +1403,12 @@ async fn verify_against_report(
         .candidates
         .into_iter()
         .next()
-        .and_then(|c| c.content.parts.into_iter().find(|p| !p.thought && !p.text.is_empty()))
+        .and_then(|c| {
+            c.content
+                .parts
+                .into_iter()
+                .find(|p| !p.thought && !p.text.is_empty())
+        })
         .map(|p| p.text)
         .unwrap_or_default();
     let json_text = extract_json(&text);
@@ -1575,13 +1623,21 @@ fn kernel_error_for_model(err: &kernel::engine::KernelError) -> String {
         || lower.contains("out of bounds")
         || lower.contains("wasm trap")
         || lower.contains("wasm runtime")
+        || lower.contains("error while executing")
         || lower.contains("memory fault")
     {
-        format!(
-            "{raw} The kernel recovers after a crash; keep rotation and X/Y cylinders."
-        )
+        format!("{raw} The kernel recovers after a crash; keep rotation and X/Y cylinders.")
     } else {
         raw
+    }
+}
+
+fn fastener_repair_hint(err: &str) -> String {
+    let l = err.to_lowercase();
+    if l.contains("fuse") || l.contains("tessellate") || l.contains("thread") {
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Never thread first and fuse a hex head on. Never sketch-on-face onto a threaded end. ".into()
+    } else {
+        String::new()
     }
 }
 
@@ -1590,8 +1646,7 @@ fn parse_agent_payload(
     json_text: &str,
     current: Option<&CadDocument>,
 ) -> Result<(CadDocument, Option<String>), String> {
-    let value: serde_json::Value =
-        serde_json::from_str(json_text).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = serde_json::from_str(json_text).map_err(|e| e.to_string())?;
     let say = value
         .get("say")
         .and_then(|s| s.as_str())
@@ -1620,7 +1675,10 @@ fn parse_agent_payload(
 
 fn compose_user_prompt(body: &ChatRequest) -> String {
     let mut text = body.message.clone();
-    if let (Some(idx), Some(label)) = (body.timeline_step_index, body.timeline_step_label.as_deref()) {
+    if let (Some(idx), Some(label)) = (
+        body.timeline_step_index,
+        body.timeline_step_label.as_deref(),
+    ) {
         text.push_str(&format!(
             "\n\n[AgentCAD] The user is viewing design history step {idx} (\"{label}\"). \
              Edit THIS document state; later timeline steps will be discarded after your change.\n"

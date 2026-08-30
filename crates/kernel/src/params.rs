@@ -30,7 +30,10 @@ const SKIP_STRING_KEYS: &[&str] = &[
 ];
 
 /// Replace `"plate_width"` / `"$plate_width"` / `"a - b"` string leaves with numbers.
-pub fn substitute_refs(value: &mut Value, parameters: &BTreeMap<String, f64>) -> Result<(), String> {
+pub fn substitute_refs(
+    value: &mut Value,
+    parameters: &BTreeMap<String, f64>,
+) -> Result<(), String> {
     if parameters.is_empty() {
         return Ok(());
     }
@@ -86,7 +89,8 @@ fn substitute_node(
 
 fn looks_like_expr(s: &str) -> bool {
     s.chars().any(|c| matches!(c, '+' | '-' | '*' | '/' | '('))
-        && s.chars().any(|c| c.is_ascii_alphabetic() || c.is_ascii_digit())
+        && s.chars()
+            .any(|c| c.is_ascii_alphabetic() || c.is_ascii_digit())
 }
 
 /// Rewrite numeric feature fields so a parameter slider actually changes geometry
@@ -390,7 +394,8 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             i += 1;
             continue;
         }
-        if c.is_ascii_digit() || (c == '.' && i + 1 < b.len() && (b[i + 1] as char).is_ascii_digit())
+        if c.is_ascii_digit()
+            || (c == '.' && i + 1 < b.len() && (b[i + 1] as char).is_ascii_digit())
         {
             let start = i;
             i += 1;
@@ -445,7 +450,10 @@ mod tests {
         let params: BTreeMap<String, f64> =
             serde_json::from_value(doc["parameters"].clone()).unwrap();
         substitute_refs(&mut doc, &params).unwrap();
-        assert_eq!(doc["bodies"][0]["features"][0]["size"], json!([80.0, 40.0, 10.0]));
+        assert_eq!(
+            doc["bodies"][0]["features"][0]["size"],
+            json!([80.0, 40.0, 10.0])
+        );
     }
 
     #[test]
@@ -462,10 +470,7 @@ mod tests {
 
     #[test]
     fn evaluates_subtraction_expr() {
-        let params = BTreeMap::from([
-            ("bolt_length".into(), 40.0),
-            ("head_height".into(), 5.3),
-        ]);
+        let params = BTreeMap::from([("bolt_length".into(), 40.0), ("head_height".into(), 5.3)]);
         assert!((eval_expr("bolt_length - head_height", &params).unwrap() - 34.7).abs() < 1e-9);
     }
 
@@ -502,5 +507,25 @@ mod tests {
         apply_parameter_delta(&mut doc, "bolt_length", 40.0, 50.0);
         let len = doc["bodies"][0]["features"][0]["length"].as_f64().unwrap();
         assert!((len - 44.7).abs() < 0.05, "length={len}");
+    }
+
+    #[test]
+    fn bolt_shank_expressions_eval() {
+        let mut doc = json!({
+            "parameters": { "bolt_length": 40.0, "head_height": 5.5 },
+            "bodies": [{ "features": [
+                { "op": "cylinder", "height": "bolt_length - head_height + 1",
+                  "at": [0, 0, "head_height - 1"] },
+                { "op": "thread", "length": "bolt_length - head_height" }
+            ] }]
+        });
+        substitute_refs(
+            &mut doc,
+            &BTreeMap::from([("bolt_length".into(), 40.0), ("head_height".into(), 5.5)]),
+        )
+        .unwrap();
+        assert!((doc["bodies"][0]["features"][0]["height"].as_f64().unwrap() - 35.5).abs() < 1e-9);
+        assert!((doc["bodies"][0]["features"][0]["at"][2].as_f64().unwrap() - 4.5).abs() < 1e-9);
+        assert!((doc["bodies"][0]["features"][1]["length"].as_f64().unwrap() - 34.5).abs() < 1e-9);
     }
 }
