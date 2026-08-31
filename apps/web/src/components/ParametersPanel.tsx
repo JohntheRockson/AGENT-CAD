@@ -8,15 +8,25 @@ import {
   unitSuffix,
 } from '../lib/document'
 
+/** Treat as unchanged so blur / Enter on the current value does not rebuild. */
+function sameParameterValue(a: number, b: number): boolean {
+  return Math.abs(a - b) < 1e-9
+}
+
+function parseDraft(raw: string): number | null {
+  const value = Number.parseFloat(raw)
+  if (!Number.isFinite(value) || value <= 0) return null
+  return value
+}
+
 export function ParametersPanel() {
   const irCode         = useCadStore((s) => s.irCode)
   const isRunning      = useCadStore((s) => s.isRunning)
   const timeline       = useCadStore((s) => s.timeline)
   const timelineIndex  = useCadStore((s) => s.timelineIndex)
   const setParameter   = useCadStore((s) => s.setParameter)
+
   const [open, setOpen] = useState(true)
-  const [draft, setDraft] = useState<Record<string, string>>({})
-  const debounceRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
 
   const doc = useMemo(() => {
     try {
@@ -29,31 +39,15 @@ export function ParametersPanel() {
   const entries = doc ? parameterEntries(doc) : []
   const atTip = timeline.length === 0 || timelineIndex >= timeline.length - 1
 
-  useEffect(() => {
-    if (!doc) return
-    const next: Record<string, string> = {}
-    for (const [name, value] of parameterEntries(doc)) {
-      next[name] = String(value)
-    }
-    setDraft(next)
-  }, [doc])
-
   const commit = useCallback(
-    (name: string, raw: string) => {
-      const value = Number.parseFloat(raw)
-      if (!Number.isFinite(value) || value <= 0) return
+    (name: string, raw: string, current: number) => {
+      const value = parseDraft(raw)
+      if (value == null) return false
+      if (sameParameterValue(value, current)) return false
       void setParameter(name, value)
+      return true
     },
     [setParameter],
-  )
-
-  const queueCommit = useCallback(
-    (name: string, raw: string) => {
-      setDraft((d) => ({ ...d, [name]: raw }))
-      clearTimeout(debounceRef.current[name])
-      debounceRef.current[name] = setTimeout(() => commit(name, raw), 350)
-    },
-    [commit],
   )
 
   if (!doc || entries.length === 0) {
@@ -76,7 +70,7 @@ export function ParametersPanel() {
   }
 
   return (
-    <div className="absolute top-10 right-2 z-20 w-60 max-h-[min(420px,calc(100%-5rem))]
+    <div className="absolute top-10 right-2 z-20 w-64 max-h-[min(420px,calc(100%-5rem))]
                     flex flex-col rounded-lg border border-border bg-panel/95 shadow-lg backdrop-blur-sm">
       <div className="flex items-center gap-1.5 px-2.5 py-1.5 border-b border-border">
         <SlidersHorizontal size={12} className="text-accent" />
@@ -101,47 +95,15 @@ export function ParametersPanel() {
       )}
 
       <div className="overflow-y-auto py-2 px-2.5 space-y-3 min-h-0">
-        {entries.map(([name, value]) => {
-          const min = Math.max(0.1, value * 0.1)
-          const max = Math.max(min * 2, value * 3)
-          const draftVal = draft[name] ?? String(value)
-          const parsed = Number.parseFloat(draftVal)
-          return (
-            <div key={name} className="space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <label
-                  htmlFor={`param-${name}`}
-                  className="text-[10px] text-gray-300 capitalize truncate"
-                  title={name}
-                >
-                  {formatParameterName(name)}
-                </label>
-                <input
-                  id={`param-${name}`}
-                  type="number"
-                  min={0.01}
-                  step="any"
-                  value={draftVal}
-                  disabled={isRunning}
-                  onChange={(e) => queueCommit(name, e.target.value)}
-                  onBlur={() => commit(name, draftVal)}
-                  className="w-[4.5rem] bg-surface border border-border rounded px-1.5 py-0.5
-                             text-[10px] text-gray-200 font-mono text-right focus:border-accent/50 focus:outline-none"
-                />
-              </div>
-              <input
-                type="range"
-                min={min}
-                max={max}
-                step={(max - min) / 200}
-                value={Number.isFinite(parsed) ? parsed : value}
-                disabled={isRunning}
-                onChange={(e) => queueCommit(name, e.target.value)}
-                className="w-full h-1 accent-accent cursor-pointer disabled:opacity-40"
-              />
-            </div>
-          )
-        })}
+        {entries.map(([name, value]) => (
+          <ParameterRow
+            key={name}
+            name={name}
+            value={value}
+            disabled={isRunning}
+            onCommit={commit}
+          />
+        ))}
       </div>
 
       {isRunning && (
@@ -150,6 +112,137 @@ export function ParametersPanel() {
           Rebuilding…
         </div>
       )}
+    </div>
+  )
+}
+
+function ParameterRow({
+  name,
+  value,
+  disabled,
+  onCommit,
+}: {
+  name: string
+  value: number
+  disabled: boolean
+  onCommit: (name: string, raw: string, current: number) => boolean
+}) {
+  const [draft, setDraft] = useState(String(value))
+  const [editing, setEditing] = useState(false)
+  const draftRef = useRef(draft)
+  const pendingRef = useRef<number | null>(null)
+
+  const writeDraft = (raw: string) => {
+    draftRef.current = raw
+    setDraft(raw)
+  }
+
+  useEffect(() => {
+    if (!editing) {
+      writeDraft(String(value))
+      if (pendingRef.current != null && sameParameterValue(pendingRef.current, value)) {
+        pendingRef.current = null
+      }
+    }
+  }, [value, editing])
+
+  const parsed = Number.parseFloat(draft)
+  const min = Math.max(0.1, value * 0.1)
+  const max = Math.max(min * 2, value * 3)
+  const sliderValue = Number.isFinite(parsed) ? parsed : value
+
+  const finishEdit = () => {
+    const raw = draftRef.current
+    const next = parseDraft(raw)
+    if (next != null && pendingRef.current != null && sameParameterValue(next, pendingRef.current)) {
+      setEditing(false)
+      return
+    }
+    const committed = onCommit(name, raw, value)
+    if (committed && next != null) {
+      pendingRef.current = next
+    } else {
+      writeDraft(String(value))
+    }
+    setEditing(false)
+  }
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <label
+          htmlFor={`param-${name}`}
+          className="text-[10px] text-gray-300 capitalize truncate"
+          title={name}
+        >
+          {formatParameterName(name)}
+        </label>
+        <input
+          id={`param-${name}`}
+          type="text"
+          inputMode="decimal"
+          autoComplete="off"
+          spellCheck={false}
+          value={draft}
+          disabled={disabled}
+          aria-label={`${formatParameterName(name)} value`}
+          onFocus={() => setEditing(true)}
+          onChange={(e) => {
+            setEditing(true)
+            writeDraft(e.target.value)
+          }}
+          onBlur={finishEdit}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              e.currentTarget.blur()
+            }
+            if (e.key === 'Escape') {
+              e.preventDefault()
+              writeDraft(String(value))
+              setEditing(false)
+              e.currentTarget.blur()
+            }
+          }}
+          className="w-[5.25rem] bg-surface border border-border rounded px-1.5 py-0.5
+                     text-[11px] text-gray-200 font-mono text-right tabular-nums
+                     focus:border-accent/50 focus:outline-none"
+        />
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={(max - min) / 200}
+        value={sliderValue}
+        disabled={disabled}
+        aria-label={`${formatParameterName(name)} slider`}
+        onPointerDown={(e) => {
+          setEditing(true)
+          e.currentTarget.setPointerCapture(e.pointerId)
+        }}
+        onChange={(e) => {
+          setEditing(true)
+          writeDraft(e.target.value)
+        }}
+        onPointerUp={finishEdit}
+        onBlur={finishEdit}
+        onKeyUp={(e) => {
+          if (
+            e.key === 'ArrowLeft' ||
+            e.key === 'ArrowRight' ||
+            e.key === 'ArrowUp' ||
+            e.key === 'ArrowDown' ||
+            e.key === 'Home' ||
+            e.key === 'End' ||
+            e.key === 'PageUp' ||
+            e.key === 'PageDown'
+          ) {
+            finishEdit()
+          }
+        }}
+        className="w-full h-1 accent-accent cursor-pointer disabled:opacity-40"
+      />
     </div>
   )
 }

@@ -184,9 +184,11 @@ export const useCadStore = create<CadStore>((set, get) => ({
   },
 
   setParameter: async (name, value) => {
-    get().branchTimeline()
     const doc = currentDocument(get().irCode)
     if (!doc) return
+    const current = doc.parameters?.[name]
+    if (current != null && Math.abs(current - value) < 1e-9) return
+    get().branchTimeline()
     const updated = setDocumentParameter(doc, name, value)
     set({ irCode: prettyDocument(updated) })
     await get().runGeometry({
