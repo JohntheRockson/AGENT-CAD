@@ -217,11 +217,24 @@ pub fn cutter_helix_path(
     z0: f64,
     pts_per_turn: u32,
 ) -> Vec<[f64; 3]> {
+    cutter_helix_path_phased(radius, pitch, height, z0, pts_per_turn, 0.0)
+}
+
+/// `phase_samples` shifts the polyline by a fraction of a step so a second
+/// bead can cover C0 vertex generators the first path leaves behind.
+pub fn cutter_helix_path_phased(
+    radius: f64,
+    pitch: f64,
+    height: f64,
+    z0: f64,
+    pts_per_turn: u32,
+    phase_samples: f64,
+) -> Vec<[f64; 3]> {
     let pitch = pitch.max(1e-9);
     let turns = (height / pitch).max(0.25);
-    let t0 = -CUTTER_SEAM_OVERLAP_TURNS;
-    let t1 = turns + CUTTER_SEAM_OVERLAP_TURNS;
     let ppt = f64::from(pts_per_turn.max(8));
+    let t0 = -CUTTER_SEAM_OVERLAP_TURNS + phase_samples / ppt;
+    let t1 = turns + CUTTER_SEAM_OVERLAP_TURNS + phase_samples / ppt;
     let n = (((t1 - t0) * ppt).ceil() as usize).max(8);
     (0..=n)
         .map(|i| {

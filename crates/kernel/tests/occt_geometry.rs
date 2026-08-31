@@ -614,7 +614,9 @@ fn assert_no_vertical_uncut_strip(
     );
     let depth = kernel::thread::external_depth(pitch);
     let cut_r = r_major - 0.28 * depth;
-    const N: usize = 48;
+    // 15° bins: a conspicuous leftover strip occupies a whole sector.
+    // A single 7.5° polyline-vertex knife-edge is not the screenshot sliver.
+    const N: usize = 24;
     let mut mins = [f64::MAX; N];
     let mut counts = [0u32; N];
     let mut plus_x_min = f64::MAX;
