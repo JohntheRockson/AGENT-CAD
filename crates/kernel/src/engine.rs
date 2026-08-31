@@ -148,15 +148,17 @@ impl Engine {
     }
 
     pub fn execute_document(&self, document: &CadDocument) -> Result<DocumentOutput, KernelError> {
+        let mut document = document.clone();
+        crate::params::bind_independent_bolt_dims(&mut document);
         document.validate()?;
 
         if self.use_occt {
             #[cfg(feature = "occt")]
-            return occt_backend::execute_document_with_occt(document);
+            return occt_backend::execute_document_with_occt(&document);
             #[cfg(not(feature = "occt"))]
             let _ = self.use_occt;
         }
-        mock_backend::execute_document_with_mock(document)
+        mock_backend::execute_document_with_mock(&document)
     }
 
     /// Export the current program to bytes in the requested format.
@@ -181,13 +183,15 @@ impl Engine {
         document: &CadDocument,
         format: &ExportFormat,
     ) -> Result<Vec<u8>, KernelError> {
+        let mut document = document.clone();
+        crate::params::bind_independent_bolt_dims(&mut document);
         document.validate()?;
 
         if self.use_occt {
             #[cfg(feature = "occt")]
-            return occt_backend::export_document_with_occt(document, format);
+            return occt_backend::export_document_with_occt(&document, format);
         }
-        mock_backend::export_document_with_mock(document, format)
+        mock_backend::export_document_with_mock(&document, format)
     }
 }
 
