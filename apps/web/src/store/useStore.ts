@@ -18,6 +18,7 @@ import {
   parseScene,
   parseSceneJson,
   prettyDocument,
+  resolvedParameters,
   setDocumentParameter,
 } from '../lib/document'
 import { makeSnapshot, truncateTimelineLabel } from '../lib/timeline'
@@ -186,7 +187,7 @@ export const useCadStore = create<CadStore>((set, get) => ({
   setParameter: async (name, value) => {
     const doc = currentDocument(get().irCode)
     if (!doc) return
-    const current = doc.parameters?.[name]
+    const current = resolvedParameters(doc)[name]
     if (current != null && Math.abs(current - value) < 1e-9) return
     get().branchTimeline()
     const updated = setDocumentParameter(doc, name, value)

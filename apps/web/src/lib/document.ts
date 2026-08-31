@@ -1,4 +1,4 @@
-import type { CadBody, CadDocument, CadProgram, Feature } from '../types/cad'
+import type { CadBody, CadDocument, CadProgram, Feature, ThreadOp } from '../types/cad'
 
 export const BODY_COLORS = [
   '#4a90e2',
@@ -73,40 +73,86 @@ export function parseSceneJson(text: string): CadDocument {
   return parseScene(JSON.parse(text) as unknown)
 }
 
+const BOLT_LENGTH_NAMES = ['bolt_length', 'overall_length', 'total_length']
+const HEAD_HEIGHT_NAMES = ['head_height', 'hex_height', 'head_depth']
+const DEAD_HEIGHT_NAMES = [
+  'dead_height',
+  'dead_length',
+  'unthreaded_length',
+  'unthreaded_height',
+]
+
+const SKIP_REWRITE_KEYS = new Set([
+  'op',
+  'bodyId',
+  'documentId',
+  'name',
+  'units',
+  'plane',
+  'axis',
+  'kind',
+  'id',
+  'hand',
+])
+
+/**
+ * Named parameters shown in the panel. Golden hex-bolt IR often bakes
+ * `bolt_length` / `head_height` / `dead_height` as feature literals and omits
+ * the parameters map — still surface those three so type-in can drive them.
+ */
+export function resolvedParameters(doc: CadDocument): Record<string, number> {
+  const explicit = { ...(doc.parameters ?? {}) }
+  const inferred = inferBoltParameters(doc)
+  const out: Record<string, number> = { ...explicit }
+  if (!hasNamed(out, BOLT_LENGTH_NAMES) && inferred.bolt_length != null) {
+    out.bolt_length = inferred.bolt_length
+  }
+  if (!hasNamed(out, HEAD_HEIGHT_NAMES) && inferred.head_height != null) {
+    out.head_height = inferred.head_height
+  }
+  if (!hasNamed(out, DEAD_HEIGHT_NAMES) && inferred.dead_height != null) {
+    out.dead_height = inferred.dead_height
+  }
+  return out
+}
+
 export function setDocumentParameter(
   doc: CadDocument,
   name: string,
   value: number,
 ): CadDocument {
-  const old = doc.parameters?.[name]
+  const resolved = resolvedParameters(doc)
+  const old = resolved[name]
   let next: CadDocument = {
     ...doc,
     parameters: {
-      ...(doc.parameters ?? {}),
+      ...resolved,
       [name]: value,
     },
   }
-  if (old != null && Number.isFinite(old) && Math.abs(old - value) > 1e-12) {
-    const replaced = { v: false }
-    next = rewriteNumbers(next, old, value, undefined, replaced) as CadDocument
-    next.parameters = { ...(doc.parameters ?? {}), [name]: value }
-    if (isAxialOverallName(name) && !replaced.v) {
-      const target = maxAxial(next)
-      if (target > 0.05) {
-        next = bumpLargestAxial(next, target, value - old) as CadDocument
-        next.parameters = { ...(doc.parameters ?? {}), [name]: value }
-      }
-    }
+  if (old == null || !Number.isFinite(old) || Math.abs(old - value) <= 1e-12) {
+    return next
   }
+  if (isHeadHeightName(name)) {
+    next = applyHexHeadHeight(next, value)
+    next.parameters = { ...resolved, [name]: value }
+    return next
+  }
+  if (isDeadHeightName(name)) {
+    next = applyDeadHeight(next, old, value)
+    next.parameters = { ...resolved, [name]: value }
+    return next
+  }
+  next = applyParameterDelta(next, name, old, value)
+  next.parameters = { ...resolved, [name]: value }
   return next
 }
 
-const AXIAL_KEYS = new Set(['length', 'depth', 'height'])
-
 /** Scale numbers that match common ratios of the old parameter (hex vertices, halves). */
 function scaleLike(v: number, oldVal: number, newVal: number, key?: string): number | null {
-  const tol = Math.max(Math.abs(oldVal) * 0.002, 0.02)
+  const tol = numberTol(oldVal)
   const axial = key === 'length' || key === 'depth' || key === 'height'
+  // Axial lengths never use hex-vertex ratios (M8 shank 34.7 ≈ 40·√3/2).
   const ratios = axial
     ? [1, 0.5]
     : [1, 0.5, 1 / Math.sqrt(3), Math.sqrt(3) / 2, 2 / Math.sqrt(3), 0.25]
@@ -120,10 +166,68 @@ function scaleLike(v: number, oldVal: number, newVal: number, key?: string): num
   return null
 }
 
-function rewriteNumbers(node: unknown, oldVal: number, newVal: number, key?: string, replaced?: { v: boolean }): unknown {
+function numberTol(oldVal: number): number {
+  return Math.max(Math.abs(oldVal) * 0.002, 0.02)
+}
+
+/**
+ * Kernel-aligned rewrite: overall length never ratio-scales hex `depth` or
+ * independent head/dead literals. Length changes shank cylinder height and
+ * thread extent only.
+ */
+function applyParameterDelta(
+  doc: CadDocument,
+  name: string,
+  oldVal: number,
+  newVal: number,
+): CadDocument {
+  const protectedVals = protectedParameterValues(doc.parameters, name)
+  const axialOverall = isAxialOverallName(name)
+  const replaced = { v: false }
+  let next = rewriteNumbers(
+    doc,
+    oldVal,
+    newVal,
+    undefined,
+    replaced,
+    protectedVals,
+    axialOverall,
+  ) as CadDocument
+  if (axialOverall && !replaced.v) {
+    next = bumpShankAxialFields(next, newVal - oldVal) as CadDocument
+  }
+  return next
+}
+
+function protectedParameterValues(
+  parameters: Record<string, number> | undefined,
+  changing: string,
+): number[] {
+  if (!parameters) return []
+  const out: number[] = []
+  for (const [k, v] of Object.entries(parameters)) {
+    if (k === changing) continue
+    if (!isIndependentBoltDim(k)) continue
+    if (!Number.isFinite(v) || Math.abs(v) < 0.05) continue
+    out.push(v)
+  }
+  return out
+}
+
+function rewriteNumbers(
+  node: unknown,
+  oldVal: number,
+  newVal: number,
+  key: string | undefined,
+  replaced: { v: boolean },
+  protectedVals: number[],
+  axialOverall: boolean,
+): unknown {
   if (node && typeof node === 'object') {
     if (Array.isArray(node)) {
-      return node.map((item) => rewriteNumbers(item, oldVal, newVal, key, replaced))
+      return node.map((item) =>
+        rewriteNumbers(item, oldVal, newVal, key, replaced, protectedVals, axialOverall),
+      )
     }
     const rec = node as Record<string, unknown>
     const out: Record<string, unknown> = {}
@@ -132,82 +236,241 @@ function rewriteNumbers(node: unknown, oldVal: number, newVal: number, key?: str
         out[k] = v
         continue
       }
-      out[k] = rewriteNumbers(v, oldVal, newVal, k, replaced)
+      out[k] = rewriteNumbers(v, oldVal, newVal, k, replaced, protectedVals, axialOverall)
     }
     return out
   }
   if (typeof node === 'number') {
-    if (key && ['op', 'bodyId', 'documentId', 'name', 'units', 'plane', 'axis', 'kind', 'id', 'hand'].includes(key)) {
+    if (key && SKIP_REWRITE_KEYS.has(key)) return node
+    if (protectedVals.some((p) => Math.abs(node - p) <= Math.max(numberTol(p), 0.05))) {
       return node
     }
+    // Hex / fuse extrude depth is the head, not the shank.
+    if (axialOverall && key === 'depth') return node
     const nv = scaleLike(node, oldVal, newVal, key)
     if (nv != null) {
-      if (Math.abs(node - oldVal) <= Math.max(Math.abs(oldVal) * 0.002, 0.02)) {
-        if (replaced) replaced.v = true
-      }
+      if (Math.abs(node - oldVal) <= numberTol(oldVal)) replaced.v = true
       return nv
     }
   }
   return node
 }
 
-function bumpLargestAxial(node: unknown, target: number, delta: number, key?: string): unknown {
+/** Grow/shrink shank cylinder `height` and thread `length` together. Never bump hex `depth`. */
+function bumpShankAxialFields(node: unknown, delta: number): unknown {
   if (node && typeof node === 'object') {
     if (Array.isArray(node)) {
-      return node.map((item) => bumpLargestAxial(item, target, delta, key))
+      return node.map((item) => bumpShankAxialFields(item, delta))
     }
     const rec = node as Record<string, unknown>
+    const op = rec.op
+    const shankOp = op === 'cylinder' || op === 'thread'
     const out: Record<string, unknown> = {}
     for (const [k, v] of Object.entries(rec)) {
       if (k === 'parameters') {
         out[k] = v
         continue
       }
-      out[k] = bumpLargestAxial(v, target, delta, k)
+      if (shankOp && (k === 'height' || k === 'length') && typeof v === 'number') {
+        out[k] = Math.max(0.05, v + delta)
+        continue
+      }
+      out[k] = bumpShankAxialFields(v, delta)
     }
     return out
-  }
-  if (typeof node === 'number' && key && AXIAL_KEYS.has(key) && Math.abs(node - target) < 1e-9) {
-    return Math.max(0.05, node + delta)
   }
   return node
 }
 
-function maxAxial(node: unknown, key?: string): number {
-  let best = 0
-  const walk = (n: unknown, k?: string) => {
-    if (n && typeof n === 'object') {
-      if (Array.isArray(n)) {
-        n.forEach((item) => walk(item, k))
-        return
-      }
-      for (const [ck, v] of Object.entries(n as Record<string, unknown>)) {
-        if (ck === 'parameters') continue
-        walk(v, ck)
-      }
-      return
-    }
-    if (typeof n === 'number' && k && AXIAL_KEYS.has(k) && n > best) best = n
-  }
-  walk(node, key)
-  return best
+function isIndependentBoltDim(name: string): boolean {
+  const n = name.toLowerCase()
+  return (
+    n === 'head_height' ||
+    n === 'hex_height' ||
+    n === 'head_width' ||
+    n === 'hex_width' ||
+    n === 'across_flats' ||
+    n === 'dead_height' ||
+    n === 'dead_length' ||
+    n === 'unthreaded_length' ||
+    n === 'unthreaded_height' ||
+    n.includes('head_height') ||
+    n.includes('dead_height') ||
+    n.includes('dead_length') ||
+    n.includes('unthreaded')
+  )
+}
+
+function isHeadHeightName(name: string): boolean {
+  const n = name.toLowerCase()
+  return HEAD_HEIGHT_NAMES.includes(n) || n.includes('head_height')
+}
+
+function isDeadHeightName(name: string): boolean {
+  const n = name.toLowerCase()
+  return (
+    DEAD_HEIGHT_NAMES.includes(n) ||
+    n.includes('dead_height') ||
+    n.includes('dead_length') ||
+    n.includes('unthreaded')
+  )
 }
 
 function isAxialOverallName(name: string): boolean {
   const n = name.toLowerCase()
+  if (isIndependentBoltDim(n)) return false
   return (
     n === 'length' ||
     n === 'height' ||
     n === 'bolt_length' ||
     n === 'overall_length' ||
     n === 'total_length' ||
-    (n.endsWith('_length') && !n.includes('head') && !n.includes('pitch'))
+    (n.endsWith('_length') && !n.includes('head') && !n.includes('pitch') && !n.includes('dead'))
   )
 }
 
+function hasNamed(params: Record<string, number>, names: string[]): boolean {
+  return names.some((n) => Number.isFinite(params[n]))
+}
+
+function featureHasHex(feat: Feature): boolean {
+  if (feat.op === 'sketch' || feat.op === 'fuse' || feat.op === 'cut') {
+    return 'hex' in feat.profile
+  }
+  return false
+}
+
+function hexBeforeThread(features: Feature[]): boolean {
+  const hexI = features.findIndex(featureHasHex)
+  const threadI = features.findIndex((f) => f.op === 'thread')
+  if (hexI >= 0 && threadI >= 0) return hexI < threadI
+  return hexI >= 0
+}
+
+/** Infer golden-M8 envelope dims from hex + thread feature literals. */
+export function inferBoltParameters(doc: CadDocument): {
+  bolt_length?: number
+  head_height?: number
+  dead_height?: number
+} {
+  for (const body of doc.bodies) {
+    const dims = inferBoltDims(body.features ?? [])
+    if (dims) return dims
+  }
+  return {}
+}
+
+function inferBoltDims(features: Feature[]): {
+  bolt_length: number
+  head_height: number
+  dead_height: number
+} | null {
+  if (!features.some(featureHasHex) || !features.some((f) => f.op === 'thread')) {
+    return null
+  }
+  const hexFirst = hexBeforeThread(features)
+  let headHeight: number | undefined
+  let pendingHex = false
+  for (const feat of features) {
+    if (featureHasHex(feat)) {
+      if (feat.op === 'sketch') pendingHex = true
+      if (feat.op === 'fuse' && typeof feat.depth === 'number') {
+        headHeight = feat.depth
+      }
+    } else if (feat.op === 'extrude' && pendingHex && typeof feat.depth === 'number') {
+      headHeight = feat.depth
+      pendingHex = false
+    } else if (feat.op !== 'sketch') {
+      pendingHex = false
+    }
+  }
+  if (headHeight == null || !(headHeight > 0)) return null
+
+  const thread = features.find((f) => f.op === 'thread')
+  const cyl = features.find((f) => f.op === 'cylinder')
+  let boltLength: number | undefined
+  let deadHeight = 0
+
+  if (thread && thread.op === 'thread') {
+    const tz = thread.at?.[2] ?? 0
+    const tlen = thread.length
+    if (typeof tlen === 'number' && tlen > 0) {
+      if (hexFirst) {
+        deadHeight = Math.max(0, tz - headHeight)
+        boltLength = tz + tlen
+      } else {
+        boltLength = tlen + headHeight + deadHeight
+      }
+    }
+  }
+  if (boltLength == null && cyl && cyl.op === 'cylinder' && typeof cyl.height === 'number') {
+    const cz = cyl.at?.[2] ?? 0
+    boltLength = cz + cyl.height
+  }
+  if (boltLength == null || !(boltLength > 0)) return null
+  return { bolt_length: boltLength, head_height: headHeight, dead_height: deadHeight }
+}
+
+/** `head_height` drives hex extrude/fuse depth only — not shank or thread. */
+function applyHexHeadHeight(doc: CadDocument, value: number): CadDocument {
+  return {
+    ...doc,
+    bodies: doc.bodies.map((body) => ({
+      ...body,
+      features: patchHexDepth(body.features, value),
+    })),
+  }
+}
+
+function patchHexDepth(features: Feature[], value: number): Feature[] {
+  let pendingHex = false
+  return features.map((feat) => {
+    if (featureHasHex(feat)) {
+      if (feat.op === 'sketch') {
+        pendingHex = true
+        return feat
+      }
+      if (feat.op === 'fuse') {
+        pendingHex = false
+        return { ...feat, depth: value }
+      }
+      pendingHex = false
+      return feat
+    }
+    if (feat.op === 'extrude' && pendingHex) {
+      pendingHex = false
+      return { ...feat, depth: value }
+    }
+    if (feat.op !== 'sketch') pendingHex = false
+    return feat
+  })
+}
+
+/** `dead_height` moves thread start (and shortens/lengthens the bead) without touching hex. */
+function applyDeadHeight(doc: CadDocument, oldVal: number, newVal: number): CadDocument {
+  const delta = newVal - oldVal
+  return {
+    ...doc,
+    bodies: doc.bodies.map((body) => ({
+      ...body,
+      features: body.features.map((feat) => {
+        if (feat.op !== 'thread') return feat
+        const at = feat.at ?? [0, 0, 0]
+        const next: ThreadOp = {
+          ...feat,
+          at: [at[0], at[1], at[2] + delta],
+        }
+        if (typeof feat.length === 'number') {
+          next.length = Math.max(0.05, feat.length - delta)
+        }
+        return next
+      }),
+    })),
+  }
+}
+
 export function parameterEntries(doc: CadDocument): Array<[string, number]> {
-  const p = doc.parameters ?? {}
-  return Object.entries(p).sort(([a], [b]) => a.localeCompare(b))
+  return Object.entries(resolvedParameters(doc)).sort(([a], [b]) => a.localeCompare(b))
 }
 
 export function formatParameterName(name: string): string {
