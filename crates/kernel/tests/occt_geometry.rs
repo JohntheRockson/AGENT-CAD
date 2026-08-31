@@ -510,7 +510,9 @@ fn m8_external_thread_builds() {
         variation > 0.08,
         "thread should be helical (radius varies around a slice); variation={variation} — stacked rings are axisymmetric"
     );
-    let spread = angular_radius_spread_at_z(&out.mesh, (zmin + zmax) * 0.5, 0.2);
+    // Band must be thinner than the ISO P/8 crest (~0.16 mm). A 0.2 mm
+    // slab smears a real M8 crest into every yaw bin and looks like rings.
+    let spread = angular_radius_spread_at_z(&out.mesh, (zmin + zmax) * 0.5, 0.08);
     assert!(
         spread > 0.25,
         "groove should sit on one side of a z-slice (helix), not all around (rings); spread={spread}"
@@ -521,6 +523,7 @@ fn m8_external_thread_builds() {
         "groove must walk around the shank (helix); distinct yaws over one thread={n_yaws} (rings stay in 1-2 bins)"
     );
     assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 1.2, zmin + 6.5);
+    assert_iso_v_thread_profile(&out.mesh, 4.0, 1.25, zmin + 1.2, zmin + 6.5);
     if let Ok(path) = std::env::var("AGENTCAD_DUMP_MESH_SHORT") {
         std::fs::write(&path, kernel::export::to_obj(&out.mesh)).expect("dump mesh");
     }
@@ -815,6 +818,140 @@ fn angular_radius_spread_at_z(mesh: &kernel::engine::MeshData, z: f64, band: f64
         - vals.iter().copied().fold(f64::INFINITY, f64::min)
 }
 
+/// Sample (x,y,z) on the shank: vertices plus triangle centroids so coarse
+/// flank tessellation still shows up in helix-phase bins.
+fn shank_samples(mesh: &kernel::engine::MeshData, z0: f64, z1: f64, r_min: f64) -> Vec<[f64; 3]> {
+    let mut pts = Vec::new();
+    for chunk in mesh.positions.chunks(3) {
+        if chunk.len() < 3 {
+            continue;
+        }
+        let p = [chunk[0] as f64, chunk[1] as f64, chunk[2] as f64];
+        if p[2] >= z0 && p[2] <= z1 && (p[0] * p[0] + p[1] * p[1]).sqrt() >= r_min {
+            pts.push(p);
+        }
+    }
+    let tris: Vec<[usize; 3]> = if mesh.indices.is_empty() {
+        (0..mesh.positions.len() / 9)
+            .map(|t| [t * 3, t * 3 + 1, t * 3 + 2])
+            .collect()
+    } else {
+        mesh.indices
+            .chunks(3)
+            .filter_map(|c| {
+                (c.len() == 3).then_some([c[0] as usize, c[1] as usize, c[2] as usize])
+            })
+            .collect()
+    };
+    for [a, b, c] in tris {
+        let pa = [
+            mesh.positions[a * 3] as f64,
+            mesh.positions[a * 3 + 1] as f64,
+            mesh.positions[a * 3 + 2] as f64,
+        ];
+        let pb = [
+            mesh.positions[b * 3] as f64,
+            mesh.positions[b * 3 + 1] as f64,
+            mesh.positions[b * 3 + 2] as f64,
+        ];
+        let pc = [
+            mesh.positions[c * 3] as f64,
+            mesh.positions[c * 3 + 1] as f64,
+            mesh.positions[c * 3 + 2] as f64,
+        ];
+        let g = [
+            (pa[0] + pb[0] + pc[0]) / 3.0,
+            (pa[1] + pb[1] + pc[1]) / 3.0,
+            (pa[2] + pb[2] + pc[2]) / 3.0,
+        ];
+        if g[2] >= z0 && g[2] <= z1 && (g[0] * g[0] + g[1] * g[1]).sqrt() >= r_min {
+            pts.push(g);
+        }
+    }
+    pts
+}
+
+/// Fail if the thread form is a boxy/wide bead (screenshot) instead of an
+/// ISO-width groove: ~P/8 crest, 5H/8-class depth, sloped flanks, yaw walks.
+fn assert_iso_v_thread_profile(
+    mesh: &kernel::engine::MeshData,
+    r_major: f64,
+    pitch: f64,
+    z0: f64,
+    z1: f64,
+) {
+    let samples = shank_samples(mesh, z0, z1, r_major * 0.55);
+    assert!(
+        samples.len() >= 80,
+        "too few shank samples ({}) — placeholder or tessellation failed",
+        samples.len()
+    );
+
+    const N: usize = 32;
+    let mut min_r = [f64::MAX; N];
+    let mut counts = [0u32; N];
+    let mut n_flank = 0u32;
+    let mut r_floor = f64::MAX;
+    let depth = kernel::thread::external_depth(pitch);
+    for p in &samples {
+        let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
+        r_floor = r_floor.min(r);
+        if r > r_major - 0.85 * depth && r < r_major - 0.15 {
+            n_flank += 1;
+        }
+        let yaw = p[1].atan2(p[0]);
+        let phase = (p[2] / pitch - yaw / (2.0 * std::f64::consts::PI)).rem_euclid(1.0);
+        let bin = ((phase * N as f64).floor() as usize).min(N - 1);
+        min_r[bin] = min_r[bin].min(r);
+        counts[bin] += 1;
+    }
+    let populated: Vec<usize> = (0..N).filter(|&i| counts[i] >= 1).collect();
+    assert!(
+        populated.len() >= 10,
+        "too few thread-phase bins ({}/{})",
+        populated.len(),
+        N
+    );
+
+    // Pure-crest bins never drop below the major — that is the leftover flat.
+    let crest_bins = populated
+        .iter()
+        .filter(|&&i| min_r[i] > r_major - 0.12)
+        .count();
+    let crest_frac = crest_bins as f64 / populated.len() as f64;
+    assert!(
+        crest_frac < 0.22,
+        "thread crest is boxy/wide: {crest_frac:.2} of pitch stays at the major \
+         (ISO 68-1 crest is ~0.125). Old mid-triangle bead left ~0.40+."
+    );
+    assert!(
+        r_floor < r_major - 0.40 * depth,
+        "groove too shallow (r={r_floor:.3} vs major {r_major}); depth should approach 5H/8"
+    );
+    let crest_r = populated.iter().map(|&i| min_r[i]).fold(0.0_f64, |a, r| a.max(r));
+    assert!(
+        crest_r > r_major - 0.20,
+        "crests were cut away (max leftover r={crest_r:.3}); ISO leaves ~P/8 at the major"
+    );
+    assert!(
+        n_flank >= 20,
+        "flanks missing: only {n_flank} intermediate-r samples \
+         (rectangular bites jump major↔groove)"
+    );
+
+    let n_yaws = distinct_groove_yaws(mesh, z0, z1, 12);
+    assert!(
+        n_yaws >= 5,
+        "groove must still walk around the shank; distinct yaws={n_yaws}"
+    );
+    let mid = 0.5 * (z0 + z1);
+    let spread = angular_radius_spread_at_z(mesh, mid, (pitch * 0.06).clamp(0.06, 0.10));
+    assert!(
+        spread > 0.25,
+        "ISO crest must still be helical at a thin z-slice; spread={spread}"
+    );
+}
+
 #[test]
 fn m8_tap_in_plate_builds() {
     let prog: CadProgram = serde_json::from_str(
@@ -951,7 +1088,7 @@ fn m8_hex_head_bolt_40mm_builds() {
         variation > 0.08,
         "shank should be helical at mid-length; variation={variation}"
     );
-    let spread = angular_radius_spread_at_z(&out.mesh, zmin + 20.0, 0.25);
+    let spread = angular_radius_spread_at_z(&out.mesh, zmin + 20.0, 0.08);
     assert!(
         spread > 0.25,
         "40 mm M8 must look helical, not stacked ticks; angular spread={spread}"
@@ -962,9 +1099,43 @@ fn m8_hex_head_bolt_40mm_builds() {
         "40 mm groove must walk around the shank; distinct yaws={n_yaws}"
     );
     assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    assert_iso_v_thread_profile(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
     if let Ok(path) = std::env::var("AGENTCAD_DUMP_MESH") {
         std::fs::write(&path, kernel::export::to_obj(&out.mesh)).expect("dump mesh");
     }
+}
+
+/// Job 1 regression: viewport M8 must be a 60° V, not the boxy wide-crest bead.
+#[test]
+fn m8_external_thread_is_iso_v_not_boxy() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "cylinder", "diameter": 8, "height": 8, "axis": "Z" },
+            { "op": "thread", "kind": "external", "size": "M8", "length": 8 }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new()
+        .execute(&prog)
+        .expect("M8 V-thread should build");
+    assert!(
+        out.metrics.volume > 50.0,
+        "placeholder volume after V-thread: {}",
+        out.metrics.volume
+    );
+    let major_cyl = std::f64::consts::PI * 4.0 * 4.0 * 8.0;
+    assert!(
+        out.metrics.volume < 0.97 * major_cyl,
+        "V-thread should cut the Ø8 cylinder, vol={}",
+        out.metrics.volume
+    );
+    let [_, _, zmin, _, _, zmax] = out.metrics.bbox;
+    assert_iso_v_thread_profile(&out.mesh, 4.0, 1.25, zmin + 1.2, zmin + 6.5);
+    assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 1.2, zmin + 6.5);
+    let _ = zmax;
 }
 
 /// Cylinder + helical thread CUT (short enough to boolean for real, not instance).
@@ -1012,6 +1183,7 @@ fn cylinder_plus_helical_thread_cut_has_no_vertical_sliver() {
         "groove must walk around the shank; distinct yaws={n_yaws} (rings stay in 1-2 bins)"
     );
     assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 1.2, zmin + 6.5);
+    assert_iso_v_thread_profile(&out.mesh, 4.0, 1.25, zmin + 1.2, zmin + 6.5);
 }
 
 /// Agent often threads first then fuses a hex head — that boolean used to crash.
@@ -1113,4 +1285,5 @@ fn m8_bolt_40mm_document_has_no_vertical_sliver() {
         std::fs::write(&path, kernel::export::to_obj(mesh)).expect("dump mesh");
     }
     assert_no_vertical_uncut_strip(mesh, 4.0, 1.25, zmin + 8.0, zmin + 36.0);
+    assert_iso_v_thread_profile(mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
 }
