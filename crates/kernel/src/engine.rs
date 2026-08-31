@@ -2747,7 +2747,17 @@ pub(crate) mod occt_backend {
         if let Ok(cutter) = thread_cutter(k, major, pitch, length, false, 0.0) {
             if let Ok(cutter) = place(k, cutter) {
                 if let Ok(raw) = k.cut(solid, cutter) {
-                    let out = drawable_shape(k, raw);
+                    let mut out = drawable_shape(k, raw);
+                    // A few degrees of extra phase wipes any leftover generator
+                    // without turning the groove into a second start.
+                    if let Ok(nudge) = k.rotate(cutter, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.14) {
+                        if let Ok(raw2) = k.cut(out, nudge) {
+                            let second = drawable_shape(k, raw2);
+                            if shape_has_extent(k, second) {
+                                out = second;
+                            }
+                        }
+                    }
                     if shape_has_extent(k, out) {
                         return Ok(out);
                     }
@@ -2827,7 +2837,10 @@ pub(crate) mod occt_backend {
         Err(occt_err("helical V-thread sweep failed"))
     }
 
-    /// Helical circular groove — a thin bead on a polyline helix, never rings.
+    /// Helical circular groove — a thin bead on a helix, never rings.
+    ///
+    /// Prefer a G1 OCCT helix: a C0 polyline left thin generator slivers at
+    /// vertex yaws (the leftover vertical strips on an otherwise good cut).
     fn helical_round_groove(
         k: &mut occt_wasm::OcctKernel,
         major: f64,
@@ -2845,24 +2858,69 @@ pub(crate) mod occt_backend {
         let sec_r = (depth * 0.55).max(pitch * 0.18);
         let z_start = z0 - pitch * 0.12;
         let height = (length + pitch).max(pitch * 2.0);
+        let overlap_z = crate::thread::CUTTER_SEAM_OVERLAP_TURNS * pitch;
+        let a0 = -crate::thread::CUTTER_SEAM_OVERLAP_TURNS * 2.0 * PI;
+        if let Ok(spine) = k.make_helix_wire(
+            0.0,
+            0.0,
+            z_start - overlap_z,
+            0.0,
+            0.0,
+            1.0,
+            pitch,
+            height + 2.0 * overlap_z,
+            r_h,
+        ) {
+            let spine = k
+                .rotate(spine, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, a0)
+                .unwrap_or(spine);
+            if let Ok(s) = pipe_thread_bead(k, spine, r_h, sec_r, pitch, z_start) {
+                return Ok(s);
+            }
+        }
         let path = crate::thread::cutter_helix_path(
             r_h,
             pitch,
             height,
             z_start,
-            thread_polyline_samples(height, pitch),
+            thread_polyline_samples(height, pitch).max(32),
         );
         let poly = wire_from_polyline3(k, &path)?;
-        if let Some(&p0) = path.first() {
-            let yaw = p0[1].atan2(p0[0]);
-            let square = crate::thread::cutter_meridian_square(r_h, sec_r, yaw, p0[2]);
-            if let Ok(face) = face_from_polygon_3d(k, &square) {
-                if let Ok(s) = pipe_along(k, face, poly) {
-                    return Ok(s);
+        if let Ok(s) = pipe_thread_bead(k, poly, r_h, sec_r, pitch, z_start) {
+            return Ok(s);
+        }
+        helix_solid(k, poly, r_h, pitch, height, sec_r, false)
+    }
+
+    /// Circular bead first (no 90° dead meridians), then the historical square.
+    fn pipe_thread_bead(
+        k: &mut occt_wasm::OcctKernel,
+        spine: Handle,
+        r_h: f64,
+        sec_r: f64,
+        pitch: f64,
+        z_start: f64,
+    ) -> Result<Handle, KernelError> {
+        let t0 = -crate::thread::CUTTER_SEAM_OVERLAP_TURNS;
+        let (p0, tang) = crate::thread::cutter_helix_frame(r_h, pitch, t0, z_start);
+        if let Ok(edge) = k.make_circle_edge(p0[0], p0[1], p0[2], tang[0], tang[1], tang[2], sec_r)
+        {
+            if let Ok(wire) = k.make_wire(&[edge]) {
+                if let Ok(face) = k.make_face(wire) {
+                    if let Ok(s) = pipe_along(k, face, spine) {
+                        return Ok(s);
+                    }
                 }
             }
         }
-        helix_solid(k, poly, r_h, pitch, height, sec_r, false)
+        let yaw = p0[1].atan2(p0[0]);
+        let square = crate::thread::cutter_meridian_square(r_h, sec_r, yaw, p0[2]);
+        if let Ok(face) = face_from_polygon_3d(k, &square) {
+            if let Ok(s) = pipe_along(k, face, spine) {
+                return Ok(s);
+            }
+        }
+        Err(occt_err("thread bead pipe failed"))
     }
 
     fn thread_polyline_samples(height: f64, pitch: f64) -> u32 {

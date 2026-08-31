@@ -232,6 +232,20 @@ pub fn cutter_helix_path(
         .collect()
 }
 
+/// Point and tangent (unnormalized) on the cutter helix at turn parameter `t`
+/// (`t = 0` is the first nominal turn, `z = z0`).
+pub fn cutter_helix_frame(radius: f64, pitch: f64, t: f64, z0: f64) -> ([f64; 3], [f64; 3]) {
+    let a = t * 2.0 * std::f64::consts::PI;
+    let (c, s) = (a.cos(), a.sin());
+    let p = [radius * c, radius * s, z0 + t * pitch];
+    let tang = [
+        -radius * 2.0 * std::f64::consts::PI * s,
+        radius * 2.0 * std::f64::consts::PI * c,
+        pitch,
+    ];
+    (p, tang)
+}
+
 /// Square bead in the meridian plane at `yaw` (axis-through-point). Matches
 /// the historical XZ square when `yaw == 0`.
 pub fn cutter_meridian_square(radius: f64, sec_r: f64, yaw: f64, z: f64) -> [[f64; 3]; 4] {
@@ -350,5 +364,12 @@ mod tests {
         let sq = cutter_meridian_square(4.0, 0.4, 0.0, 0.0);
         assert!((sq[0][0] - 3.6).abs() < 1e-12 && sq[0][1].abs() < 1e-12);
         assert!((sq[1][0] - 4.4).abs() < 1e-12 && sq[1][1].abs() < 1e-12);
+    }
+
+    #[test]
+    fn cutter_helix_frame_at_zero_is_plus_x() {
+        let (p, t) = cutter_helix_frame(4.0, 1.25, 0.0, 0.0);
+        assert!((p[0] - 4.0).abs() < 1e-12 && p[1].abs() < 1e-12);
+        assert!(t[1] > 0.0 && t[0].abs() < 1e-12);
     }
 }

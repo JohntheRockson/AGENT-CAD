@@ -652,6 +652,9 @@ fn assert_no_vertical_uncut_strip(
         populated >= N * 2 / 3,
         "too few yaw bins have vertices ({populated}/{N}) — placeholder or tessellation failed"
     );
+    if let Ok(path) = std::env::var("AGENTCAD_DUMP_MESH_SHORT") {
+        let _ = std::fs::write(&path, kernel::export::to_obj(mesh));
+    }
     let mut uncut: Vec<(usize, f64, u32)> = Vec::new();
     for i in 0..N {
         if counts[i] >= 6 && mins[i] > cut_r {
