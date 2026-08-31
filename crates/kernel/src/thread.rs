@@ -382,8 +382,7 @@ pub fn cutter_iso_vee_normal(
 }
 
 /// Circular bead that matches ISO crest (P/8 leftover) and 5H/8 root as
-/// closely as a circle can. MakePipeShell only accepts an in-place disk;
-/// this is the fallback when a lofted V solid cannot be built.
+/// closely as a circle can. MakePipeShell only accepts an in-place disk.
 ///
 /// Returns `(path_radius, section_radius)` in the meridian plane: the
 /// circumcircle of the minor-radius root and the two crest-edge points

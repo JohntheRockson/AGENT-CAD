@@ -2716,12 +2716,9 @@ pub(crate) mod occt_backend {
         internal: bool,
         z0: f64,
     ) -> Result<Handle, KernelError> {
-        // MakePipeShell only accepts an in-place circular Face. A triangular
-        // V cannot be piped (BRepFill_Section), and loft/sew of V sections
-        // poisons the WASM heap on the subsequent boolean. The unique circle
-        // through the ISO 5H/8 root and P/8 crest-edge points is the cutter
-        // that actually cuts: narrow crests, deep groove, Frenet yaw-walk.
-        // Never fall back to a meridian square (rectangular bites).
+        // MakePipeShell only pipes an in-place circular Face. The disk is
+        // the circumcircle of the ISO 5H/8 root and P/8 crest-edge points,
+        // Frenet-piped along the overlapped helix. Never a meridian square.
         helical_round_groove(k, major, pitch, length, internal, z0)
     }
 
@@ -2787,6 +2784,42 @@ pub(crate) mod occt_backend {
         }
     }
 
+    fn pipe_iso_circle_bead(
+        k: &mut occt_wasm::OcctKernel,
+        r_h: f64,
+        sec_r: f64,
+        pitch: f64,
+        height: f64,
+        z0: f64,
+        ppt: u32,
+    ) -> Result<Handle, KernelError> {
+        let path = crate::thread::cutter_helix_path(r_h, pitch, height, z0, ppt);
+        let poly = wire_from_polyline3(k, &path)?;
+        let p0 = path[0];
+        let p1 = path
+            .get(1)
+            .copied()
+            .unwrap_or([p0[0], p0[1], p0[2] + pitch]);
+        let edge = k
+            .make_circle_edge(
+                p0[0],
+                p0[1],
+                p0[2],
+                p1[0] - p0[0],
+                p1[1] - p0[1],
+                p1[2] - p0[2],
+                sec_r,
+            )
+            .map_err(|e| occt_err(format!("ISO bead circle: {e}")))?;
+        let wire = k
+            .make_wire(&[edge])
+            .map_err(|e| occt_err(format!("ISO bead wire: {e}")))?;
+        let face = k
+            .make_face(wire)
+            .map_err(|e| occt_err(format!("ISO bead face: {e}")))?;
+        pipe_thread_cutter(k, face, poly)
+    }
+
     /// Helical groove whose circular section is the circumcircle of the
     /// ISO 5H/8 root and the two P/8 crest-edge points. Frenet-piped along
     /// an overlapped polyline helix so yaw walks and the +X seam closes.
@@ -2805,30 +2838,15 @@ pub(crate) mod occt_backend {
             crate::thread::cutter_iso_circle(major, pitch)
         };
         let height = (length + pitch).max(pitch * 2.0);
-        let path = crate::thread::cutter_helix_path(
+        pipe_iso_circle_bead(
+            k,
             r_h,
+            sec_r,
             pitch,
             height,
             z0,
             thread_polyline_samples(height, pitch),
-        );
-        let poly = wire_from_polyline3(k, &path)?;
-        let p0 = path[0];
-        let p1 = path
-            .get(1)
-            .copied()
-            .unwrap_or([p0[0], p0[1], p0[2] + pitch]);
-        let tang = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-        if let Ok(edge) = k.make_circle_edge(p0[0], p0[1], p0[2], tang[0], tang[1], tang[2], sec_r) {
-            if let Ok(wire) = k.make_wire(&[edge]) {
-                if let Ok(face) = k.make_face(wire) {
-                    if let Ok(s) = pipe_thread_cutter(k, face, poly) {
-                        return Ok(s);
-                    }
-                }
-            }
-        }
-        Err(occt_err("helical ISO-sized circular groove failed"))
+        )
     }
 
     /// Sweep a thread bead with a rolling (Frenet) trihedron so yaw walks

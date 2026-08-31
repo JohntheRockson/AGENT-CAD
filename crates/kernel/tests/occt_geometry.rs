@@ -510,7 +510,9 @@ fn m8_external_thread_builds() {
         variation > 0.08,
         "thread should be helical (radius varies around a slice); variation={variation} — stacked rings are axisymmetric"
     );
-    let spread = angular_radius_spread_at_z(&out.mesh, (zmin + zmax) * 0.5, 0.2);
+    // Band must be thinner than the ISO P/8 crest (~0.16 mm). A 0.2 mm
+    // slab smears a real M8 crest into every yaw bin and looks like rings.
+    let spread = angular_radius_spread_at_z(&out.mesh, (zmin + zmax) * 0.5, 0.08);
     assert!(
         spread > 0.25,
         "groove should sit on one side of a z-slice (helix), not all around (rings); spread={spread}"
@@ -942,6 +944,12 @@ fn assert_iso_v_thread_profile(
         n_yaws >= 5,
         "groove must still walk around the shank; distinct yaws={n_yaws}"
     );
+    let mid = 0.5 * (z0 + z1);
+    let spread = angular_radius_spread_at_z(mesh, mid, (pitch * 0.06).clamp(0.06, 0.10));
+    assert!(
+        spread > 0.25,
+        "ISO crest must still be helical at a thin z-slice; spread={spread}"
+    );
 }
 
 #[test]
@@ -1080,7 +1088,7 @@ fn m8_hex_head_bolt_40mm_builds() {
         variation > 0.08,
         "shank should be helical at mid-length; variation={variation}"
     );
-    let spread = angular_radius_spread_at_z(&out.mesh, zmin + 20.0, 0.25);
+    let spread = angular_radius_spread_at_z(&out.mesh, zmin + 20.0, 0.08);
     assert!(
         spread > 0.25,
         "40 mm M8 must look helical, not stacked ticks; angular spread={spread}"
