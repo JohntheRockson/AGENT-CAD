@@ -3,7 +3,7 @@
 //! Run with: `cargo test -p kernel --features occt --test occt_geometry`
 
 use kernel::engine::Engine;
-use kernel::ir::CadProgram;
+use kernel::ir::{CadDocument, CadProgram};
 
 fn venturi_program() -> CadProgram {
     serde_json::from_str(
@@ -680,6 +680,97 @@ fn assert_no_vertical_uncut_strip(
         plus_x_min <= cut_r,
         "+X meridian still at r={plus_x_min:.3} (cut below {cut_r:.3}) — the screenshot sliver"
     );
+    let panel_z0 = ((z0 + z1) * 0.5 - 4.0).max(z0);
+    let panel_z1 = (panel_z0 + 8.0).min(z1);
+    let panel = max_full_height_uncut_yaw_span_deg(mesh, r_major, panel_z0, panel_z1);
+    assert!(
+        panel < 25.0,
+        "leftover uncut cylinder panel spans {panel:.1}° of yaw — cutter did not roll around the shank"
+    );
+}
+
+/// Largest contiguous yaw span of triangles that sit on the major cylinder
+/// and run most of the shank height — the leftover generator strip.
+fn max_full_height_uncut_yaw_span_deg(
+    mesh: &kernel::engine::MeshData,
+    r_major: f64,
+    z0: f64,
+    z1: f64,
+) -> f64 {
+    let min_zspan = ((z1 - z0) * 0.55).clamp(5.0, 7.5);
+    let r_lo = r_major - 0.08;
+    let r_hi = r_major + 0.15;
+    let tris: Vec<[usize; 3]> = if mesh.indices.is_empty() {
+        (0..mesh.positions.len() / 9)
+            .map(|t| {
+                let i = t * 3;
+                [i, i + 1, i + 2]
+            })
+            .collect()
+    } else {
+        mesh.indices
+            .chunks(3)
+            .filter_map(|c| {
+                if c.len() == 3 {
+                    Some([c[0] as usize, c[1] as usize, c[2] as usize])
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let mut yaws: Vec<f64> = Vec::new();
+    for [a, b, c] in tris {
+        let p = |i: usize| {
+            [
+                mesh.positions[i * 3] as f64,
+                mesh.positions[i * 3 + 1] as f64,
+                mesh.positions[i * 3 + 2] as f64,
+            ]
+        };
+        let pa = p(a);
+        let pb = p(b);
+        let pc = p(c);
+        let rs = [
+            (pa[0] * pa[0] + pa[1] * pa[1]).sqrt(),
+            (pb[0] * pb[0] + pb[1] * pb[1]).sqrt(),
+            (pc[0] * pc[0] + pc[1] * pc[1]).sqrt(),
+        ];
+        if rs.iter().copied().fold(f64::INFINITY, f64::min) < r_lo
+            || rs.iter().copied().fold(0.0_f64, f64::max) > r_hi
+        {
+            continue;
+        }
+        let zs = [pa[2], pb[2], pc[2]];
+        let zspan = zs.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+            - zs.iter().copied().fold(f64::INFINITY, f64::min);
+        if zspan < min_zspan {
+            continue;
+        }
+        let yaw = (pa[1] + pb[1] + pc[1]).atan2(pa[0] + pb[0] + pc[0]);
+        yaws.push(yaw);
+    }
+    if yaws.len() < 3 {
+        return 0.0;
+    }
+    yaws.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut best: f64 = 0.0;
+    let mut run_start = yaws[0];
+    let mut prev = yaws[0];
+    for &y in &yaws[1..] {
+        if y - prev > 0.22 {
+            best = best.max(prev - run_start);
+            run_start = y;
+        }
+        prev = y;
+    }
+    best = best.max(prev - run_start);
+    let wrap = yaws[0] + 2.0 * std::f64::consts::PI - yaws[yaws.len() - 1];
+    if wrap <= 0.22 {
+        let extra = (yaws[0] - (-std::f64::consts::PI)) + (std::f64::consts::PI - yaws[yaws.len() - 1]);
+        best = best.max(extra);
+    }
+    best * 180.0 / std::f64::consts::PI
 }
 
 /// Min radius in each yaw sector. A helix has a groove in some sectors only;
@@ -949,4 +1040,77 @@ fn hex_head_fused_onto_short_thread_does_not_crash() {
         out.metrics.bbox
     );
     assert!(!out.mesh.positions.is_empty());
+}
+
+/// The live golden M8×40 IR (13 mm hex, 34.7 mm thread). Long enough that the
+/// kernel instances short rods on an uncut host — that path must not leave a
+/// generator-line of the original cylinder.
+#[test]
+fn m8_bolt_40mm_document_has_no_vertical_sliver() {
+    let doc: CadDocument = serde_json::from_str(
+        r#"{
+          "documentId": "m8_bolt_40mm",
+          "units": "mm",
+          "parameters": {
+            "bolt_length": 40,
+            "head_height": 5.3,
+            "head_width": 13
+          },
+          "bodies": [
+            {
+              "bodyId": "body_m8_bolt",
+              "name": "M8 Bolt",
+              "visible": true,
+              "suppressed": false,
+              "transform": { "position": [0, 0, 0], "rotation": [0, 0, 0] },
+              "features": [
+                { "id": "sketch", "op": "sketch", "origin": [0, 0], "plane": "XY",
+                  "profile": { "hex": { "across_flats": 13, "at": [0, 0] } } },
+                { "depth": 5.3, "id": "body", "op": "extrude", "symmetric": false },
+                { "at": [0, 0, 4.3], "axis": "Z", "diameter": 8, "height": 35.7, "op": "cylinder" },
+                { "at": [0, 0, 5.3], "axis": "Z", "center": [0, 0], "hand": "right",
+                  "kind": "external", "length": 34.7, "op": "thread", "plane": "XY",
+                  "size": "M8", "through": false }
+              ],
+              "references": []
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let t0 = std::time::Instant::now();
+    let out = Engine::new()
+        .execute_document(&doc)
+        .expect("M8×40 document should build");
+    assert!(
+        t0.elapsed().as_secs() < 25,
+        "40 mm bolt took {:?} — segmented helix must stay viewport-fast",
+        t0.elapsed()
+    );
+    let mesh = &out.bodies[0].mesh;
+    let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
+    assert!(
+        (xmax - xmin).abs() > 12.0 && (ymax - ymin).abs() > 12.0,
+        "expected ~13 mm hex head, bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(
+        (zmax - zmin).abs() > 38.0 && (zmax - zmin).abs() < 48.0,
+        "expected ~40 mm overall, bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(
+        out.metrics.volume > 400.0,
+        "placeholder volume: {}",
+        out.metrics.volume
+    );
+    let n_yaws = distinct_groove_yaws(mesh, zmin + 12.0, zmin + 28.0, 16);
+    assert!(
+        n_yaws >= 5,
+        "groove must walk around the shank; distinct yaws={n_yaws}"
+    );
+    if let Ok(path) = std::env::var("AGENTCAD_DUMP_MESH") {
+        std::fs::write(&path, kernel::export::to_obj(mesh)).expect("dump mesh");
+    }
+    assert_no_vertical_uncut_strip(mesh, 4.0, 1.25, zmin + 8.0, zmin + 36.0);
 }
