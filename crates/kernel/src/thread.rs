@@ -199,6 +199,16 @@ pub fn tap_drill_diameter(major: f64, pitch: f64) -> f64 {
     (major - pitch).max(major * 0.5)
 }
 
+/// ISO 68-1 external minor radius: major/2 − 5H/8.
+pub fn external_minor_radius(major: f64, pitch: f64) -> f64 {
+    major / 2.0 - external_depth(pitch)
+}
+
+/// Flat crest width of an ISO 68-1 external thread (H/8 truncation) = P/8.
+pub fn iso_crest_width(pitch: f64) -> f64 {
+    pitch / 8.0
+}
+
 /// Extra turns swept before θ = 0 and after the last turn.
 ///
 /// The cutter helix used to start and end on +X — the same generator as a
@@ -281,6 +291,96 @@ pub fn cutter_meridian_vee(r_out: f64, r_in: f64, half: f64, yaw: f64, z: f64) -
         [r_out * c, r_out * s, z + 2.0 * half],
         [r_in * c, r_in * s, z + half],
     ]
+}
+
+fn normalize(v: [f64; 3]) -> [f64; 3] {
+    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-15);
+    [v[0] / n, v[1] / n, v[2] / n]
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Frenet-friendly 60° ISO 68-1 V in the plane ⊥ helix tangent.
+///
+/// A meridian-plane V that spans ~1 pitch in Z Frenet-pipes into ring-like
+/// troughs. This section lives in the normal plane (same idea as the circular
+/// bead), so the groove yaws with the helix instead of wrapping into rings.
+///
+/// External: apex at the theoretical sharp root (7H/8 below major) so a
+/// cylinder boolean leaves H/8 crests and 60° flanks. Internal: inverted V
+/// cutting out from the tap-drill wall.
+pub fn cutter_iso_vee_normal(
+    origin: [f64; 3],
+    tang: [f64; 3],
+    major: f64,
+    pitch: f64,
+    internal: bool,
+) -> [[f64; 3]; 3] {
+    let h = triangle_height(pitch);
+    let r_major = major / 2.0;
+    let (r_in, r_out, half) = if internal {
+        let r_hole = tap_drill_diameter(major, pitch) / 2.0;
+        (
+            (r_hole - 0.12 * pitch).max(0.05),
+            r_major + 0.12 * pitch,
+            pitch * 0.45,
+        )
+    } else {
+        // Fundamental triangle: sharp root 7H/8 in, sharp crest H/8 out,
+        // plus a hair of overshoot so the boolean clears the major cylinder.
+        (
+            r_major - 0.875 * h,
+            r_major + 0.125 * h + 0.06 * pitch,
+            pitch * 0.50,
+        )
+    };
+
+    let t = normalize(tang);
+    let rxy = (origin[0] * origin[0] + origin[1] * origin[1]).sqrt();
+    let radial = if rxy < 1e-12 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [origin[0] / rxy, origin[1] / rxy, 0.0]
+    };
+    let n = normalize([
+        radial[0] - t[0] * dot(radial, t),
+        radial[1] - t[1] * dot(radial, t),
+        radial[2] - t[2] * dot(radial, t),
+    ]);
+    let b = normalize(cross(t, n));
+
+    let r_path = rxy;
+    let u_in = r_in - r_path;
+    let u_out = r_out - r_path;
+    let pt = |u: f64, v: f64| -> [f64; 3] {
+        [
+            origin[0] + n[0] * u + b[0] * v,
+            origin[1] + n[1] * u + b[1] * v,
+            origin[2] + n[2] * u + b[2] * v,
+        ]
+    };
+    [pt(u_out, -half), pt(u_in, 0.0), pt(u_out, half)]
+}
+
+/// Path radius through the middle of [`cutter_iso_vee_normal`].
+pub fn cutter_iso_path_radius(major: f64, pitch: f64, internal: bool) -> f64 {
+    if internal {
+        tap_drill_diameter(major, pitch) / 2.0
+    } else {
+        let h = triangle_height(pitch);
+        // Midway between sharp root (major/2 − 7H/8) and overshooting crest.
+        major / 2.0 - 0.375 * h + 0.03 * pitch
+    }
 }
 
 /// Convert a millimetre spec into document units.
@@ -384,5 +484,61 @@ mod tests {
         let (p, t) = cutter_helix_frame(4.0, 1.25, 0.0, 0.0);
         assert!((p[0] - 4.0).abs() < 1e-12 && p[1].abs() < 1e-12);
         assert!(t[1] > 0.0 && t[0].abs() < 1e-12);
+    }
+
+    #[test]
+    fn iso_m8_crest_and_depth() {
+        let p = 1.25;
+        assert!((iso_crest_width(p) - 0.15625).abs() < 1e-12);
+        let depth = external_depth(p);
+        // 5H/8 = 5/8 * √3/2 * P ≈ 0.5413 P
+        assert!((depth - 0.541266 * p).abs() < 1e-4);
+        assert!((external_minor_radius(8.0, p) - (4.0 - depth)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cutter_iso_vee_is_sixty_degree_not_square() {
+        let r = cutter_iso_path_radius(8.0, 1.25, false);
+        let (p0, tang) = cutter_helix_frame(r, 1.25, -CUTTER_SEAM_OVERLAP_TURNS, 0.0);
+        let v = cutter_iso_vee_normal(p0, tang, 8.0, 1.25, false);
+        let apex = v[1];
+        let a = v[0];
+        let c = v[2];
+        let d0 = [
+            a[0] - apex[0],
+            a[1] - apex[1],
+            a[2] - apex[2],
+        ];
+        let d1 = [
+            c[0] - apex[0],
+            c[1] - apex[1],
+            c[2] - apex[2],
+        ];
+        let cos = dot(d0, d1) / (dot(d0, d0).sqrt() * dot(d1, d1).sqrt());
+        let deg = cos.clamp(-1.0, 1.0).acos() * 180.0 / std::f64::consts::PI;
+        assert!(
+            (deg - 60.0).abs() < 8.0,
+            "ISO V included angle should be ~60°, got {deg:.1}° (square bead is 90°)"
+        );
+
+        let r_apex = (apex[0] * apex[0] + apex[1] * apex[1]).sqrt();
+        let r_a = (a[0] * a[0] + a[1] * a[1]).sqrt();
+        let r_c = (c[0] * c[0] + c[1] * c[1]).sqrt();
+        assert!(
+            r_apex < 3.3,
+            "apex must sit at the theoretical root, r={r_apex}"
+        );
+        assert!(
+            r_a > 4.0 && r_c > 4.0,
+            "outer corners must overshoot the major cylinder"
+        );
+
+        // A square/rectangular bead has a wide flat at the major. The ISO V
+        // opening at the major radius is ~0.875 P, leaving only P/8 crest.
+        let opening = ((a[0] - c[0]).powi(2) + (a[1] - c[1]).powi(2) + (a[2] - c[2]).powi(2)).sqrt();
+        assert!(
+            opening > 1.0,
+            "V opening {opening:.3} is too narrow — that is the boxy crest"
+        );
     }
 }

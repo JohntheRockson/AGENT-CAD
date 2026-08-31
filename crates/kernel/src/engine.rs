@@ -1206,9 +1206,9 @@ pub(crate) mod occt_backend {
 
     fn preview_linear(pitch: Option<f64>, level: u8, diag: f64) -> f64 {
         match (pitch, level) {
-            // ~pitch/8: fine enough to see an M8 helix, coarse enough for WASM.
-            (Some(p), 0) => (p * 0.10).clamp(0.08, 0.16),
-            (Some(p), 1) => (p * 0.16).clamp(0.12, 0.22),
+            // ~pitch/12: resolve the 60° V flank without tessellate_relative.
+            (Some(p), 0) => (p * 0.08).clamp(0.07, 0.12),
+            (Some(p), 1) => (p * 0.14).clamp(0.10, 0.18),
             (Some(_), _) => 0.35,
             (None, 0) => (diag * 0.008).clamp(0.06, 0.25),
             (None, 1) => 0.4,
@@ -2716,10 +2716,12 @@ pub(crate) mod occt_backend {
         internal: bool,
         z0: f64,
     ) -> Result<Handle, KernelError> {
-        // Thin helical bead first. A V-profile that spans nearly one pitch in Z
-        // Frenet-pipes into ring-like troughs (the "stacked ticks" look).
-        helical_round_groove(k, major, pitch, length, internal, z0)
+        // ISO 60° V in the helix normal plane. A meridian-plane V that spans
+        // ~1 pitch in Z Frenet-pipes into ring-like troughs; a circular/square
+        // bead leaves wide flat crests (would not fit a nut).
+        helical_iso_v_groove(k, major, pitch, length, internal, z0)
             .or_else(|_| helical_thread_cutter(k, major, pitch, length, internal, z0))
+            .or_else(|_| helical_round_groove(k, major, pitch, length, internal, z0))
     }
 
     /// Prefer one helical cutter. Only chunk if that boolean fails — five
@@ -2784,8 +2786,79 @@ pub(crate) mod occt_backend {
         }
     }
 
-    /// Compact V-groove along a polyline helix we control. The ISO triangle
-    /// that spans ~1 pitch in Z is too tall for OCCT's Frenet pipe.
+    /// ISO 68-1 60° V swept along a helix. Profile sits in the plane ⊥ the
+    /// helix tangent so Frenet-pipe rolls the groove around the shank
+    /// (PR #5/#6) instead of wrapping a tall meridian V into stacked rings.
+    fn helical_iso_v_groove(
+        k: &mut occt_wasm::OcctKernel,
+        major: f64,
+        pitch: f64,
+        length: f64,
+        internal: bool,
+        z0: f64,
+    ) -> Result<Handle, KernelError> {
+        let r_h = crate::thread::cutter_iso_path_radius(major, pitch, internal);
+        let height = (length + pitch * 1.1).max(pitch * 2.0);
+        let (spine, p0, tang) = overlapped_cutter_spine(
+            k,
+            r_h,
+            pitch,
+            height,
+            z0,
+            thread_polyline_samples(height, pitch),
+        )?;
+        let vee = crate::thread::cutter_iso_vee_normal(p0, tang, major, pitch, internal);
+        if let Ok(face) = face_from_polygon_3d(k, &vee) {
+            if let Ok(s) = pipe_thread_cutter(k, face, spine) {
+                return Ok(s);
+            }
+            if let Ok(s) = pipe_along(k, face, spine) {
+                return Ok(s);
+            }
+        }
+        Err(occt_err("helical ISO V-thread sweep failed"))
+    }
+
+    /// Helix spine that starts before the +X hex-vertex seam. Prefer an
+    /// analytic helix (smooth flanks); fall back to a dense polyline.
+    fn overlapped_cutter_spine(
+        k: &mut occt_wasm::OcctKernel,
+        radius: f64,
+        pitch: f64,
+        height: f64,
+        z0: f64,
+        pts_per_turn: u32,
+    ) -> Result<(Handle, [f64; 3], [f64; 3]), KernelError> {
+        let t0 = -crate::thread::CUTTER_SEAM_OVERLAP_TURNS;
+        let (p0, tang) = crate::thread::cutter_helix_frame(radius, pitch, t0, z0);
+        let z_start = z0 + t0 * pitch;
+        let sweep_h = height + 2.0 * crate::thread::CUTTER_SEAM_OVERLAP_TURNS * pitch;
+        if let Ok(wire) = k.make_helix_wire(0.0, 0.0, z_start, 0.0, 0.0, 1.0, pitch, sweep_h, radius)
+        {
+            let yaw0 = p0[1].atan2(p0[0]);
+            if let Ok(sp) = k.rotate(wire, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, yaw0) {
+                return Ok((sp, p0, tang));
+            }
+            if yaw0.abs() < 1e-6 {
+                return Ok((wire, p0, tang));
+            }
+        }
+        let path = crate::thread::cutter_helix_path(radius, pitch, height, z0, pts_per_turn);
+        let poly = wire_from_polyline3(k, &path)?;
+        let p0 = path[0];
+        let p1 = path
+            .get(1)
+            .copied()
+            .unwrap_or([p0[0], p0[1], p0[2] + pitch]);
+        Ok((
+            poly,
+            p0,
+            [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]],
+        ))
+    }
+
+    /// Compact V-groove along a polyline helix we control. Fallback when the
+    /// full ISO triangle cannot be piped; still a V, not a square bead.
     fn helical_thread_cutter(
         k: &mut occt_wasm::OcctKernel,
         major: f64,
@@ -2926,9 +2999,15 @@ pub(crate) mod occt_backend {
     }
 
     fn thread_polyline_samples(height: f64, pitch: f64) -> u32 {
+        // Short cutters only (long Z bolts instance ≤8-turn rods). Spend
+        // points so zoomed flanks are a helix, not rectangular bites.
         let turns = (height / pitch.max(1e-9)).max(0.25);
-        let max_pts = 220.0;
-        ((max_pts / turns).floor() as u32).clamp(16, 40)
+        if turns <= 8.5 {
+            48
+        } else {
+            let max_pts = 220.0;
+            ((max_pts / turns).floor() as u32).clamp(16, 32)
+        }
     }
 
     fn threaded_rod(
