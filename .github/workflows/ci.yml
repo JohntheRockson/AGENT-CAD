@@ -1,0 +1,59 @@
+# PR compile+test CI. Any failing step fails this job (red).
+#
+# Required:
+#   cargo test -p kernel --lib
+#   cargo test -p kernel --test ir_tests
+#   apps/web: npm ci && npm run build  (tsc -b && vite build)
+#
+# occt_geometry is omitted on purpose. It is optional and needs wasmtime to
+# decompress/JIT the bundled OCCT WASM (~21 MB). That is not a reliable
+# default on GitHub-hosted runners, and we will not add mock/stub coverage.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  ci:
+    name: compile and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: kernel lib tests
+        run: cargo test -p kernel --lib
+
+      - name: kernel ir tests
+        run: cargo test -p kernel --test ir_tests
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: apps/web install
+        working-directory: apps/web
+        run: npm ci
+
+      - name: apps/web typecheck and build
+        working-directory: apps/web
+        run: npm run build

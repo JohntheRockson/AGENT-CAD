@@ -1,0 +1,5 @@
+# Pin matches vendor/occt-wasm (edition 2024, rust-version 1.95).
+# Workspace crates are edition 2021; the vendored crate is what requires 1.95.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
