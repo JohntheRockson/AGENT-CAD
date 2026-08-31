@@ -2820,6 +2820,9 @@ pub(crate) mod occt_backend {
         let yaw = p0[1].atan2(p0[0]);
         let pts = crate::thread::cutter_meridian_vee(r_out, r_in, half, yaw, p0[2]);
         if let Ok(face) = face_from_polygon_3d(k, &pts) {
+            if let Ok(s) = pipe_thread_cutter(k, face, poly) {
+                return Ok(s);
+            }
             if let Ok(s) = pipe_along(k, face, poly) {
                 return Ok(s);
             }
@@ -2853,16 +2856,73 @@ pub(crate) mod occt_backend {
             thread_polyline_samples(height, pitch),
         );
         let poly = wire_from_polyline3(k, &path)?;
-        if let Some(&p0) = path.first() {
-            let yaw = p0[1].atan2(p0[0]);
-            let square = crate::thread::cutter_meridian_square(r_h, sec_r, yaw, p0[2]);
-            if let Ok(face) = face_from_polygon_3d(k, &square) {
-                if let Ok(s) = pipe_along(k, face, poly) {
-                    return Ok(s);
+        let p0 = path[0];
+        let p1 = path.get(1).copied().unwrap_or([p0[0], p0[1], p0[2] + pitch]);
+        let tx = p1[0] - p0[0];
+        let ty = p1[1] - p0[1];
+        let tz = p1[2] - p0[2];
+        // Frenet-pipe a circular bead so the groove yaws with the helix.
+        // `pipe_along` prefers MakePipe, which can lock the trihedron and
+        // leave a vertical strip of the original cylinder.
+        if !internal {
+            if let Ok(edge) = k.make_circle_edge(p0[0], p0[1], p0[2], tx, ty, tz, sec_r) {
+                if let Ok(wire) = k.make_wire(&[edge]) {
+                    if let Ok(face) = k.make_face(wire) {
+                        if let Ok(s) = pipe_thread_cutter(k, face, poly) {
+                            return Ok(s);
+                        }
+                    }
                 }
             }
         }
+        let yaw = p0[1].atan2(p0[0]);
+        let square = crate::thread::cutter_meridian_square(r_h, sec_r, yaw, p0[2]);
+        if let Ok(face) = face_from_polygon_3d(k, &square) {
+            if let Ok(s) = pipe_thread_cutter(k, face, poly) {
+                return Ok(s);
+            }
+            if let Ok(s) = pipe_along(k, face, poly) {
+                return Ok(s);
+            }
+        }
         helix_solid(k, poly, r_h, pitch, height, sec_r, false)
+    }
+
+    /// Sweep a thread bead with a rolling (Frenet) trihedron so yaw walks
+    /// around the shank. MakePipe is tried last — it can freeze the section
+    /// and leave the leftover generator strip.
+    fn pipe_thread_cutter(
+        k: &mut occt_wasm::OcctKernel,
+        profile: Handle,
+        spine: Handle,
+    ) -> Result<Handle, KernelError> {
+        let as_solid = |k: &mut occt_wasm::OcctKernel, s: Handle| -> Option<Handle> {
+            let ids = k.get_sub_shapes(s, "solid").ok()?;
+            if ids.is_empty() {
+                k.thicken(s, 0.05, 1e-3).ok().map(|t| unwrap_to_solid(k, t))
+            } else {
+                Some(unwrap_to_solid(k, s))
+            }
+        };
+        for (freenet, smooth) in [(true, true), (true, false)] {
+            if let Ok(s) = k.sweep_pipe_shell(profile, spine, freenet, smooth) {
+                if let Some(sol) = as_solid(k, s) {
+                    return Ok(sol);
+                }
+            }
+        }
+        let wire = k.outer_wire(profile).unwrap_or(profile);
+        if let Ok(s) = k.sweep(wire, spine, 1) {
+            if let Some(sol) = as_solid(k, s) {
+                return Ok(sol);
+            }
+        }
+        if let Ok(s) = k.pipe(profile, spine) {
+            if let Some(sol) = as_solid(k, s) {
+                return Ok(sol);
+            }
+        }
+        Err(occt_err("thread cutter pipe failed"))
     }
 
     fn thread_polyline_samples(height: f64, pitch: f64) -> u32 {
