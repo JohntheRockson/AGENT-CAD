@@ -2,7 +2,7 @@
 //!
 //! Run with: `cargo test -p kernel --features occt --test occt_geometry`
 
-use kernel::engine::Engine;
+use kernel::engine::{Engine, ExportFormat};
 use kernel::ir::{CadDocument, CadProgram};
 
 fn venturi_program() -> CadProgram {
@@ -561,21 +561,26 @@ fn groove_yaw_at_z(mesh: &kernel::engine::MeshData, z: f64, band: f64) -> Option
     for i in 0..N {
         if counts[i] >= 2 && mins[i] < best_r {
             best_r = mins[i];
-            let yaw = (i as f64 + 0.5) / N as f64 * 2.0 * std::f64::consts::PI
-                - std::f64::consts::PI;
+            let yaw =
+                (i as f64 + 0.5) / N as f64 * 2.0 * std::f64::consts::PI - std::f64::consts::PI;
             best = Some(yaw);
         }
     }
     best.filter(|_| best_r < 3.85)
 }
 
-fn distinct_groove_yaws(mesh: &kernel::engine::MeshData, z0: f64, z1: f64, samples: usize) -> usize {
+fn distinct_groove_yaws(
+    mesh: &kernel::engine::MeshData,
+    z0: f64,
+    z1: f64,
+    samples: usize,
+) -> usize {
     let mut bins = std::collections::HashSet::new();
     for i in 0..samples {
         let z = z0 + (z1 - z0) * (i as f64) / (samples as f64);
         if let Some(y) = groove_yaw_at_z(mesh, z, 0.1) {
-            let bin = (((y + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)) * 16.0).floor()
-                as i32;
+            let bin =
+                (((y + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)) * 16.0).floor() as i32;
             bins.insert(bin.rem_euclid(16));
         }
     }
@@ -770,7 +775,8 @@ fn max_full_height_uncut_yaw_span_deg(
     best = best.max(prev - run_start);
     let wrap = yaws[0] + 2.0 * std::f64::consts::PI - yaws[yaws.len() - 1];
     if wrap <= 0.22 {
-        let extra = (yaws[0] - (-std::f64::consts::PI)) + (std::f64::consts::PI - yaws[yaws.len() - 1]);
+        let extra =
+            (yaws[0] - (-std::f64::consts::PI)) + (std::f64::consts::PI - yaws[yaws.len() - 1]);
         best = best.max(extra);
     }
     best * 180.0 / std::f64::consts::PI
@@ -838,9 +844,7 @@ fn shank_samples(mesh: &kernel::engine::MeshData, z0: f64, z1: f64, r_min: f64) 
     } else {
         mesh.indices
             .chunks(3)
-            .filter_map(|c| {
-                (c.len() == 3).then_some([c[0] as usize, c[1] as usize, c[2] as usize])
-            })
+            .filter_map(|c| (c.len() == 3).then_some([c[0] as usize, c[1] as usize, c[2] as usize]))
             .collect()
     };
     for [a, b, c] in tris {
@@ -928,7 +932,10 @@ fn assert_iso_v_thread_profile(
         r_floor < r_major - 0.40 * depth,
         "groove too shallow (r={r_floor:.3} vs major {r_major}); depth should approach 5H/8"
     );
-    let crest_r = populated.iter().map(|&i| min_r[i]).fold(0.0_f64, |a, r| a.max(r));
+    let crest_r = populated
+        .iter()
+        .map(|&i| min_r[i])
+        .fold(0.0_f64, |a, r| a.max(r));
     assert!(
         crest_r > r_major - 0.20,
         "crests were cut away (max leftover r={crest_r:.3}); ISO leaves ~P/8 at the major"
@@ -1103,6 +1110,123 @@ fn m8_hex_head_bolt_40mm_builds() {
     if let Ok(path) = std::env::var("AGENTCAD_DUMP_MESH") {
         std::fs::write(&path, kernel::export::to_obj(&out.mesh)).expect("dump mesh");
     }
+}
+
+fn golden_m8_x40_program() -> CadProgram {
+    serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": { "hex": { "across_flats": 10 } } },
+            { "op": "extrude", "depth": 5.5 },
+            { "op": "cylinder", "diameter": 8, "height": 35.5, "at": [0, 0, 4.5] },
+            { "op": "thread", "kind": "external", "size": "M8", "length": 34.5, "at": [0, 0, 5.5] }
+          ]
+        }"#,
+    )
+    .unwrap()
+}
+
+fn assert_step_is_solid_in_mesh_bbox_family(step: &[u8], mesh_bbox: [f64; 6], label: &str) {
+    assert!(
+        step.len() > 512,
+        "{label}: STEP must be non-empty, got {} bytes",
+        step.len()
+    );
+    let text = std::str::from_utf8(step).unwrap_or("");
+    assert!(
+        text.contains("ISO-10303-21") || text.contains("STEP"),
+        "{label}: missing ISO-10303/STEP header"
+    );
+    assert!(
+        text.contains("MANIFOLD_SOLID_BREP")
+            || text.contains("FACETED_BREP")
+            || text.contains("CLOSED_SHELL")
+            || text.contains("BREP_WITH_VOIDS"),
+        "{label}: STEP does not parse as a solid (no MANIFOLD_SOLID_BREP/CLOSED_SHELL)"
+    );
+    let bb = kernel::export::cartesian_bbox_from_step(step)
+        .unwrap_or_else(|| panic!("{label}: no CARTESIAN_POINT bbox in STEP"));
+    assert!(
+        bbox_same_family(mesh_bbox, bb),
+        "{label}: STEP bbox {bb:?} not in the same family as mesh {mesh_bbox:?}"
+    );
+}
+
+fn bbox_same_family(a: [f64; 6], b: [f64; 6]) -> bool {
+    for i in 0..3 {
+        let ea = (a[i + 3] - a[i]).abs();
+        let eb = (b[i + 3] - b[i]).abs();
+        let tol = 2.0_f64.max(0.15 * ea.max(eb).max(1.0));
+        if (ea - eb).abs() > tol {
+            return false;
+        }
+        let ca = 0.5 * (a[i] + a[i + 3]);
+        let cb = 0.5 * (b[i] + b[i + 3]);
+        if (ca - cb).abs() > 2.0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Golden M8×40 STEP must be a non-empty solid in the mesh bbox family.
+/// Must not WASM-trap. Long thread stays uncut/segmented in STEP (no 27-turn helix).
+#[test]
+fn golden_m8_x40_step_export_is_nonempty_solid() {
+    let prog = golden_m8_x40_program();
+    let engine = Engine::new();
+    let mesh_out = engine
+        .execute(&prog)
+        .expect("golden M8 execute (needed for bbox family)");
+    let mesh_bbox = kernel::engine::bbox_from_positions(&mesh_out.mesh.positions);
+    let t0 = std::time::Instant::now();
+    let step = engine
+        .export(&prog, &ExportFormat::Step)
+        .expect("golden M8×40 STEP must not WASM-trap");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed.as_secs() < 40,
+        "40 mm bolt STEP took {elapsed:?} — must stay seconds, not a minute"
+    );
+    assert_step_is_solid_in_mesh_bbox_family(&step, mesh_bbox, "golden M8×40");
+}
+
+/// Inspector PR #13: hex-only and hex+shank probes crashed the same way as
+/// golden M8. STEP must succeed for those prefixes too.
+#[test]
+fn hex_only_and_hex_shank_step_export_no_wasm_crash() {
+    let engine = Engine::new();
+    let golden = golden_m8_x40_program();
+
+    let hex_only = CadProgram {
+        units: golden.units.clone(),
+        features: golden.features[..2].to_vec(),
+    };
+    let hex_mesh = engine.execute(&hex_only).expect("hex-only execute");
+    let hex_step = engine
+        .export(&hex_only, &ExportFormat::Step)
+        .expect("hex-only STEP must not WASM-trap");
+    assert_step_is_solid_in_mesh_bbox_family(
+        &hex_step,
+        kernel::engine::bbox_from_positions(&hex_mesh.mesh.positions),
+        "hex-only",
+    );
+
+    let hex_shank = CadProgram {
+        units: golden.units.clone(),
+        features: golden.features[..3].to_vec(),
+    };
+    let shank_mesh = engine.execute(&hex_shank).expect("hex+shank execute");
+    let shank_step = engine
+        .export(&hex_shank, &ExportFormat::Step)
+        .expect("hex+shank STEP must not WASM-trap");
+    assert_step_is_solid_in_mesh_bbox_family(
+        &shank_step,
+        kernel::engine::bbox_from_positions(&shank_mesh.mesh.positions),
+        "hex+shank",
+    );
 }
 
 /// Job 1 regression: viewport M8 must be a 60° V, not the boxy wide-crest bead.

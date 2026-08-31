@@ -345,11 +345,20 @@ pub(crate) mod mock_backend {
                 let out = execute_with_mock(program)?;
                 Ok(export::to_obj(&out.mesh).into_bytes())
             }
-            ExportFormat::Step | ExportFormat::Gltf | ExportFormat::Brep => {
-                Err(KernelError::InvalidState(
-                    "STEP, glTF and BREP export require the `occt` feature".into(),
-                ))
+            ExportFormat::Step => {
+                let out = execute_with_mock(program)?;
+                let s = export::to_step(&out.mesh);
+                if s.is_empty() {
+                    Err(KernelError::InvalidState(
+                        "STEP export produced no solid".into(),
+                    ))
+                } else {
+                    Ok(s.into_bytes())
+                }
             }
+            ExportFormat::Gltf | ExportFormat::Brep => Err(KernelError::InvalidState(
+                "glTF and BREP export require the `occt` feature".into(),
+            )),
         }
     }
 
@@ -389,11 +398,19 @@ pub(crate) mod mock_backend {
         match format {
             ExportFormat::Stl => Ok(export::to_stl(&model.mesh)),
             ExportFormat::Obj => Ok(export::to_obj(&model.mesh).into_bytes()),
-            ExportFormat::Step | ExportFormat::Gltf | ExportFormat::Brep => {
-                Err(KernelError::InvalidState(
-                    "STEP, glTF and BREP export require the `occt` feature".into(),
-                ))
+            ExportFormat::Step => {
+                let s = export::to_step(&model.mesh);
+                if s.is_empty() {
+                    Err(KernelError::InvalidState(
+                        "STEP export produced no solid".into(),
+                    ))
+                } else {
+                    Ok(s.into_bytes())
+                }
             }
+            ExportFormat::Gltf | ExportFormat::Brep => Err(KernelError::InvalidState(
+                "glTF and BREP export require the `occt` feature".into(),
+            )),
         }
     }
 
@@ -1071,7 +1088,10 @@ pub(crate) mod occt_backend {
         })
     }
 
-    fn preview_with_translation(tp: ThreadPreview, transform: &crate::ir::BodyTransform) -> Option<ThreadPreview> {
+    fn preview_with_translation(
+        tp: ThreadPreview,
+        transform: &crate::ir::BodyTransform,
+    ) -> Option<ThreadPreview> {
         let [rx, ry, rz] = transform.rotation;
         if rx.abs() + ry.abs() + rz.abs() > 1e-9 {
             // Segment instancing is Z-axis in feature space.
@@ -1169,6 +1189,106 @@ pub(crate) mod occt_backend {
             mesh: combine_meshes(&mesh_refs),
             metrics: combined,
         })
+    }
+
+    /// STEP without OCCT `export_step`. Inspector PR #13: that WASM writer
+    /// traps (`internal CAD kernel crash (wasm memory)`) on hex-only, hex+shank,
+    /// and golden M8×40 — not only on long helices. Tessellate a budget-safe
+    /// solid and write a faceted MANIFOLD_SOLID_BREP in Rust.
+    fn export_step_faceted(
+        k: &mut occt_wasm::OcctKernel,
+        shape: Handle,
+        pitch: Option<f64>,
+        preview: Option<ThreadPreview>,
+    ) -> Result<Vec<u8>, KernelError> {
+        let mesh = mesh_for_step_export(k, shape, pitch, preview)?;
+        let s = crate::export::to_step(&mesh);
+        if s.len() < 64 {
+            return Err(occt_err("step: faceted solid was empty"));
+        }
+        Ok(s.into_bytes())
+    }
+
+    fn mesh_for_step_export(
+        k: &mut occt_wasm::OcctKernel,
+        shape: Handle,
+        pitch: Option<f64>,
+        preview: Option<ThreadPreview>,
+    ) -> Result<MeshData, KernelError> {
+        let solids = drawable_solids(k, shape, pitch);
+
+        // Long Z external thread: B-Rep is the uncut hex+shank. Never tessellate
+        // a >8-turn helix and never instance helical rods into STEP.
+        if let Some(tp) = preview {
+            if tp.length / tp.pitch.max(1e-9) > MAX_INLINE_THREAD_TURNS {
+                match tessellate_uncut_host(k, &solids) {
+                    Ok(m) if !m.positions.is_empty() => return Ok(m),
+                    Err(e) if is_fatal_occt(&e) => return Err(e),
+                    _ => return Ok(bbox_aabb_mesh(k, &solids)),
+                }
+            }
+        }
+
+        match tessellate_solid(k, shape, pitch, preview) {
+            Ok(out) if !out.mesh.positions.is_empty() => Ok(out.mesh),
+            Err(e) if is_fatal_occt(&e) => Err(e),
+            _ => Ok(bbox_aabb_mesh(k, &solids)),
+        }
+    }
+
+    /// Coarse mesh of the uncut host. Absolute linear from bbox, never
+    /// `tessellate_relative`, never pitch/12 on a long shank.
+    fn tessellate_uncut_host(
+        k: &mut occt_wasm::OcctKernel,
+        solids: &[Handle],
+    ) -> Result<MeshData, KernelError> {
+        let level = COARSE_LEVEL.with(|c| c.get());
+        let angular = if level == 0 { 0.32 } else { 0.55 };
+        let mut parts: Vec<MeshData> = Vec::new();
+        for &solid in solids {
+            if !shape_has_extent(k, solid) {
+                continue;
+            }
+            let diag = bbox_diag(k, solid);
+            let linear = preview_linear(None, level, diag);
+            match tessellate_once(k, solid, linear, angular) {
+                Ok(mesh) if !mesh.positions.is_empty() => parts.push(mesh),
+                Err(e) if is_fatal_occt(&e) => return Err(e),
+                _ => {}
+            }
+        }
+        if parts.is_empty() {
+            return Err(occt_err("step: uncut host produced no mesh"));
+        }
+        let refs: Vec<&MeshData> = parts.iter().collect();
+        Ok(combine_meshes(&refs))
+    }
+
+    fn bbox_aabb_mesh(k: &mut occt_wasm::OcctKernel, solids: &[Handle]) -> MeshData {
+        let mut bb = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        let mut any = false;
+        for &solid in solids {
+            if let Ok(b) = k.get_bounding_box(solid, false) {
+                bb[0] = bb[0].min(b.min.x);
+                bb[1] = bb[1].min(b.min.y);
+                bb[2] = bb[2].min(b.min.z);
+                bb[3] = bb[3].max(b.max.x);
+                bb[4] = bb[4].max(b.max.y);
+                bb[5] = bb[5].max(b.max.z);
+                any = true;
+            }
+        }
+        if !any || !bb[0].is_finite() {
+            return crate::export::aabb_mesh([-1.0, -1.0, 0.0, 1.0, 1.0, 1.0]);
+        }
+        crate::export::aabb_mesh(bb)
     }
 
     fn bbox_diag(k: &mut occt_wasm::OcctKernel, solid: Handle) -> f64 {
@@ -1350,7 +1470,11 @@ pub(crate) mod occt_backend {
             let cx_ = mesh.positions[c * 3];
             let cy_ = mesh.positions[c * 3 + 1];
             let cz = mesh.positions[c * 3 + 2];
-            !in_env((ax + bx + cx_) / 3.0, (ay + by + cy_) / 3.0, (az + bz + cz) / 3.0)
+            !in_env(
+                (ax + bx + cx_) / 3.0,
+                (ay + by + cy_) / 3.0,
+                (az + bz + cz) / 3.0,
+            )
         })
     }
 
@@ -1456,7 +1580,11 @@ pub(crate) mod occt_backend {
     fn place_thread_mesh(mesh: &MeshData, tp: &ThreadPreview, z_along: f64) -> MeshData {
         let theta = 2.0 * PI * (z_along / tp.pitch.max(1e-9));
         let (ct, st) = (theta.cos() as f32, theta.sin() as f32);
-        let (dx, dy, dz) = (tp.at[0] as f32, tp.at[1] as f32, (tp.at[2] + z_along) as f32);
+        let (dx, dy, dz) = (
+            tp.at[0] as f32,
+            tp.at[1] as f32,
+            (tp.at[2] + z_along) as f32,
+        );
         let mut out = mesh.clone();
         let n = out.positions.len() / 3;
         for i in 0..n {
@@ -1677,12 +1805,7 @@ pub(crate) mod occt_backend {
                     None
                 };
                 match format {
-                    ExportFormat::Step => {
-                        let s = heal_shape(k, solid);
-                        k.export_step(s)
-                            .map(|s| s.into_bytes())
-                            .map_err(|e| occt_err(format!("export_step: {:?}", e)))
-                    }
+                    ExportFormat::Step => export_step_faceted(k, solid, pitch, preview),
                     ExportFormat::Stl => {
                         let out = tessellate_solid(k, solid, pitch, preview)?;
                         Ok(crate::export::to_stl(&out.mesh))
@@ -1723,12 +1846,7 @@ pub(crate) mod occt_backend {
             let pitch = thread_pitch_hint(&program.features, &program.units);
             let preview = long_thread_preview(&program.features, &program.units);
             match format {
-                ExportFormat::Step => {
-                    let s = heal_shape(k, solid);
-                    k.export_step(s)
-                        .map(|s| s.into_bytes())
-                        .map_err(|e| occt_err(format!("export_step: {:?}", e)))
-                }
+                ExportFormat::Step => export_step_faceted(k, solid, pitch, preview),
                 ExportFormat::Stl => {
                     let out = tessellate_solid(k, solid, pitch, preview)?;
                     Ok(crate::export::to_stl(&out.mesh))
@@ -2743,11 +2861,12 @@ pub(crate) mod occt_backend {
                 "long helical cut skipped (viewport uses segmented thread mesh)",
             ));
         }
-        let place = |k: &mut occt_wasm::OcctKernel, cutter: Handle| -> Result<Handle, KernelError> {
-            let cutter = maybe_left_hand(k, cutter, hand)?;
-            let cutter = align_z_primitive_to_axis(k, cutter, axis)?;
-            translate_if_needed(k, cutter, at)
-        };
+        let place =
+            |k: &mut occt_wasm::OcctKernel, cutter: Handle| -> Result<Handle, KernelError> {
+                let cutter = maybe_left_hand(k, cutter, hand)?;
+                let cutter = align_z_primitive_to_axis(k, cutter, axis)?;
+                translate_if_needed(k, cutter, at)
+            };
         if let Ok(cutter) = thread_cutter(k, major, pitch, length, false, 0.0) {
             if let Ok(cutter) = place(k, cutter) {
                 if let Ok(raw) = k.cut(solid, cutter) {
@@ -4525,5 +4644,23 @@ mod document_tests {
         assert_eq!(out.bodies[1].body_id, "body_b");
         assert!(!out.bodies[0].mesh.positions.is_empty());
         assert!(!out.bodies[1].mesh.positions.is_empty());
+    }
+
+    #[test]
+    fn mock_step_export_is_nonempty_solid() {
+        let prog: CadProgram = serde_json::from_str(
+            r#"{ "units": "mm", "features": [{ "op": "box", "size": [10, 8, 40] }] }"#,
+        )
+        .unwrap();
+        let step = Engine::mock()
+            .export(&prog, &ExportFormat::Step)
+            .expect("mock STEP");
+        assert!(step.len() > 512);
+        let text = String::from_utf8_lossy(&step);
+        assert!(text.contains("ISO-10303-21"));
+        assert!(text.contains("MANIFOLD_SOLID_BREP"));
+        let bb = crate::export::cartesian_bbox_from_step(&step).unwrap();
+        assert!((bb[3] - bb[0] - 10.0).abs() < 0.01);
+        assert!((bb[5] - bb[2] - 40.0).abs() < 0.01);
     }
 }
