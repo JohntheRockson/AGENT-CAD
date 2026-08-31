@@ -1114,3 +1114,96 @@ fn m8_bolt_40mm_document_has_no_vertical_sliver() {
     }
     assert_no_vertical_uncut_strip(mesh, 4.0, 1.25, zmin + 8.0, zmin + 36.0);
 }
+
+/// Head height and dead height must stay put when only `bolt_length` changes.
+/// A uniform Z scale (or bolt_length driving hex extrude depth) is the bug.
+#[test]
+fn m8_bolt_length_keeps_head_and_dead_height() {
+    fn bolt(length: f64) -> CadDocument {
+        CadDocument::from_json_value(serde_json::json!({
+            "documentId": "m8_len",
+            "units": "mm",
+            "parameters": {
+                "bolt_length": length,
+                "head_height": 5.3,
+                "dead_height": 2.0,
+                "head_width": 13.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": "head_width" } } },
+                    { "op": "extrude", "depth": "head_height" },
+                    { "op": "cylinder", "diameter": 8, "axis": "Z",
+                      "height": "bolt_length - head_height + 1",
+                      "at": [0, 0, "head_height - 1"] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": "bolt_length - head_height - dead_height",
+                      "at": [0, 0, "head_height + dead_height"] }
+                ]
+            }]
+        }))
+        .expect("bolt document")
+    }
+
+    let short = Engine::new()
+        .execute_document(&bolt(40.0))
+        .expect("40 mm bolt");
+    let long = Engine::new()
+        .execute_document(&bolt(64.0))
+        .expect("64 mm bolt");
+
+    let head_40 = hex_head_z_extent(&short.bodies[0].mesh, 4.0);
+    let head_64 = hex_head_z_extent(&long.bodies[0].mesh, 4.0);
+    assert!(
+        head_40.2 > 0.5 && head_64.2 > 0.5,
+        "missing hex-head vertices: 40={head_40:?} 64={head_64:?}"
+    );
+    assert!(
+        (head_40.2 - head_64.2).abs() < 0.35,
+        "head Z extent changed with length: 40mm={:.3} 64mm={:.3}",
+        head_40.2,
+        head_64.2
+    );
+    assert!(
+        (head_40.2 - 5.3).abs() < 0.8,
+        "head Z should stay ~head_height 5.3, got {:.3}",
+        head_40.2
+    );
+
+    let z40 = (short.metrics.bbox[5] - short.metrics.bbox[2]).abs();
+    let z64 = (long.metrics.bbox[5] - long.metrics.bbox[2]).abs();
+    assert!(
+        (z64 - z40 - 24.0).abs() < 3.0,
+        "shank/thread Z must grow with length: dz40={z40:.2} dz64={z64:.2}"
+    );
+    assert!(
+        z64 > z40 + 16.0,
+        "overall length did not grow: {z40:.2} → {z64:.2}"
+    );
+}
+
+/// Z span of vertices outside the shank radius (the hex head).
+fn hex_head_z_extent(mesh: &kernel::engine::MeshData, shank_r: f64) -> (f64, f64, f64) {
+    let cut = shank_r + 0.45;
+    let mut z0 = f64::MAX;
+    let mut z1 = f64::MIN;
+    for chunk in mesh.positions.chunks(3) {
+        if chunk.len() < 3 {
+            continue;
+        }
+        let r = (chunk[0] as f64).hypot(chunk[1] as f64);
+        if r > cut {
+            let z = chunk[2] as f64;
+            z0 = z0.min(z);
+            z1 = z1.max(z);
+        }
+    }
+    if z0 > z1 {
+        (0.0, 0.0, 0.0)
+    } else {
+        (z0, z1, z1 - z0)
+    }
+}

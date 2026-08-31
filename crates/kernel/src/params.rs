@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::ir::ValidationError;
+use crate::ir::{CadDocument, Feature, Profile, ThreadKind, ValidationError};
 
 /// Keys whose string values must never be treated as parameter references.
 const SKIP_STRING_KEYS: &[&str] = &[
@@ -95,15 +95,80 @@ fn looks_like_expr(s: &str) -> bool {
 
 /// Rewrite numeric feature fields so a parameter slider actually changes geometry
 /// even when the agent baked literals instead of `"head_width"` refs.
+///
+/// Overall length (`bolt_length`, …) never ratio-scales hex-head `depth` or any
+/// value that already matches an independent param (`head_height`, `dead_height`).
+/// Length changes shank cylinder height and thread extent only.
 pub fn apply_parameter_delta(value: &mut Value, name: &str, old: f64, new: f64) {
     if !old.is_finite() || !new.is_finite() || (old - new).abs() < 1e-12 || old.abs() < 1e-12 {
         return;
     }
+    write_parameter_value(value, name, new);
+    let protected = protected_parameter_values(value, name);
+    let axial_overall = is_axial_overall_name(name);
     let mut replaced_exact = false;
-    rewrite_numbers(value, None, old, new, &mut replaced_exact);
-    if is_axial_overall_name(name) && !replaced_exact {
-        bump_largest_axial_field(value, new - old);
+    rewrite_numbers(
+        value,
+        None,
+        old,
+        new,
+        &mut replaced_exact,
+        &protected,
+        axial_overall,
+    );
+    if axial_overall && !replaced_exact {
+        bump_shank_axial_fields(value, new - old);
     }
+}
+
+fn write_parameter_value(value: &mut Value, name: &str, new: f64) {
+    let Some(params) = value.get_mut("parameters").and_then(|p| p.as_object_mut()) else {
+        return;
+    };
+    if !params.contains_key(name) {
+        return;
+    }
+    if let Some(num) = serde_json::Number::from_f64(new) {
+        params.insert(name.to_string(), Value::Number(num));
+    }
+}
+
+fn protected_parameter_values(value: &Value, changing: &str) -> Vec<f64> {
+    let Some(params) = value.get("parameters").and_then(|p| p.as_object()) else {
+        return Vec::new();
+    };
+    params
+        .iter()
+        .filter_map(|(k, v)| {
+            if k == changing {
+                return None;
+            }
+            if !is_independent_bolt_dim(k) {
+                return None;
+            }
+            v.as_f64()
+        })
+        .collect()
+}
+
+/// Head / dead / wrench size stay put when only overall length changes.
+pub fn is_independent_bolt_dim(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "head_height"
+            | "hex_height"
+            | "head_width"
+            | "hex_width"
+            | "across_flats"
+            | "dead_height"
+            | "dead_length"
+            | "unthreaded_length"
+            | "unthreaded_height"
+    ) || n.contains("head_height")
+        || n.contains("dead_height")
+        || n.contains("dead_length")
+        || n.contains("unthreaded")
 }
 
 fn rewrite_numbers(
@@ -112,6 +177,8 @@ fn rewrite_numbers(
     old: f64,
     new: f64,
     replaced_exact: &mut bool,
+    protected: &[f64],
+    axial_overall: bool,
 ) {
     match node {
         Value::Object(map) => {
@@ -119,12 +186,20 @@ fn rewrite_numbers(
                 if k == "parameters" {
                     continue;
                 }
-                rewrite_numbers(v, Some(k.as_str()), old, new, replaced_exact);
+                rewrite_numbers(
+                    v,
+                    Some(k.as_str()),
+                    old,
+                    new,
+                    replaced_exact,
+                    protected,
+                    axial_overall,
+                );
             }
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                rewrite_numbers(item, key, old, new, replaced_exact);
+                rewrite_numbers(item, key, old, new, replaced_exact, protected, axial_overall);
             }
         }
         Value::Number(n) => {
@@ -147,6 +222,19 @@ fn rewrite_numbers(
             let Some(v) = n.as_f64() else {
                 return;
             };
+            // Head / dead height literals must not ride along with bolt_length.
+            if protected
+                .iter()
+                .any(|p| (v - p).abs() <= number_tol(*p).max(0.05))
+            {
+                return;
+            }
+            // Hex / fuse extrude depth is the head, not the shank. A ratio
+            // match on overall length (depth == L or L/2) is what stretched
+            // the M8 hex into a tall prism.
+            if axial_overall && key == Some("depth") {
+                return;
+            }
             if let Some(nv) = scaled_like(v, old, new, key) {
                 if (v - old).abs() <= number_tol(old) {
                     *replaced_exact = true;
@@ -194,76 +282,183 @@ fn scaled_like(v: f64, old: f64, new: f64, key: Option<&str>) -> Option<f64> {
 
 fn is_axial_overall_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
+    if is_independent_bolt_dim(&n) {
+        return false;
+    }
     matches!(
         n.as_str(),
         "length" | "height" | "bolt_length" | "overall_length" | "total_length"
-    ) || (n.ends_with("_length") && !n.contains("head") && !n.contains("pitch"))
+    ) || (n.ends_with("_length") && !n.contains("head") && !n.contains("pitch") && !n.contains("dead"))
 }
 
-fn bump_largest_axial_field(node: &mut Value, delta: f64) {
-    let mut best_val = 0.0_f64;
-    find_max_axial(node, None, &mut best_val);
-    if best_val <= 0.05 {
-        return;
-    }
-    apply_axial_bump(node, None, best_val, delta);
-}
-
-fn find_max_axial(node: &Value, key: Option<&str>, best: &mut f64) {
+/// Grow/shrink shank cylinder `height` and thread `length` together.
+/// Never bump hex/fuse `depth` — that is head height, not overall length.
+fn bump_shank_axial_fields(node: &mut Value, delta: f64) {
     match node {
         Value::Object(map) => {
-            for (k, v) in map {
-                if k == "parameters" {
-                    continue;
-                }
-                find_max_axial(v, Some(k.as_str()), best);
-            }
-        }
-        Value::Number(n) => {
-            if let Some(v) = n.as_f64() {
-                if key.is_some_and(|k| matches!(k, "length" | "depth" | "height")) && v > *best {
-                    *best = v;
-                }
-            }
-        }
-        Value::Array(arr) => {
-            for v in arr {
-                find_max_axial(v, key, best);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn apply_axial_bump(node: &mut Value, key: Option<&str>, target: f64, delta: f64) {
-    match node {
-        Value::Object(map) => {
+            let op = map.get("op").and_then(|v| v.as_str()).unwrap_or("");
+            let shank_op = matches!(op, "cylinder" | "thread");
             for (k, v) in map.iter_mut() {
                 if k == "parameters" {
                     continue;
                 }
-                apply_axial_bump(v, Some(k.as_str()), target, delta);
+                if shank_op && matches!(k.as_str(), "height" | "length") {
+                    if let Some(n) = v.as_f64() {
+                        let nv = (n + delta).max(0.05);
+                        if let Some(num) = serde_json::Number::from_f64(nv) {
+                            *v = Value::Number(num);
+                        }
+                    }
+                    continue;
+                }
+                bump_shank_axial_fields(v, delta);
             }
         }
         Value::Array(arr) => {
             for v in arr.iter_mut() {
-                apply_axial_bump(v, key, target, delta);
-            }
-        }
-        Value::Number(n) => {
-            if key.is_some_and(|k| matches!(k, "length" | "depth" | "height")) {
-                if let Some(v) = n.as_f64() {
-                    if (v - target).abs() < 1e-9 {
-                        let nv = (v + delta).max(0.05);
-                        if let Some(num) = serde_json::Number::from_f64(nv) {
-                            *node = Value::Number(num);
-                        }
-                    }
-                }
+                bump_shank_axial_fields(v, delta);
             }
         }
         _ => {}
     }
+}
+
+/// Keep hex-head height and unthreaded dead length at their parameter values.
+/// Overall `bolt_length` only changes shank / thread extent.
+pub fn bind_independent_bolt_dims(doc: &mut CadDocument) {
+    if doc.parameters.is_empty() {
+        return;
+    }
+    let head_h = param_named(
+        &doc.parameters,
+        &["head_height", "hex_height", "head_depth"],
+    );
+    let dead_h = param_named(
+        &doc.parameters,
+        &[
+            "dead_height",
+            "dead_length",
+            "unthreaded_length",
+            "unthreaded_height",
+        ],
+    )
+    .unwrap_or(0.0);
+    let bolt_l = param_named(
+        &doc.parameters,
+        &["bolt_length", "overall_length", "total_length"],
+    );
+    let Some(head_h) = head_h else {
+        return;
+    };
+    for body in &mut doc.bodies {
+        if !body_is_hex_bolt(&body.features) {
+            continue;
+        }
+        apply_bolt_envelope(&mut body.features, head_h, dead_h, bolt_l);
+    }
+}
+
+fn param_named(parameters: &BTreeMap<String, f64>, names: &[&str]) -> Option<f64> {
+    for name in names {
+        if let Some(&v) = parameters.get(*name) {
+            if v.is_finite() && v > 0.0 {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn body_is_hex_bolt(features: &[Feature]) -> bool {
+    let has_hex = features.iter().any(feature_has_hex);
+    let has_thread = features.iter().any(|f| matches!(f, Feature::Thread(_)));
+    has_hex && has_thread
+}
+
+fn feature_has_hex(feat: &Feature) -> bool {
+    match feat {
+        Feature::Sketch(op) => matches!(op.profile, Profile::Hex(_)),
+        Feature::Fuse(op) => matches!(op.profile, Profile::Hex(_)),
+        Feature::Cut(op) => matches!(op.profile, Profile::Hex(_)),
+        _ => false,
+    }
+}
+
+fn hex_before_thread(features: &[Feature]) -> bool {
+    let hex_i = features.iter().position(feature_has_hex);
+    let thread_i = features.iter().position(|f| matches!(f, Feature::Thread(_)));
+    match (hex_i, thread_i) {
+        (Some(h), Some(t)) => h < t,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+fn apply_bolt_envelope(
+    features: &mut [Feature],
+    head_h: f64,
+    dead_h: f64,
+    bolt_l: Option<f64>,
+) {
+    let hex_first = hex_before_thread(features);
+    let mut pending_hex_extrude = false;
+    let mut thread_end_z = 0.0_f64;
+    for feat in features.iter_mut() {
+        match feat {
+            Feature::Sketch(op) if matches!(op.profile, Profile::Hex(_)) => {
+                pending_hex_extrude = true;
+            }
+            Feature::Extrude(op) if pending_hex_extrude => {
+                op.depth = head_h;
+                pending_hex_extrude = false;
+            }
+            Feature::Fuse(op) if matches!(op.profile, Profile::Hex(_)) => {
+                op.depth = head_h;
+                if !hex_first {
+                    if let Some(l) = bolt_l {
+                        op.at[2] = (l - head_h).max(0.0);
+                    }
+                }
+            }
+            Feature::Cylinder(op) if hex_first => {
+                if let Some(l) = bolt_l {
+                    let overlap = cylinder_head_overlap(op.at[2], op.height, head_h, l);
+                    op.height = (l - head_h + overlap).max(0.05);
+                    op.at[2] = head_h - overlap;
+                }
+            }
+            Feature::Thread(op) if matches!(op.kind, ThreadKind::External) => {
+                if let Some(l) = bolt_l {
+                    if hex_first {
+                        let start = head_h + dead_h;
+                        op.length = (l - start).max(0.05);
+                        op.at[2] = start;
+                    } else {
+                        op.length = (l - head_h - dead_h).max(0.05);
+                    }
+                    thread_end_z = op.at[2] + op.length;
+                }
+            }
+            _ => {
+                if !matches!(feat, Feature::Sketch(_)) {
+                    pending_hex_extrude = false;
+                }
+            }
+        }
+    }
+    let _ = thread_end_z;
+}
+
+fn cylinder_head_overlap(at_z: f64, height: f64, head_h: f64, bolt_l: f64) -> f64 {
+    let from_at = head_h - at_z;
+    if from_at > 0.05 && from_at < 3.0 {
+        return from_at;
+    }
+    let from_len = height - (bolt_l - head_h);
+    if from_len > 0.05 && from_len < 3.0 {
+        return from_len;
+    }
+    1.0
 }
 
 pub fn validate_parameters(parameters: &BTreeMap<String, f64>) -> Result<(), ValidationError> {
@@ -435,6 +630,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::{CadDocument, Feature};
     use serde_json::json;
 
     #[test]
@@ -507,6 +703,108 @@ mod tests {
         apply_parameter_delta(&mut doc, "bolt_length", 40.0, 50.0);
         let len = doc["bodies"][0]["features"][0]["length"].as_f64().unwrap();
         assert!((len - 44.7).abs() < 0.05, "length={len}");
+    }
+
+    #[test]
+    fn delta_length_does_not_scale_hex_extrude_depth() {
+        // Agent often bakes hex extrude depth equal to bolt_length (or L/2).
+        // Changing length must not stretch that prism.
+        let mut doc = json!({
+            "parameters": { "bolt_length": 40.0, "head_height": 5.3, "head_width": 13.0 },
+            "bodies": [{
+                "features": [
+                    { "op": "sketch", "profile": { "hex": { "across_flats": 13.0 } } },
+                    { "op": "extrude", "depth": 40.0 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "length": 34.7, "size": "M8" }
+                ]
+            }]
+        });
+        apply_parameter_delta(&mut doc, "bolt_length", 40.0, 64.0);
+        let depth = doc["bodies"][0]["features"][1]["depth"].as_f64().unwrap();
+        assert!(
+            (depth - 40.0).abs() < 1e-9 || (depth - 5.3).abs() < 1e-9,
+            "hex extrude must not pick up the new length, depth={depth}"
+        );
+        assert!((depth - 64.0).abs() > 1.0, "head was ratio-scaled to {depth}");
+    }
+
+    #[test]
+    fn delta_length_protects_head_and_dead_height() {
+        let mut doc = json!({
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "dead_height": 2.0,
+                "head_width": 13.0
+            },
+            "bodies": [{
+                "features": [
+                    { "op": "fuse", "depth": 5.3,
+                      "profile": { "hex": { "across_flats": 13.0 } } },
+                    { "op": "thread", "length": 32.7, "size": "M8" }
+                ]
+            }]
+        });
+        apply_parameter_delta(&mut doc, "bolt_length", 40.0, 55.0);
+        let depth = doc["bodies"][0]["features"][0]["depth"].as_f64().unwrap();
+        assert!((depth - 5.3).abs() < 1e-9, "head_height changed: {depth}");
+        let params = doc["parameters"].as_object().unwrap();
+        assert!((params["head_height"].as_f64().unwrap() - 5.3).abs() < 1e-9);
+        assert!((params["dead_height"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+        assert!((params["bolt_length"].as_f64().unwrap() - 55.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bind_snaps_stretched_hex_to_head_height() {
+        let mut doc = CadDocument::from_json_value(json!({
+            "documentId": "m8",
+            "units": "mm",
+            "parameters": { "bolt_length": 64.0, "head_height": 5.3, "dead_height": 1.5 },
+            "bodies": [{
+                "bodyId": "b",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 16.0 },
+                    { "op": "cylinder", "diameter": 8, "height": 60.0, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 50.0, "at": [0, 0, 16.0] }
+                ]
+            }]
+        }))
+        .unwrap();
+        bind_independent_bolt_dims(&mut doc);
+        match &doc.bodies[0].features[1] {
+            Feature::Extrude(op) => assert!(
+                (op.depth - 5.3).abs() < 1e-9,
+                "head depth={}",
+                op.depth
+            ),
+            other => panic!("expected extrude, {other:?}"),
+        }
+        match &doc.bodies[0].features[2] {
+            Feature::Cylinder(op) => {
+                assert!(
+                    (op.height - (64.0 - 5.3 + 1.0)).abs() < 0.05,
+                    "shank height={}",
+                    op.height
+                );
+                assert!((op.at[2] - 4.3).abs() < 0.05, "shank at.z={}", op.at[2]);
+            }
+            other => panic!("expected cylinder, {other:?}"),
+        }
+        match &doc.bodies[0].features[3] {
+            Feature::Thread(op) => {
+                assert!(
+                    (op.length - (64.0 - 5.3 - 1.5)).abs() < 0.05,
+                    "thread length={}",
+                    op.length
+                );
+                assert!((op.at[2] - 6.8).abs() < 0.05, "thread at.z={}", op.at[2]);
+            }
+            other => panic!("expected thread, {other:?}"),
+        }
     }
 
     #[test]

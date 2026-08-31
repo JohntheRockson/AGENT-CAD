@@ -125,6 +125,7 @@ impl CadDocument {
 
         if !parameters.is_empty() {
             doc.parameters = parameters;
+            crate::params::bind_independent_bolt_dims(&mut doc);
         }
         Ok(doc)
     }
@@ -1909,6 +1910,63 @@ mod tests {
                 assert!((op.at[2] - 5.5).abs() < 1e-9, "at.z={}", op.at[2]);
             }
             other => panic!("expected thread, got {other:?}"),
+        }
+    }
+
+    fn bolt_doc_json(bolt_length: f64, head_height: f64, dead_height: f64) -> serde_json::Value {
+        serde_json::json!({
+            "documentId": "m8_bolt",
+            "units": "mm",
+            "parameters": {
+                "bolt_length": bolt_length,
+                "head_width": 13.0,
+                "head_height": head_height,
+                "dead_height": dead_height
+            },
+            "bodies": [{
+                "bodyId": "body_bolt",
+                "name": "M8 bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": "head_width" } } },
+                    { "op": "extrude", "depth": "head_height" },
+                    { "op": "cylinder", "diameter": 8,
+                      "height": "bolt_length - head_height + 1",
+                      "at": [0, 0, "head_height - 1"] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": "bolt_length - head_height - dead_height",
+                      "at": [0, 0, "head_height + dead_height"] }
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn bolt_length_change_keeps_head_and_dead_height() {
+        let a = CadDocument::from_json_value(bolt_doc_json(40.0, 5.3, 2.0)).unwrap();
+        let b = CadDocument::from_json_value(bolt_doc_json(64.0, 5.3, 2.0)).unwrap();
+        match (&a.bodies[0].features[1], &b.bodies[0].features[1]) {
+            (Feature::Extrude(x), Feature::Extrude(y)) => {
+                assert!((x.depth - 5.3).abs() < 1e-9);
+                assert!((y.depth - 5.3).abs() < 1e-9);
+            }
+            _ => panic!("expected extrude"),
+        }
+        match (&a.bodies[0].features[2], &b.bodies[0].features[2]) {
+            (Feature::Cylinder(x), Feature::Cylinder(y)) => {
+                assert!((x.at[2] - 4.3).abs() < 1e-9);
+                assert!((y.at[2] - 4.3).abs() < 1e-9);
+                assert!((y.height - x.height - 24.0).abs() < 1e-9, "{} vs {}", x.height, y.height);
+            }
+            _ => panic!("expected cylinder"),
+        }
+        match (&a.bodies[0].features[3], &b.bodies[0].features[3]) {
+            (Feature::Thread(x), Feature::Thread(y)) => {
+                assert!((x.at[2] - 7.3).abs() < 1e-9);
+                assert!((y.at[2] - 7.3).abs() < 1e-9);
+                assert!((y.length - x.length - 24.0).abs() < 1e-9, "{} vs {}", x.length, y.length);
+            }
+            _ => panic!("expected thread"),
         }
     }
 }
