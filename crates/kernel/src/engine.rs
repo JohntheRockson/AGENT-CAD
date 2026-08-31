@@ -6,7 +6,71 @@
 //! automatically by `crates/server`) to get real OpenCASCADE B-Rep geometry.
 
 use crate::ir::{CadDocument, CadProgram, Feature, Profile};
+use std::cell::Cell;
 use thiserror::Error;
+
+/// Peak WASM budget: an ~8-turn M8 V-groove tessellates; 20+ turns trap.
+/// Long Z external threads must instance ≤8-turn rods instead of meshing the
+/// full uncut host (hex + shank) in one `tessellate` call.
+pub const MAX_INLINE_THREAD_TURNS: f64 = 8.0;
+
+/// Helical turn count for a thread of `length` at `pitch` (both same units).
+pub fn helical_turns(length: f64, pitch: f64) -> f64 {
+    length / pitch.max(1e-9)
+}
+
+/// True when a thread is too long to cut or tessellate as one WASM helix.
+pub fn exceeds_inline_thread_budget(length: f64, pitch: f64) -> bool {
+    helical_turns(length, pitch) > MAX_INLINE_THREAD_TURNS
+}
+
+thread_local! {
+    /// Test hook: make `tessellate_thread_segments` fail so callers can prove
+    /// `tessellate_solid` does not fall through to the uncut long host.
+    static FORCE_THREAD_INSTANCE_FAILURE: Cell<bool> = const { Cell::new(false) };
+    /// How many times we attempted to tessellate a solid whose Z span exceeds
+    /// the inline helix budget (the old fallthrough / full-host path).
+    static LONG_HOST_TESSELLATE_ATTEMPTS: Cell<u32> = const { Cell::new(0) };
+}
+
+fn thread_instance_failure_forced() -> bool {
+    FORCE_THREAD_INSTANCE_FAILURE.with(|c| c.get())
+}
+
+#[cfg_attr(not(feature = "occt"), allow(dead_code))]
+fn record_long_host_tessellate_attempt() {
+    LONG_HOST_TESSELLATE_ATTEMPTS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Force the long-thread instance path to fail (integration-test hook).
+///
+/// Pair with [`take_long_host_tessellate_attempts`]: a regression of the old
+/// fallthrough increments that counter and/or traps WASM.
+pub fn force_thread_instance_failure_for_tests(force: bool) {
+    FORCE_THREAD_INSTANCE_FAILURE.with(|c| c.set(force));
+}
+
+/// Clears and returns the long-host tessellate attempt counter.
+pub fn take_long_host_tessellate_attempts() -> u32 {
+    LONG_HOST_TESSELLATE_ATTEMPTS.with(|c| c.replace(0))
+}
+
+/// Drops the instance-path failure hook even if the test panics.
+pub struct ThreadInstanceFailureGuard {
+    _priv: (),
+}
+
+impl Drop for ThreadInstanceFailureGuard {
+    fn drop(&mut self) {
+        force_thread_instance_failure_for_tests(false);
+    }
+}
+
+/// Fail the next long-thread instance path; reset on drop.
+pub fn with_forced_thread_instance_failure() -> ThreadInstanceFailureGuard {
+    force_thread_instance_failure_for_tests(true);
+    ThreadInstanceFailureGuard { _priv: () }
+}
 
 // ── Output types ─────────────────────────────────────────────────────────────
 
@@ -487,9 +551,6 @@ pub(crate) mod occt_backend {
         Cut,
         Fuse,
     }
-
-    /// Peak WASM budget: an ~8-turn M8 V-groove tessellates; 20+ turns trap.
-    const MAX_INLINE_THREAD_TURNS: f64 = 8.0;
 
     #[derive(Clone, Copy, Debug)]
     struct ThreadPreview {
@@ -1052,7 +1113,7 @@ pub(crate) mod occt_backend {
         }
         let (major, pitch) = thread_dims(op, units).ok()?;
         let length = external_thread_length(op, major, pitch);
-        if length / pitch.max(1e-9) <= MAX_INLINE_THREAD_TURNS {
+        if !super::exceeds_inline_thread_budget(length, pitch) {
             return None;
         }
         Some(ThreadPreview {
@@ -1145,18 +1206,35 @@ pub(crate) mod occt_backend {
         let mut combined = super::combine_metrics(&metric_refs);
 
         if let Some(tp) = preview {
-            if tp.length / tp.pitch.max(1e-9) > MAX_INLINE_THREAD_TURNS {
-                match tessellate_thread_segments(k, &meshes, tp) {
+            if super::exceeds_inline_thread_budget(tp.length, tp.pitch) {
+                // Long Z bolts: instance short rods. Never fall through to
+                // tessellate_shape_mesh on the uncut hex+shank — that WASM-traps
+                // (`tessellate: Runtime`) once the instance path is empty/errors.
+                return match tessellate_thread_segments(k, &meshes, tp) {
                     Ok(mesh) if !mesh.positions.is_empty() => {
                         combined.bbox = bbox_from_positions(&mesh.positions);
-                        return Ok(ModelOutput {
+                        Ok(ModelOutput {
                             mesh,
                             metrics: combined,
-                        });
+                        })
                     }
-                    Err(e) if is_fatal_occt(&e) => return Err(e),
-                    _ => {}
-                }
+                    Ok(_) => Err(occt_err(
+                        "long-thread instance path produced no mesh \
+                         (refusing uncut-host tessellate fallthrough)",
+                    )),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if is_fatal_occt(&e) {
+                            Err(e)
+                        } else if msg.contains("refusing uncut-host tessellate fallthrough") {
+                            Err(e)
+                        } else {
+                            Err(occt_err(format!(
+                                "{msg}; refusing uncut-host tessellate fallthrough"
+                            )))
+                        }
+                    }
+                };
             }
         }
 
@@ -1240,45 +1318,41 @@ pub(crate) mod occt_backend {
     }
 
     /// Viewport path for long Z bolts: do not tessellate a 30-turn B-Rep.
-    /// Mesh the uncut head+shank, strip the smooth cylinder, instance an
-    /// 8-turn V-groove rod (the size we know WASM can mesh) along Z.
+    /// Mesh only safe pieces (hex head / dead caps whose Z span is ≤8 turns),
+    /// then instance an 8-turn V-groove rod along Z.
     fn tessellate_thread_segments(
         k: &mut occt_wasm::OcctKernel,
         solids: &[Handle],
         tp: ThreadPreview,
     ) -> Result<MeshData, KernelError> {
+        if super::thread_instance_failure_forced() {
+            return Err(occt_err(
+                "long-thread instance path failed \
+                 (refusing uncut-host tessellate fallthrough)",
+            ));
+        }
+
         let level = COARSE_LEVEL.with(|c| c.get());
         let angular = if level == 0 { 0.32 } else { 0.55 };
-        let mut body_parts: Vec<MeshData> = Vec::new();
-        for &solid in solids {
-            if !shape_has_extent(k, solid) {
-                continue;
-            }
-            let diag = bbox_diag(k, solid);
-            let linear = preview_linear(None, level, diag);
-            match tessellate_once(k, solid, linear, angular) {
-                Ok(mesh) => body_parts.push(mesh),
-                Err(e) if is_fatal_occt(&e) => return Err(e),
-                Err(_) => {}
-            }
-        }
-        let body = if body_parts.is_empty() {
-            MeshData {
-                positions: vec![],
-                normals: vec![],
-                indices: vec![],
-            }
-        } else {
-            let refs: Vec<&MeshData> = body_parts.iter().collect();
-            strip_thread_envelope(&combine_meshes(&refs), &tp)
-        };
+        let body = tessellate_safe_host_caps(k, solids, &tp, level, angular)?;
 
         let seg = (tp.pitch * 6.4).min(tp.length).max(tp.pitch * 2.0);
+        if super::exceeds_inline_thread_budget(seg, tp.pitch) {
+            return Err(occt_err(
+                "thread instance segment exceeds 8-turn tessellate budget",
+            ));
+        }
         let n_full = (tp.length / seg).floor() as i32;
         let rem = tp.length - n_full as f64 * seg;
         let helix_linear = preview_linear(Some(tp.pitch), level, tp.major.max(10.0));
 
         let proto = threaded_rod(k, tp.major, tp.pitch, seg)?;
+        if solid_exceeds_inline_budget(k, proto, tp.pitch) {
+            super::record_long_host_tessellate_attempt();
+            return Err(occt_err(
+                "thread prototype rod exceeds 8-turn tessellate budget",
+            ));
+        }
         let proto_mesh = tessellate_once(k, proto, helix_linear, angular)?;
         let (pz0, pz1) = mesh_z_range(&proto_mesh);
 
@@ -1295,7 +1369,18 @@ pub(crate) mod occt_backend {
             parts.push(place_thread_mesh(&mesh, &tp, z));
         }
         if has_tail {
+            if super::exceeds_inline_thread_budget(rem, tp.pitch) {
+                return Err(occt_err(
+                    "thread instance tail exceeds 8-turn tessellate budget",
+                ));
+            }
             let tail = threaded_rod(k, tp.major, tp.pitch, rem)?;
+            if solid_exceeds_inline_budget(k, tail, tp.pitch) {
+                super::record_long_host_tessellate_attempt();
+                return Err(occt_err(
+                    "thread tail rod exceeds 8-turn tessellate budget",
+                ));
+            }
             let tail_mesh = tessellate_once(k, tail, helix_linear, angular)?;
             let (tz0, tz1) = mesh_z_range(&tail_mesh);
             let mesh = strip_z_caps(&tail_mesh, tz0, tz1, n_full > 0, false);
@@ -1308,6 +1393,140 @@ pub(crate) mod occt_backend {
         }
         let refs: Vec<&MeshData> = parts.iter().collect();
         Ok(combine_meshes(&refs))
+    }
+
+    fn solid_z_span(k: &mut occt_wasm::OcctKernel, solid: Handle) -> Option<(f64, f64, f64)> {
+        let b = k.get_bounding_box(solid, false).ok()?;
+        let z0 = b.min.z;
+        let z1 = b.max.z;
+        Some((z0, z1, (z1 - z0).abs()))
+    }
+
+    fn solid_exceeds_inline_budget(
+        k: &mut occt_wasm::OcctKernel,
+        solid: Handle,
+        pitch: f64,
+    ) -> bool {
+        solid_z_span(k, solid)
+            .is_some_and(|(_, _, dz)| super::exceeds_inline_thread_budget(dz, pitch))
+    }
+
+    /// Mesh only pieces whose Z span is within the 8-turn budget: hex head and
+    /// any unthreaded tip. Never tessellate the full uncut long shank.
+    fn tessellate_safe_host_caps(
+        k: &mut occt_wasm::OcctKernel,
+        solids: &[Handle],
+        tp: &ThreadPreview,
+        level: u8,
+        angular: f64,
+    ) -> Result<MeshData, KernelError> {
+        let mut body_parts: Vec<MeshData> = Vec::new();
+        let budget_z = super::MAX_INLINE_THREAD_TURNS * tp.pitch.max(1e-9);
+        for &solid in solids {
+            if !shape_has_extent(k, solid) {
+                continue;
+            }
+            let Some(bb) = k.get_bounding_box(solid, false).ok() else {
+                continue;
+            };
+            let zmin = bb.min.z;
+            let zmax = bb.max.z;
+            let dz = (zmax - zmin).abs();
+            let diag = bbox_diag(k, solid);
+            let linear = preview_linear(None, level, diag);
+
+            if !super::exceeds_inline_thread_budget(dz, tp.pitch) {
+                match tessellate_once(k, solid, linear, angular) {
+                    Ok(mesh) => body_parts.push(strip_thread_envelope(&mesh, tp)),
+                    Err(e) if is_fatal_occt(&e) => return Err(e),
+                    Err(_) => {}
+                }
+                continue;
+            }
+
+            // Full host is a >8-turn-equivalent uncut hex+shank. Do not mesh it.
+            let thread_z0 = tp.at[2];
+            let thread_z1 = tp.at[2] + tp.length;
+            let mut ranges: Vec<(f64, f64)> = Vec::new();
+            if thread_z0 - zmin > tp.pitch * 0.15 {
+                ranges.push((zmin - 0.05, thread_z0.min(zmax)));
+            }
+            if zmax - thread_z1 > tp.pitch * 0.15 {
+                ranges.push((thread_z1.max(zmin), zmax + 0.05));
+            }
+            for (a, b) in ranges {
+                let mut z = a;
+                while z < b - 1e-9 {
+                    let seg = (b - z).min(budget_z);
+                    match clip_solid_to_z_slab(
+                        k,
+                        solid,
+                        [bb.min.x, bb.min.y, bb.min.z],
+                        [bb.max.x, bb.max.y, bb.max.z],
+                        z,
+                        z + seg,
+                    ) {
+                        Ok(cap) => {
+                            if solid_exceeds_inline_budget(k, cap, tp.pitch) {
+                                super::record_long_host_tessellate_attempt();
+                                return Err(occt_err(
+                                    "clipped host cap still exceeds 8-turn tessellate budget",
+                                ));
+                            }
+                            match tessellate_once(k, cap, linear, angular) {
+                                Ok(mesh) => body_parts.push(strip_thread_envelope(&mesh, tp)),
+                                Err(e) if is_fatal_occt(&e) => return Err(e),
+                                Err(_) => {}
+                            }
+                        }
+                        Err(e) if is_fatal_occt(&e) => return Err(e),
+                        Err(_) => {}
+                    }
+                    z += seg;
+                }
+            }
+        }
+        if body_parts.is_empty() {
+            return Ok(MeshData {
+                positions: vec![],
+                normals: vec![],
+                indices: vec![],
+            });
+        }
+        let refs: Vec<&MeshData> = body_parts.iter().collect();
+        Ok(combine_meshes(&refs))
+    }
+
+    fn clip_solid_to_z_slab(
+        k: &mut occt_wasm::OcctKernel,
+        solid: Handle,
+        bb_min: [f64; 3],
+        bb_max: [f64; 3],
+        z0: f64,
+        z1: f64,
+    ) -> Result<Handle, KernelError> {
+        let pad = ((bb_max[0] - bb_min[0]).abs())
+            .max((bb_max[1] - bb_min[1]).abs())
+            .max(2.0)
+            + 2.0;
+        let slab = k
+            .make_box_from_corners(
+                bb_min[0] - pad,
+                bb_min[1] - pad,
+                z0,
+                bb_max[0] + pad,
+                bb_max[1] + pad,
+                z1,
+            )
+            .map_err(|e| occt_err(format!("thread host slab: {e}")))?;
+        let raw = k
+            .common(solid, slab)
+            .map_err(|e| occt_err(format!("thread host clip: {e}")))?;
+        let out = drawable_shape(k, raw);
+        if !shape_has_extent(k, out) {
+            return Err(occt_err("thread host clip produced empty solid"));
+        }
+        Ok(out)
     }
 
     fn mesh_z_range(mesh: &MeshData) -> (f32, f32) {
@@ -2738,7 +2957,7 @@ pub(crate) mod occt_backend {
         axis: &RevolveAxis,
         hand: &ThreadHand,
     ) -> Result<Handle, KernelError> {
-        if length / pitch.max(1e-9) > MAX_INLINE_THREAD_TURNS {
+        if super::exceeds_inline_thread_budget(length, pitch) {
             return Err(occt_err(
                 "long helical cut skipped (viewport uses segmented thread mesh)",
             ));
@@ -4494,6 +4713,41 @@ pub fn bbox_from_positions(positions: &[f32]) -> [f64; 6] {
         mx[1] as f64,
         mx[2] as f64,
     ]
+}
+
+#[cfg(test)]
+mod thread_budget_tests {
+    use super::*;
+
+    #[test]
+    fn golden_m8_20mm_thread_must_instance() {
+        // Recipe thread length 20 / M8 pitch 1.25 = 16 turns.
+        assert!(exceeds_inline_thread_budget(20.0, 1.25));
+        assert!(helical_turns(20.0, 1.25) > MAX_INLINE_THREAD_TURNS);
+    }
+
+    #[test]
+    fn short_m8_stays_inline() {
+        // 8 mm / 1.25 = 6.4 turns — still cut and tessellated for real.
+        assert!(!exceeds_inline_thread_budget(8.0, 1.25));
+        assert!(helical_turns(8.0, 1.25) <= MAX_INLINE_THREAD_TURNS);
+    }
+
+    #[test]
+    fn instance_failure_hook_resets_on_drop() {
+        assert!(!thread_instance_failure_forced());
+        {
+            let _guard = with_forced_thread_instance_failure();
+            assert!(thread_instance_failure_forced());
+        }
+        assert!(!thread_instance_failure_forced());
+    }
+
+    #[test]
+    fn long_host_attempt_counter_starts_empty() {
+        let _ = take_long_host_tessellate_attempts();
+        assert_eq!(take_long_host_tessellate_attempts(), 0);
+    }
 }
 
 #[cfg(test)]
