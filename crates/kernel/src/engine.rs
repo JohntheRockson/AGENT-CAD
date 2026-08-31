@@ -347,14 +347,7 @@ pub(crate) mod mock_backend {
             }
             ExportFormat::Step => {
                 let out = execute_with_mock(program)?;
-                let s = export::to_step(&out.mesh);
-                if s.is_empty() {
-                    Err(KernelError::InvalidState(
-                        "STEP export produced no solid".into(),
-                    ))
-                } else {
-                    Ok(s.into_bytes())
-                }
+                export::step_export_bytes(&out.mesh).map_err(KernelError::InvalidState)
             }
             ExportFormat::Gltf | ExportFormat::Brep => Err(KernelError::InvalidState(
                 "glTF and BREP export require the `occt` feature".into(),
@@ -399,14 +392,7 @@ pub(crate) mod mock_backend {
             ExportFormat::Stl => Ok(export::to_stl(&model.mesh)),
             ExportFormat::Obj => Ok(export::to_obj(&model.mesh).into_bytes()),
             ExportFormat::Step => {
-                let s = export::to_step(&model.mesh);
-                if s.is_empty() {
-                    Err(KernelError::InvalidState(
-                        "STEP export produced no solid".into(),
-                    ))
-                } else {
-                    Ok(s.into_bytes())
-                }
+                export::step_export_bytes(&model.mesh).map_err(KernelError::InvalidState)
             }
             ExportFormat::Gltf | ExportFormat::Brep => Err(KernelError::InvalidState(
                 "glTF and BREP export require the `occt` feature".into(),
@@ -1202,11 +1188,7 @@ pub(crate) mod occt_backend {
         preview: Option<ThreadPreview>,
     ) -> Result<Vec<u8>, KernelError> {
         let mesh = mesh_for_step_export(k, shape, pitch, preview)?;
-        let s = crate::export::to_step(&mesh);
-        if s.len() < 64 {
-            return Err(occt_err("step: faceted solid was empty"));
-        }
-        Ok(s.into_bytes())
+        crate::export::step_export_bytes(&mesh).map_err(occt_err)
     }
 
     fn mesh_for_step_export(
@@ -1221,18 +1203,18 @@ pub(crate) mod occt_backend {
         // a >8-turn helix and never instance helical rods into STEP.
         if let Some(tp) = preview {
             if tp.length / tp.pitch.max(1e-9) > MAX_INLINE_THREAD_TURNS {
-                match tessellate_uncut_host(k, &solids) {
-                    Ok(m) if !m.positions.is_empty() => return Ok(m),
-                    Err(e) if is_fatal_occt(&e) => return Err(e),
-                    _ => return Ok(bbox_aabb_mesh(k, &solids)),
-                }
+                return match tessellate_uncut_host(k, &solids) {
+                    Ok(m) if !m.positions.is_empty() => Ok(m),
+                    Ok(_) => Err(occt_err("step: uncut host tessellation was empty")),
+                    Err(e) => Err(e),
+                };
             }
         }
 
         match tessellate_solid(k, shape, pitch, preview) {
             Ok(out) if !out.mesh.positions.is_empty() => Ok(out.mesh),
-            Err(e) if is_fatal_occt(&e) => Err(e),
-            _ => Ok(bbox_aabb_mesh(k, &solids)),
+            Ok(_) => Err(occt_err("step: tessellation was empty")),
+            Err(e) => Err(e),
         }
     }
 
@@ -1262,33 +1244,6 @@ pub(crate) mod occt_backend {
         }
         let refs: Vec<&MeshData> = parts.iter().collect();
         Ok(combine_meshes(&refs))
-    }
-
-    fn bbox_aabb_mesh(k: &mut occt_wasm::OcctKernel, solids: &[Handle]) -> MeshData {
-        let mut bb = [
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-        ];
-        let mut any = false;
-        for &solid in solids {
-            if let Ok(b) = k.get_bounding_box(solid, false) {
-                bb[0] = bb[0].min(b.min.x);
-                bb[1] = bb[1].min(b.min.y);
-                bb[2] = bb[2].min(b.min.z);
-                bb[3] = bb[3].max(b.max.x);
-                bb[4] = bb[4].max(b.max.y);
-                bb[5] = bb[5].max(b.max.z);
-                any = true;
-            }
-        }
-        if !any || !bb[0].is_finite() {
-            return crate::export::aabb_mesh([-1.0, -1.0, 0.0, 1.0, 1.0, 1.0]);
-        }
-        crate::export::aabb_mesh(bb)
     }
 
     fn bbox_diag(k: &mut occt_wasm::OcctKernel, solid: Handle) -> f64 {
@@ -4662,5 +4617,22 @@ mod document_tests {
         let bb = crate::export::cartesian_bbox_from_step(&step).unwrap();
         assert!((bb[3] - bb[0] - 10.0).abs() < 0.01);
         assert!((bb[5] - bb[2] - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn empty_tessellation_step_export_is_error_not_success() {
+        let empty = MeshData {
+            positions: vec![],
+            normals: vec![],
+            indices: vec![],
+        };
+        let err = crate::export::step_export_bytes(&empty)
+            .expect_err("empty tessellation must not succeed");
+        assert!(
+            err.contains("empty") || err.contains("no solid"),
+            "unexpected: {err}"
+        );
+        // Ok(vec![]) would be a 0-byte "success".
+        assert!(crate::export::step_export_bytes(&empty).is_err());
     }
 }

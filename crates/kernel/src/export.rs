@@ -291,44 +291,26 @@ pub fn to_step(mesh: &MeshData) -> String {
     w.out
 }
 
-/// Axis-aligned box as a triangle mesh. Fallback when host tessellation fails
-/// so STEP still has a solid in the same bbox family (never a 0-byte trap).
-pub fn aabb_mesh(bbox: [f64; 6]) -> MeshData {
-    let [x0, y0, z0, x1, y1, z1] = [
-        bbox[0] as f32,
-        bbox[1] as f32,
-        bbox[2] as f32,
-        bbox[3] as f32,
-        bbox[4] as f32,
-        bbox[5] as f32,
-    ];
-    let p = [
-        [x0, y0, z0],
-        [x1, y0, z0],
-        [x1, y1, z0],
-        [x0, y1, z0],
-        [x0, y0, z1],
-        [x1, y0, z1],
-        [x1, y1, z1],
-        [x0, y1, z1],
-    ];
-    let mut positions = Vec::with_capacity(8 * 3);
-    for v in p {
-        positions.extend_from_slice(&v);
+/// STEP bytes from a real triangle mesh. Empty or degenerate tessellation is
+/// an error — never a manufactured AABB box and never `Ok` of 0 bytes.
+pub fn step_export_bytes(mesh: &MeshData) -> Result<Vec<u8>, String> {
+    let tri_count = if mesh.indices.is_empty() {
+        mesh.positions.len() / 9
+    } else {
+        mesh.indices.len() / 3
+    };
+    if tri_count == 0 || mesh.positions.len() < 9 {
+        return Err("step: empty tessellation".into());
     }
-    let indices: Vec<u32> = vec![
-        0, 2, 1, 0, 3, 2, // bottom
-        4, 5, 6, 4, 6, 7, // top
-        0, 1, 5, 0, 5, 4, // y=y0
-        1, 2, 6, 1, 6, 5, // x=x1
-        2, 3, 7, 2, 7, 6, // y=y1
-        3, 0, 4, 3, 4, 7, // x=x0
-    ];
-    MeshData {
-        positions,
-        normals: vec![],
-        indices,
+    let s = to_step(mesh);
+    if s.len() < 512
+        || !s.contains("ISO-10303-21")
+        || !s.contains("MANIFOLD_SOLID_BREP")
+        || !s.contains("CLOSED_SHELL")
+    {
+        return Err("step: tessellation produced no solid".into());
     }
+    Ok(s.into_bytes())
 }
 
 /// Axis-aligned bbox of `CARTESIAN_POINT` coordinates in an ISO-10303 file.
@@ -536,19 +518,20 @@ mod tests {
 
     #[test]
     fn step_faceted_solid_has_iso_tokens_and_bbox() {
-        let mesh = aabb_mesh([-5.7735, -5.0, 0.0, 5.7735, 5.0, 40.0]);
-        let step = to_step(&mesh);
+        let mesh = fixture_box_mesh([-5.7735, -5.0, 0.0, 5.7735, 5.0, 40.0]);
+        let step = step_export_bytes(&mesh).expect("real mesh must export");
+        let text = String::from_utf8_lossy(&step);
         assert!(
             step.len() > 512,
             "STEP must be a non-empty file, got {} bytes",
             step.len()
         );
-        assert!(step.contains("ISO-10303-21"), "missing ISO-10303-21 header");
+        assert!(text.contains("ISO-10303-21"), "missing ISO-10303-21 header");
         assert!(
-            step.contains("MANIFOLD_SOLID_BREP") && step.contains("CLOSED_SHELL"),
+            text.contains("MANIFOLD_SOLID_BREP") && text.contains("CLOSED_SHELL"),
             "STEP must parse as a solid"
         );
-        let bb = cartesian_bbox_from_step(step.as_bytes()).expect("CARTESIAN_POINT bbox");
+        let bb = cartesian_bbox_from_step(&step).expect("CARTESIAN_POINT bbox");
         assert!((bb[0] + 5.7735).abs() < 1e-4 && (bb[3] - 5.7735).abs() < 1e-4);
         assert!((bb[1] + 5.0).abs() < 1e-4 && (bb[4] - 5.0).abs() < 1e-4);
         assert!(bb[2].abs() < 1e-4 && (bb[5] - 40.0).abs() < 1e-4);
@@ -562,5 +545,86 @@ mod tests {
             indices: vec![],
         };
         assert!(to_step(&mesh).is_empty());
+    }
+
+    /// Inspector: an AABB box in the mesh bbox family would pass
+    /// `bbox_same_family`. Empty tessellation must fail, not write that box.
+    #[test]
+    fn empty_tessellation_fails_step_export_not_bbox_placeholder() {
+        let empty = MeshData {
+            positions: vec![],
+            normals: vec![],
+            indices: vec![],
+        };
+        let err = step_export_bytes(&empty).expect_err("empty tessellation must fail");
+        assert!(
+            err.contains("empty") || err.contains("no solid"),
+            "unexpected error: {err}"
+        );
+        assert!(to_step(&empty).is_empty());
+        assert!(
+            !to_step(&empty).contains("MANIFOLD_SOLID_BREP"),
+            "empty tessellation must not write a STEP solid"
+        );
+
+        // What the removed fallback would have emitted — a box whose bbox
+        // matches the golden M8 mesh family. That is a placeholder solid.
+        let mesh_bbox = [-5.7735, -5.0, 0.0, 5.7735, 5.0, 40.0];
+        let placeholder = fixture_box_mesh(mesh_bbox);
+        let placeholder_step = to_step(&placeholder);
+        assert!(placeholder_step.contains("MANIFOLD_SOLID_BREP"));
+        let pbb = cartesian_bbox_from_step(placeholder_step.as_bytes()).unwrap();
+        for i in 0..3 {
+            let ea = (mesh_bbox[i + 3] - mesh_bbox[i]).abs();
+            let eb = (pbb[i + 3] - pbb[i]).abs();
+            assert!(
+                (ea - eb).abs() < 0.05,
+                "fixture box is in the mesh bbox family (the forbidden pass)"
+            );
+        }
+        let empty_bytes = to_step(&empty).into_bytes();
+        assert_ne!(
+            empty_bytes,
+            placeholder_step.into_bytes(),
+            "empty tessellation must not produce the bbox placeholder STEP"
+        );
+        assert!(
+            step_export_bytes(&empty).is_err(),
+            "export of empty tessellation must not succeed"
+        );
+    }
+
+    /// Test fixture only — not used as an export fallback.
+    fn fixture_box_mesh(bbox: [f64; 6]) -> MeshData {
+        let [x0, y0, z0, x1, y1, z1] = [
+            bbox[0] as f32,
+            bbox[1] as f32,
+            bbox[2] as f32,
+            bbox[3] as f32,
+            bbox[4] as f32,
+            bbox[5] as f32,
+        ];
+        let p = [
+            [x0, y0, z0],
+            [x1, y0, z0],
+            [x1, y1, z0],
+            [x0, y1, z0],
+            [x0, y0, z1],
+            [x1, y0, z1],
+            [x1, y1, z1],
+            [x0, y1, z1],
+        ];
+        let mut positions = Vec::with_capacity(8 * 3);
+        for v in p {
+            positions.extend_from_slice(&v);
+        }
+        MeshData {
+            positions,
+            normals: vec![],
+            indices: vec![
+                0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 7, 2,
+                7, 6, 3, 0, 4, 3, 4, 7,
+            ],
+        }
     }
 }

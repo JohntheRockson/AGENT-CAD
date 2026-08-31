@@ -2,7 +2,7 @@
 //!
 //! Run with: `cargo test -p kernel --features occt --test occt_geometry`
 
-use kernel::engine::{Engine, ExportFormat};
+use kernel::engine::{Engine, ExportFormat, MeshData};
 use kernel::ir::{CadDocument, CadProgram};
 
 fn venturi_program() -> CadProgram {
@@ -1227,6 +1227,27 @@ fn hex_only_and_hex_shank_step_export_no_wasm_crash() {
         kernel::engine::bbox_from_positions(&shank_mesh.mesh.positions),
         "hex+shank",
     );
+}
+
+/// Empty tessellation must fail the export. A bbox-sized box would pass
+/// `bbox_same_family` and is a placeholder solid — not allowed.
+#[test]
+fn empty_tessellation_step_export_fails_not_bbox_box() {
+    let empty = MeshData {
+        positions: vec![],
+        normals: vec![],
+        indices: vec![],
+    };
+    let err = kernel::export::step_export_bytes(&empty)
+        .expect_err("empty tessellation must not write STEP");
+    assert!(
+        err.contains("empty") || err.contains("no solid"),
+        "unexpected: {err}"
+    );
+    let text = kernel::export::to_step(&empty);
+    assert!(text.is_empty());
+    assert!(!text.contains("MANIFOLD_SOLID_BREP"));
+    assert!(kernel::export::cartesian_bbox_from_step(text.as_bytes()).is_none());
 }
 
 /// Job 1 regression: viewport M8 must be a 60° V, not the boxy wide-crest bead.
