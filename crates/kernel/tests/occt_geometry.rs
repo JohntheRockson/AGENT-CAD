@@ -918,13 +918,18 @@ fn assert_iso_v_thread_profile(
         .count();
     let crest_frac = crest_bins as f64 / populated.len() as f64;
     assert!(
-        crest_frac < 0.36,
+        crest_frac < 0.22,
         "thread crest is boxy/wide: {crest_frac:.2} of pitch stays at the major \
-         (ISO 68-1 crest is ~0.125). Old square/round bead left ~0.40+."
+         (ISO 68-1 crest is ~0.125). Old mid-triangle bead left ~0.40+."
     );
     assert!(
         r_floor < r_major - 0.40 * depth,
         "groove too shallow (r={r_floor:.3} vs major {r_major}); depth should approach 5H/8"
+    );
+    let crest_r = populated.iter().map(|&i| min_r[i]).fold(0.0_f64, |a, r| a.max(r));
+    assert!(
+        crest_r > r_major - 0.20,
+        "crests were cut away (max leftover r={crest_r:.3}); ISO leaves ~P/8 at the major"
     );
     assert!(
         n_flank >= 20,

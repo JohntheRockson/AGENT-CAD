@@ -2716,12 +2716,13 @@ pub(crate) mod occt_backend {
         internal: bool,
         z0: f64,
     ) -> Result<Handle, KernelError> {
-        // MakePipeShell only pipes an in-place circular Face. A loft of
-        // meridian ISO 60° V sections is the real thread form; the circle
-        // fallback is sized to the same P/8 crest / 5H/8 root (not the old
-        // wide square bead). Never fall back to a meridian square.
-        helical_iso_v_loft(k, major, pitch, length, internal, z0)
-            .or_else(|_| helical_round_groove(k, major, pitch, length, internal, z0))
+        // MakePipeShell only accepts an in-place circular Face. A triangular
+        // V cannot be piped (BRepFill_Section), and loft/sew of V sections
+        // poisons the WASM heap on the subsequent boolean. The unique circle
+        // through the ISO 5H/8 root and P/8 crest-edge points is the cutter
+        // that actually cuts: narrow crests, deep groove, Frenet yaw-walk.
+        // Never fall back to a meridian square (rectangular bites).
+        helical_round_groove(k, major, pitch, length, internal, z0)
     }
 
     /// Prefer one helical cutter. Only chunk if that boolean fails — five
@@ -2786,43 +2787,9 @@ pub(crate) mod occt_backend {
         }
     }
 
-    /// ISO 68-1 60° V lofted along the helix. Each section is the standard
-    /// meridian triangle (not a square bead). Ruled loft between yaw-walked
-    /// sections keeps groove yaw walking; it does not revolve into rings.
-    fn helical_iso_v_loft(
-        k: &mut occt_wasm::OcctKernel,
-        major: f64,
-        pitch: f64,
-        length: f64,
-        internal: bool,
-        z0: f64,
-    ) -> Result<Handle, KernelError> {
-        let height = (length + pitch).max(pitch * 2.0);
-        let ppt = thread_loft_samples(height, pitch);
-        let path = crate::thread::cutter_helix_path(major / 2.0, pitch, height, z0, ppt);
-        if path.len() < 3 {
-            return Err(occt_err("ISO V loft path too short"));
-        }
-        let mut wires = Vec::with_capacity(path.len());
-        for p in &path {
-            let yaw = p[1].atan2(p[0]);
-            let vee = crate::thread::cutter_iso_vee_meridian(major, pitch, yaw, p[2], internal);
-            wires.push(closed_polygon_wire(k, &vee)?);
-        }
-        let lofted = k
-            .loft(&wires, true, true)
-            .map_err(|e| occt_err(format!("ISO V loft: {e}")))?;
-        let ids = k
-            .get_sub_shapes(lofted, "solid")
-            .map_err(|e| occt_err(format!("ISO V loft solids: {e}")))?;
-        if ids.is_empty() {
-            return Err(occt_err("ISO V loft produced no solid"));
-        }
-        Ok(unwrap_to_solid(k, lofted))
-    }
-
-    /// Helical circular groove sized to ISO crest/root — used only when the
-    /// V loft fails. Frenet-pipe so yaw walks; analytic helix when possible.
+    /// Helical groove whose circular section is the circumcircle of the
+    /// ISO 5H/8 root and the two P/8 crest-edge points. Frenet-piped along
+    /// an overlapped polyline helix so yaw walks and the +X seam closes.
     fn helical_round_groove(
         k: &mut occt_wasm::OcctKernel,
         major: f64,
@@ -2838,62 +2805,30 @@ pub(crate) mod occt_backend {
             crate::thread::cutter_iso_circle(major, pitch)
         };
         let height = (length + pitch).max(pitch * 2.0);
-        let (spine, p0, tang) = overlapped_cutter_spine(
-            k,
+        let path = crate::thread::cutter_helix_path(
             r_h,
             pitch,
             height,
             z0,
             thread_polyline_samples(height, pitch),
-        )?;
-        if let Ok(edge) = k.make_circle_edge(p0[0], p0[1], p0[2], tang[0], tang[1], tang[2], sec_r) {
-            if let Ok(wire) = k.make_wire(&[edge]) {
-                if let Ok(face) = k.make_face(wire) {
-                    if let Ok(s) = pipe_thread_cutter(k, face, spine) {
-                        return Ok(s);
-                    }
-                }
-            }
-        }
-        Err(occt_err("helical ISO-sized circular groove failed"))
-    }
-
-    /// Helix spine that starts before the +X hex-vertex seam. Prefer an
-    /// analytic helix (smooth flanks); fall back to a dense polyline.
-    fn overlapped_cutter_spine(
-        k: &mut occt_wasm::OcctKernel,
-        radius: f64,
-        pitch: f64,
-        height: f64,
-        z0: f64,
-        pts_per_turn: u32,
-    ) -> Result<(Handle, [f64; 3], [f64; 3]), KernelError> {
-        let t0 = -crate::thread::CUTTER_SEAM_OVERLAP_TURNS;
-        let (p0, tang) = crate::thread::cutter_helix_frame(radius, pitch, t0, z0);
-        let z_start = z0 + t0 * pitch;
-        let sweep_h = height + 2.0 * crate::thread::CUTTER_SEAM_OVERLAP_TURNS * pitch;
-        if let Ok(wire) = k.make_helix_wire(0.0, 0.0, z_start, 0.0, 0.0, 1.0, pitch, sweep_h, radius)
-        {
-            let yaw0 = p0[1].atan2(p0[0]);
-            if let Ok(sp) = k.rotate(wire, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, yaw0) {
-                return Ok((sp, p0, tang));
-            }
-            if yaw0.abs() < 1e-6 {
-                return Ok((wire, p0, tang));
-            }
-        }
-        let path = crate::thread::cutter_helix_path(radius, pitch, height, z0, pts_per_turn);
+        );
         let poly = wire_from_polyline3(k, &path)?;
         let p0 = path[0];
         let p1 = path
             .get(1)
             .copied()
             .unwrap_or([p0[0], p0[1], p0[2] + pitch]);
-        Ok((
-            poly,
-            p0,
-            [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]],
-        ))
+        let tang = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        if let Ok(edge) = k.make_circle_edge(p0[0], p0[1], p0[2], tang[0], tang[1], tang[2], sec_r) {
+            if let Ok(wire) = k.make_wire(&[edge]) {
+                if let Ok(face) = k.make_face(wire) {
+                    if let Ok(s) = pipe_thread_cutter(k, face, poly) {
+                        return Ok(s);
+                    }
+                }
+            }
+        }
+        Err(occt_err("helical ISO-sized circular groove failed"))
     }
 
     /// Sweep a thread bead with a rolling (Frenet) trihedron so yaw walks
@@ -2942,17 +2877,6 @@ pub(crate) mod occt_backend {
         } else {
             let max_pts = 220.0;
             ((max_pts / turns).floor() as u32).clamp(16, 32)
-        }
-    }
-
-    /// Loft sections per turn. Dense enough that zoomed flanks are a helix,
-    /// sparse enough that an 8-turn ThruSections stays viewport-fast.
-    fn thread_loft_samples(height: f64, pitch: f64) -> u32 {
-        let turns = (height / pitch.max(1e-9)).max(0.25);
-        if turns <= 8.5 {
-            20
-        } else {
-            12
         }
     }
 
