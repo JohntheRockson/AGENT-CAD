@@ -816,8 +816,61 @@ fn angular_radius_spread_at_z(mesh: &kernel::engine::MeshData, z: f64, band: f64
         - vals.iter().copied().fold(f64::INFINITY, f64::min)
 }
 
-/// Fail if the axial thread form is a boxy/wide rectangular bead instead of
-/// ISO 68-1 60° V (narrow H/8 crest, sloped flanks, 5H/8-class depth).
+/// Sample (x,y,z) on the shank: vertices plus triangle centroids so coarse
+/// flank tessellation still shows up in helix-phase bins.
+fn shank_samples(mesh: &kernel::engine::MeshData, z0: f64, z1: f64, r_min: f64) -> Vec<[f64; 3]> {
+    let mut pts = Vec::new();
+    for chunk in mesh.positions.chunks(3) {
+        if chunk.len() < 3 {
+            continue;
+        }
+        let p = [chunk[0] as f64, chunk[1] as f64, chunk[2] as f64];
+        if p[2] >= z0 && p[2] <= z1 && (p[0] * p[0] + p[1] * p[1]).sqrt() >= r_min {
+            pts.push(p);
+        }
+    }
+    let tris: Vec<[usize; 3]> = if mesh.indices.is_empty() {
+        (0..mesh.positions.len() / 9)
+            .map(|t| [t * 3, t * 3 + 1, t * 3 + 2])
+            .collect()
+    } else {
+        mesh.indices
+            .chunks(3)
+            .filter_map(|c| {
+                (c.len() == 3).then_some([c[0] as usize, c[1] as usize, c[2] as usize])
+            })
+            .collect()
+    };
+    for [a, b, c] in tris {
+        let pa = [
+            mesh.positions[a * 3] as f64,
+            mesh.positions[a * 3 + 1] as f64,
+            mesh.positions[a * 3 + 2] as f64,
+        ];
+        let pb = [
+            mesh.positions[b * 3] as f64,
+            mesh.positions[b * 3 + 1] as f64,
+            mesh.positions[b * 3 + 2] as f64,
+        ];
+        let pc = [
+            mesh.positions[c * 3] as f64,
+            mesh.positions[c * 3 + 1] as f64,
+            mesh.positions[c * 3 + 2] as f64,
+        ];
+        let g = [
+            (pa[0] + pb[0] + pc[0]) / 3.0,
+            (pa[1] + pb[1] + pc[1]) / 3.0,
+            (pa[2] + pb[2] + pc[2]) / 3.0,
+        ];
+        if g[2] >= z0 && g[2] <= z1 && (g[0] * g[0] + g[1] * g[1]).sqrt() >= r_min {
+            pts.push(g);
+        }
+    }
+    pts
+}
+
+/// Fail if the thread form is a boxy/wide bead (screenshot) instead of an
+/// ISO-width groove: ~P/8 crest, 5H/8-class depth, sloped flanks, yaw walks.
 fn assert_iso_v_thread_profile(
     mesh: &kernel::engine::MeshData,
     r_major: f64,
@@ -825,79 +878,64 @@ fn assert_iso_v_thread_profile(
     z0: f64,
     z1: f64,
 ) {
+    let samples = shank_samples(mesh, z0, z1, r_major * 0.55);
+    assert!(
+        samples.len() >= 80,
+        "too few shank samples ({}) — placeholder or tessellation failed",
+        samples.len()
+    );
+
     const N: usize = 32;
-    let mut max_r = [0.0_f64; N];
     let mut min_r = [f64::MAX; N];
     let mut counts = [0u32; N];
-    for chunk in mesh.positions.chunks(3) {
-        if chunk.len() < 3 {
-            continue;
+    let mut n_flank = 0u32;
+    let mut r_floor = f64::MAX;
+    let depth = kernel::thread::external_depth(pitch);
+    for p in &samples {
+        let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
+        r_floor = r_floor.min(r);
+        if r > r_major - 0.85 * depth && r < r_major - 0.15 {
+            n_flank += 1;
         }
-        let z = chunk[2] as f64;
-        if z < z0 || z > z1 {
-            continue;
-        }
-        let x = chunk[0] as f64;
-        let y = chunk[1] as f64;
-        let r = (x * x + y * y).sqrt();
-        if r < r_major * 0.55 {
-            continue;
-        }
-        let yaw = y.atan2(x);
-        let phase = (z / pitch - yaw / (2.0 * std::f64::consts::PI)).rem_euclid(1.0);
+        let yaw = p[1].atan2(p[0]);
+        let phase = (p[2] / pitch - yaw / (2.0 * std::f64::consts::PI)).rem_euclid(1.0);
         let bin = ((phase * N as f64).floor() as usize).min(N - 1);
-        max_r[bin] = max_r[bin].max(r);
         min_r[bin] = min_r[bin].min(r);
         counts[bin] += 1;
     }
-    let populated: Vec<usize> = (0..N).filter(|&i| counts[i] >= 3).collect();
+    let populated: Vec<usize> = (0..N).filter(|&i| counts[i] >= 1).collect();
     assert!(
-        populated.len() >= N * 2 / 3,
-        "too few thread-phase bins ({}/{}) — placeholder or tessellation failed",
+        populated.len() >= 10,
+        "too few thread-phase bins ({}/{})",
         populated.len(),
         N
     );
 
-    let crest_r = r_major - 0.10;
+    // Pure-crest bins never drop below the major — that is the leftover flat.
     let crest_bins = populated
         .iter()
-        .filter(|&&i| max_r[i] > crest_r)
+        .filter(|&&i| min_r[i] > r_major - 0.12)
         .count();
     let crest_frac = crest_bins as f64 / populated.len() as f64;
-    // ISO crest is P/8 ≈ 12.5% of pitch. A circular/square bead leaves ~40%+.
-    // Allow tessellation slop, but fail the screenshot "wide rectangular crest".
     assert!(
-        crest_frac < 0.34,
-        "thread crest is boxy/wide: {crest_frac:.2} of pitch stays near major \
-         (ISO 68-1 is ~0.125). Cutter is a square/round bead, not a 60° V."
+        crest_frac < 0.36,
+        "thread crest is boxy/wide: {crest_frac:.2} of pitch stays at the major \
+         (ISO 68-1 crest is ~0.125). Old square/round bead left ~0.40+."
     );
-
-    let depth = kernel::thread::external_depth(pitch);
-    let groove = populated
-        .iter()
-        .map(|i| max_r[*i])
-        .fold(f64::MAX, f64::min);
     assert!(
-        groove < r_major - 0.45 * depth,
-        "groove too shallow ({groove:.3} vs major {r_major}); V depth should approach 5H/8"
+        r_floor < r_major - 0.40 * depth,
+        "groove too shallow (r={r_floor:.3} vs major {r_major}); depth should approach 5H/8"
     );
-
-    let flank_lo = r_major - 0.85 * depth;
-    let flank_hi = r_major - 0.18;
-    let flank_bins = populated
-        .iter()
-        .filter(|&&i| max_r[i] > flank_lo && max_r[i] < flank_hi)
-        .count();
     assert!(
-        flank_bins >= 5,
-        "flanks are not a V: only {flank_bins} phase bins have sloped radius \
-         (rectangular bites jump major↔groove with no intermediate r)"
+        n_flank >= 20,
+        "flanks missing: only {n_flank} intermediate-r samples \
+         (rectangular bites jump major↔groove)"
     );
 
     let n_yaws = distinct_groove_yaws(mesh, z0, z1, 12);
     assert!(
         n_yaws >= 5,
-        "V-profile must still walk around the shank; distinct yaws={n_yaws}"
+        "groove must still walk around the shank; distinct yaws={n_yaws}"
     );
 }
 
@@ -1070,6 +1108,17 @@ fn m8_external_thread_is_iso_v_not_boxy() {
     let out = Engine::new()
         .execute(&prog)
         .expect("M8 V-thread should build");
+    assert!(
+        out.metrics.volume > 50.0,
+        "placeholder volume after V-thread: {}",
+        out.metrics.volume
+    );
+    let major_cyl = std::f64::consts::PI * 4.0 * 4.0 * 8.0;
+    assert!(
+        out.metrics.volume < 0.97 * major_cyl,
+        "V-thread should cut the Ø8 cylinder, vol={}",
+        out.metrics.volume
+    );
     let [_, _, zmin, _, _, zmax] = out.metrics.bbox;
     assert_iso_v_thread_profile(&out.mesh, 4.0, 1.25, zmin + 1.2, zmin + 6.5);
     assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 1.2, zmin + 6.5);

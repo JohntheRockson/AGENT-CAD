@@ -2716,11 +2716,11 @@ pub(crate) mod occt_backend {
         internal: bool,
         z0: f64,
     ) -> Result<Handle, KernelError> {
-        // ISO 60° V in the helix normal plane. A meridian-plane V that spans
-        // ~1 pitch in Z Frenet-pipes into ring-like troughs; a circular/square
-        // bead leaves wide flat crests (would not fit a nut).
-        helical_iso_v_groove(k, major, pitch, length, internal, z0)
-            .or_else(|_| helical_thread_cutter(k, major, pitch, length, internal, z0))
+        // MakePipeShell only pipes an in-place circular Face. A loft of
+        // meridian ISO 60° V sections is the real thread form; the circle
+        // fallback is sized to the same P/8 crest / 5H/8 root (not the old
+        // wide square bead). Never fall back to a meridian square.
+        helical_iso_v_loft(k, major, pitch, length, internal, z0)
             .or_else(|_| helical_round_groove(k, major, pitch, length, internal, z0))
     }
 
@@ -2786,10 +2786,10 @@ pub(crate) mod occt_backend {
         }
     }
 
-    /// ISO 68-1 60° V swept along a helix. Profile sits in the plane ⊥ the
-    /// helix tangent so Frenet-pipe rolls the groove around the shank
-    /// (PR #5/#6) instead of wrapping a tall meridian V into stacked rings.
-    fn helical_iso_v_groove(
+    /// ISO 68-1 60° V lofted along the helix. Each section is the standard
+    /// meridian triangle (not a square bead). Ruled loft between yaw-walked
+    /// sections keeps groove yaw walking; it does not revolve into rings.
+    fn helical_iso_v_loft(
         k: &mut occt_wasm::OcctKernel,
         major: f64,
         pitch: f64,
@@ -2797,8 +2797,47 @@ pub(crate) mod occt_backend {
         internal: bool,
         z0: f64,
     ) -> Result<Handle, KernelError> {
-        let r_h = crate::thread::cutter_iso_path_radius(major, pitch, internal);
-        let height = (length + pitch * 1.1).max(pitch * 2.0);
+        let height = (length + pitch).max(pitch * 2.0);
+        let ppt = thread_loft_samples(height, pitch);
+        let path = crate::thread::cutter_helix_path(major / 2.0, pitch, height, z0, ppt);
+        if path.len() < 3 {
+            return Err(occt_err("ISO V loft path too short"));
+        }
+        let mut wires = Vec::with_capacity(path.len());
+        for p in &path {
+            let yaw = p[1].atan2(p[0]);
+            let vee = crate::thread::cutter_iso_vee_meridian(major, pitch, yaw, p[2], internal);
+            wires.push(closed_polygon_wire(k, &vee)?);
+        }
+        let lofted = k
+            .loft(&wires, true, true)
+            .map_err(|e| occt_err(format!("ISO V loft: {e}")))?;
+        let ids = k
+            .get_sub_shapes(lofted, "solid")
+            .map_err(|e| occt_err(format!("ISO V loft solids: {e}")))?;
+        if ids.is_empty() {
+            return Err(occt_err("ISO V loft produced no solid"));
+        }
+        Ok(unwrap_to_solid(k, lofted))
+    }
+
+    /// Helical circular groove sized to ISO crest/root — used only when the
+    /// V loft fails. Frenet-pipe so yaw walks; analytic helix when possible.
+    fn helical_round_groove(
+        k: &mut occt_wasm::OcctKernel,
+        major: f64,
+        pitch: f64,
+        length: f64,
+        internal: bool,
+        z0: f64,
+    ) -> Result<Handle, KernelError> {
+        let (r_h, sec_r) = if internal {
+            let r_h = crate::thread::tap_drill_diameter(major, pitch) / 2.0;
+            (r_h, crate::thread::external_depth(pitch) * 0.55)
+        } else {
+            crate::thread::cutter_iso_circle(major, pitch)
+        };
+        let height = (length + pitch).max(pitch * 2.0);
         let (spine, p0, tang) = overlapped_cutter_spine(
             k,
             r_h,
@@ -2807,16 +2846,16 @@ pub(crate) mod occt_backend {
             z0,
             thread_polyline_samples(height, pitch),
         )?;
-        let vee = crate::thread::cutter_iso_vee_normal(p0, tang, major, pitch, internal);
-        if let Ok(face) = face_from_polygon_3d(k, &vee) {
-            if let Ok(s) = pipe_thread_cutter(k, face, spine) {
-                return Ok(s);
-            }
-            if let Ok(s) = pipe_along(k, face, spine) {
-                return Ok(s);
+        if let Ok(edge) = k.make_circle_edge(p0[0], p0[1], p0[2], tang[0], tang[1], tang[2], sec_r) {
+            if let Ok(wire) = k.make_wire(&[edge]) {
+                if let Ok(face) = k.make_face(wire) {
+                    if let Ok(s) = pipe_thread_cutter(k, face, spine) {
+                        return Ok(s);
+                    }
+                }
             }
         }
-        Err(occt_err("helical ISO V-thread sweep failed"))
+        Err(occt_err("helical ISO-sized circular groove failed"))
     }
 
     /// Helix spine that starts before the +X hex-vertex seam. Prefer an
@@ -2855,110 +2894,6 @@ pub(crate) mod occt_backend {
             p0,
             [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]],
         ))
-    }
-
-    /// Compact V-groove along a polyline helix we control. Fallback when the
-    /// full ISO triangle cannot be piped; still a V, not a square bead.
-    fn helical_thread_cutter(
-        k: &mut occt_wasm::OcctKernel,
-        major: f64,
-        pitch: f64,
-        length: f64,
-        internal: bool,
-        z0: f64,
-    ) -> Result<Handle, KernelError> {
-        let depth = crate::thread::external_depth(pitch);
-        let half = pitch * 0.22;
-        let (r_out, r_in) = if internal {
-            let r_hole = crate::thread::tap_drill_diameter(major, pitch) / 2.0;
-            (
-                major / 2.0 + 0.12 * pitch,
-                (r_hole - 0.12 * pitch).max(0.05),
-            )
-        } else {
-            (major / 2.0 + 0.18 * pitch, major / 2.0 - depth)
-        };
-        let r_h = 0.5 * (r_out + r_in);
-        let z_start = z0 - half;
-        let height = (length + pitch * 1.1).max(pitch * 2.0);
-        let path = crate::thread::cutter_helix_path(
-            r_h,
-            pitch,
-            height,
-            z_start,
-            thread_polyline_samples(height, pitch),
-        );
-        let poly = wire_from_polyline3(k, &path)?;
-        let p0 = path[0];
-        let yaw = p0[1].atan2(p0[0]);
-        let pts = crate::thread::cutter_meridian_vee(r_out, r_in, half, yaw, p0[2]);
-        if let Ok(face) = face_from_polygon_3d(k, &pts) {
-            if let Ok(s) = pipe_thread_cutter(k, face, poly) {
-                return Ok(s);
-            }
-            if let Ok(s) = pipe_along(k, face, poly) {
-                return Ok(s);
-            }
-        }
-        Err(occt_err("helical V-thread sweep failed"))
-    }
-
-    /// Helical circular groove — a thin bead on a polyline helix, never rings.
-    fn helical_round_groove(
-        k: &mut occt_wasm::OcctKernel,
-        major: f64,
-        pitch: f64,
-        length: f64,
-        internal: bool,
-        z0: f64,
-    ) -> Result<Handle, KernelError> {
-        let depth = crate::thread::external_depth(pitch);
-        let r_h = if internal {
-            crate::thread::tap_drill_diameter(major, pitch) / 2.0
-        } else {
-            major / 2.0 - depth * 0.45
-        };
-        let sec_r = (depth * 0.55).max(pitch * 0.18);
-        let z_start = z0 - pitch * 0.12;
-        let height = (length + pitch).max(pitch * 2.0);
-        let path = crate::thread::cutter_helix_path(
-            r_h,
-            pitch,
-            height,
-            z_start,
-            thread_polyline_samples(height, pitch),
-        );
-        let poly = wire_from_polyline3(k, &path)?;
-        let p0 = path[0];
-        let p1 = path.get(1).copied().unwrap_or([p0[0], p0[1], p0[2] + pitch]);
-        let tx = p1[0] - p0[0];
-        let ty = p1[1] - p0[1];
-        let tz = p1[2] - p0[2];
-        // Frenet-pipe a circular bead so the groove yaws with the helix.
-        // `pipe_along` prefers MakePipe, which can lock the trihedron and
-        // leave a vertical strip of the original cylinder.
-        if !internal {
-            if let Ok(edge) = k.make_circle_edge(p0[0], p0[1], p0[2], tx, ty, tz, sec_r) {
-                if let Ok(wire) = k.make_wire(&[edge]) {
-                    if let Ok(face) = k.make_face(wire) {
-                        if let Ok(s) = pipe_thread_cutter(k, face, poly) {
-                            return Ok(s);
-                        }
-                    }
-                }
-            }
-        }
-        let yaw = p0[1].atan2(p0[0]);
-        let square = crate::thread::cutter_meridian_square(r_h, sec_r, yaw, p0[2]);
-        if let Ok(face) = face_from_polygon_3d(k, &square) {
-            if let Ok(s) = pipe_thread_cutter(k, face, poly) {
-                return Ok(s);
-            }
-            if let Ok(s) = pipe_along(k, face, poly) {
-                return Ok(s);
-            }
-        }
-        helix_solid(k, poly, r_h, pitch, height, sec_r, false)
     }
 
     /// Sweep a thread bead with a rolling (Frenet) trihedron so yaw walks
@@ -3007,6 +2942,17 @@ pub(crate) mod occt_backend {
         } else {
             let max_pts = 220.0;
             ((max_pts / turns).floor() as u32).clamp(16, 32)
+        }
+    }
+
+    /// Loft sections per turn. Dense enough that zoomed flanks are a helix,
+    /// sparse enough that an 8-turn ThruSections stays viewport-fast.
+    fn thread_loft_samples(height: f64, pitch: f64) -> u32 {
+        let turns = (height / pitch.max(1e-9)).max(0.25);
+        if turns <= 8.5 {
+            20
+        } else {
+            12
         }
     }
 
@@ -3340,13 +3286,13 @@ pub(crate) mod occt_backend {
             .map_err(|e| occt_err(format!("path wire: {e}")))
     }
 
-    fn face_from_polygon_3d(
+    fn closed_polygon_wire(
         k: &mut occt_wasm::OcctKernel,
         pts: &[[f64; 3]],
     ) -> Result<Handle, KernelError> {
         if pts.len() < 3 {
             return Err(KernelError::InvalidState(
-                "polygon face needs at least 3 points".into(),
+                "polygon wire needs at least 3 points".into(),
             ));
         }
         let mut edges = Vec::with_capacity(pts.len());
@@ -3358,9 +3304,15 @@ pub(crate) mod occt_backend {
                 .map_err(|err| occt_err(format!("polygon edge: {err}")))?;
             edges.push(e);
         }
-        let wire = k
-            .make_wire(&edges)
-            .map_err(|e| occt_err(format!("polygon wire: {e}")))?;
+        k.make_wire(&edges)
+            .map_err(|e| occt_err(format!("polygon wire: {e}")))
+    }
+
+    fn face_from_polygon_3d(
+        k: &mut occt_wasm::OcctKernel,
+        pts: &[[f64; 3]],
+    ) -> Result<Handle, KernelError> {
+        let wire = closed_polygon_wire(k, pts)?;
         k.make_face(wire)
             .or_else(|_| k.make_non_planar_face(wire))
             .map_err(|e| occt_err(format!("polygon face: {e}")))
