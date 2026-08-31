@@ -142,6 +142,10 @@ fn run() -> Result<bool, String> {
         Vec::new()
     };
 
+    // Diagnostic STEP probes (not check a). Isolates "STEP is dead" vs "this bolt's STEP crashes".
+    probe_step(&engine, &ir_value, 2, "hex-only (sketch+extrude)", &mut log);
+    probe_step(&engine, &ir_value, 3, "hex+shank (no thread)", &mut log);
+
     // STEP from Engine::export (B-Rep). Long threads may instance rods on an
     // uncut host — STEP without helical grooves is OK (out of scope).
     let step_path = out_dir.join("m8_x40.step");
@@ -325,6 +329,30 @@ fn rel(p: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string()
+}
+
+fn probe_step(
+    engine: &Engine,
+    ir: &serde_json::Value,
+    n_features: usize,
+    label: &str,
+    log: &mut Vec<String>,
+) {
+    let mut v = ir.clone();
+    if let Some(arr) = v["features"].as_array_mut() {
+        arr.truncate(n_features);
+    }
+    match serde_json::from_value::<CadProgram>(v) {
+        Ok(p) => match engine.export(&p, &ExportFormat::Step) {
+            Ok(b) => log.push(format!(
+                "STEP probe {label}: ok, {} bytes (ISO-10303={})",
+                b.len(),
+                String::from_utf8_lossy(&b).contains("ISO-10303")
+            )),
+            Err(e) => log.push(format!("STEP probe {label} FAILED: {e}")),
+        },
+        Err(e) => log.push(format!("STEP probe {label} IR: {e}")),
+    }
 }
 
 fn hex_head_only(ir: &serde_json::Value) -> serde_json::Value {
