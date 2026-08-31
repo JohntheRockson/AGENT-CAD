@@ -1,0 +1,9 @@
+/target
+/out
+*.stl
+*.step
+*.stp
+*.obj
+*.brep
+*.glb
+*.gltf

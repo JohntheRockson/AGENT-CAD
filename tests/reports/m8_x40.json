@@ -1,0 +1,19 @@
+{
+  "units": "mm",
+  "features": [
+    {
+      "op": "sketch",
+      "plane": "XY",
+      "profile": { "hex": { "across_flats": 10 } }
+    },
+    { "op": "extrude", "depth": 5.5 },
+    { "op": "cylinder", "diameter": 8, "height": 35.5, "at": [0, 0, 4.5] },
+    {
+      "op": "thread",
+      "kind": "external",
+      "size": "M8",
+      "length": 34.5,
+      "at": [0, 0, 5.5]
+    }
+  ]
+}
