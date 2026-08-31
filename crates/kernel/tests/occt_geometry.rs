@@ -520,6 +520,7 @@ fn m8_external_thread_builds() {
         n_yaws >= 5,
         "groove must walk around the shank (helix); distinct yaws over one thread={n_yaws} (rings stay in 1-2 bins)"
     );
+    assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 1.2, zmin + 6.5);
     if let Ok(path) = std::env::var("AGENTCAD_DUMP_MESH_SHORT") {
         std::fs::write(&path, kernel::export::to_obj(&out.mesh)).expect("dump mesh");
     }
@@ -595,6 +596,85 @@ fn radius_variation_at_z(mesh: &kernel::engine::MeshData, z: f64, band: f64) -> 
     }
     let mean = rs.iter().sum::<f64>() / rs.len() as f64;
     (rs.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rs.len() as f64).sqrt()
+}
+
+/// Fail if a yaw sector stays at the major radius over the whole shank band —
+/// a generator-line of uncut cylinder (the M8 sliver). Also flags the +X
+/// meridian specifically: that is the hex-vertex seam the cutter used to miss.
+fn assert_no_vertical_uncut_strip(
+    mesh: &kernel::engine::MeshData,
+    r_major: f64,
+    pitch: f64,
+    z0: f64,
+    z1: f64,
+) {
+    assert!(
+        !mesh.positions.is_empty(),
+        "empty mesh — WASM trap / placeholder, not a threaded shank"
+    );
+    let depth = kernel::thread::external_depth(pitch);
+    let cut_r = r_major - 0.28 * depth;
+    const N: usize = 48;
+    let mut mins = [f64::MAX; N];
+    let mut counts = [0u32; N];
+    let mut plus_x_min = f64::MAX;
+    let mut plus_x_n = 0u32;
+    for chunk in mesh.positions.chunks(3) {
+        if chunk.len() < 3 {
+            continue;
+        }
+        let z = chunk[2] as f64;
+        if z < z0 || z > z1 {
+            continue;
+        }
+        let x = chunk[0] as f64;
+        let y = chunk[1] as f64;
+        let r = (x * x + y * y).sqrt();
+        if r < r_major * 0.55 {
+            continue;
+        }
+        let theta = y.atan2(x);
+        let mut bin = (((theta + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)) * N as f64)
+            .floor() as isize;
+        if bin < 0 {
+            bin = 0;
+        }
+        let bin = (bin as usize).min(N - 1);
+        mins[bin] = mins[bin].min(r);
+        counts[bin] += 1;
+        if theta.abs() < 0.14 {
+            plus_x_min = plus_x_min.min(r);
+            plus_x_n += 1;
+        }
+    }
+    let populated = counts.iter().filter(|c| **c >= 4).count();
+    assert!(
+        populated >= N * 2 / 3,
+        "too few yaw bins have vertices ({populated}/{N}) — placeholder or tessellation failed"
+    );
+    let mut uncut: Vec<(usize, f64, u32)> = Vec::new();
+    for i in 0..N {
+        if counts[i] >= 6 && mins[i] > cut_r {
+            uncut.push((i, mins[i], counts[i]));
+        }
+    }
+    assert!(
+        uncut.is_empty(),
+        "vertical uncut strip after helical thread CUT: yaw bins {:?} stay above r={cut_r:.3} \
+         (major={r_major}). Groove must continue all the way around.",
+        uncut
+            .iter()
+            .map(|(i, r, n)| format!("bin{i} r={r:.3} n={n}"))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        plus_x_n >= 4,
+        "+X meridian (hex-vertex seam) has no shank vertices — cannot inspect the sliver"
+    );
+    assert!(
+        plus_x_min <= cut_r,
+        "+X meridian still at r={plus_x_min:.3} (cut below {cut_r:.3}) — the screenshot sliver"
+    );
 }
 
 /// Min radius in each yaw sector. A helix has a groove in some sectors only;
@@ -785,9 +865,57 @@ fn m8_hex_head_bolt_40mm_builds() {
         n_yaws >= 5,
         "40 mm groove must walk around the shank; distinct yaws={n_yaws}"
     );
+    assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
     if let Ok(path) = std::env::var("AGENTCAD_DUMP_MESH") {
         std::fs::write(&path, kernel::export::to_obj(&out.mesh)).expect("dump mesh");
     }
+}
+
+/// Cylinder + helical thread CUT (short enough to boolean for real, not instance).
+/// The golden failure was a leftover +X generator-line of uncut cylinder.
+#[test]
+fn cylinder_plus_helical_thread_cut_has_no_vertical_sliver() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "cylinder", "diameter": 8, "height": 8, "axis": "Z" },
+            { "op": "thread", "kind": "external", "size": "M8", "length": 8 }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new()
+        .execute(&prog)
+        .expect("cylinder + helical thread CUT must not WASM-trap");
+    let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
+    let dx = (xmax - xmin).abs();
+    let dy = (ymax - ymin).abs();
+    let dz = (zmax - zmin).abs();
+    assert!(
+        dx > 6.0 && dy > 6.0 && dz > 6.0,
+        "placeholder bbox after thread cut: {:?}",
+        out.metrics.bbox
+    );
+    let major_cyl = std::f64::consts::PI * 4.0 * 4.0 * 8.0;
+    assert!(
+        out.metrics.volume > 50.0 && out.metrics.volume < 0.97 * major_cyl,
+        "placeholder volume after thread cut: {} (smooth cyl={})",
+        out.metrics.volume,
+        major_cyl
+    );
+    let mid = (zmin + zmax) * 0.5;
+    let variation = radius_variation_at_z(&out.mesh, mid, 0.2);
+    assert!(
+        variation > 0.08,
+        "thread should be helical; variation={variation} — stacked rings are axisymmetric"
+    );
+    let n_yaws = distinct_groove_yaws(&out.mesh, zmin + 1.2, zmin + 6.5, 12);
+    assert!(
+        n_yaws >= 5,
+        "groove must walk around the shank; distinct yaws={n_yaws} (rings stay in 1-2 bins)"
+    );
+    assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 1.2, zmin + 6.5);
 }
 
 /// Agent often threads first then fuses a hex head — that boolean used to crash.

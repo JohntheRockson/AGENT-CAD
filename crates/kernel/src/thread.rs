@@ -199,6 +199,63 @@ pub fn tap_drill_diameter(major: f64, pitch: f64) -> f64 {
     (major - pitch).max(major * 0.5)
 }
 
+/// Extra turns swept before θ = 0 and after the last turn.
+///
+/// The cutter helix used to start and end on +X — the same generator as a
+/// hex-head vertex. OCCT's pipe then leaves that meridian uncut, a vertical
+/// sliver of the original cylinder. Overlapping the start/end azimuth closes
+/// the 360° sweep without adding a full extra turn (WASM budget).
+pub const CUTTER_SEAM_OVERLAP_TURNS: f64 = 0.15;
+
+/// Polyline helix for a thread cutter. `z0` is the Z of the first *nominal*
+/// turn (t = 0); samples extend `CUTTER_SEAM_OVERLAP_TURNS` before and after
+/// so the groove overlaps its start/end meridian.
+pub fn cutter_helix_path(
+    radius: f64,
+    pitch: f64,
+    height: f64,
+    z0: f64,
+    pts_per_turn: u32,
+) -> Vec<[f64; 3]> {
+    let pitch = pitch.max(1e-9);
+    let turns = (height / pitch).max(0.25);
+    let t0 = -CUTTER_SEAM_OVERLAP_TURNS;
+    let t1 = turns + CUTTER_SEAM_OVERLAP_TURNS;
+    let ppt = f64::from(pts_per_turn.max(8));
+    let n = (((t1 - t0) * ppt).ceil() as usize).max(8);
+    (0..=n)
+        .map(|i| {
+            let t = t0 + (t1 - t0) * (i as f64) / (n as f64);
+            let a = t * 2.0 * std::f64::consts::PI;
+            [radius * a.cos(), radius * a.sin(), z0 + t * pitch]
+        })
+        .collect()
+}
+
+/// Square bead in the meridian plane at `yaw` (axis-through-point). Matches
+/// the historical XZ square when `yaw == 0`.
+pub fn cutter_meridian_square(radius: f64, sec_r: f64, yaw: f64, z: f64) -> [[f64; 3]; 4] {
+    let (c, s) = (yaw.cos(), yaw.sin());
+    let r0 = radius - sec_r;
+    let r1 = radius + sec_r;
+    [
+        [r0 * c, r0 * s, z - sec_r],
+        [r1 * c, r1 * s, z - sec_r],
+        [r1 * c, r1 * s, z + sec_r],
+        [r0 * c, r0 * s, z + sec_r],
+    ]
+}
+
+/// Compact V-groove in the meridian plane at `yaw`.
+pub fn cutter_meridian_vee(r_out: f64, r_in: f64, half: f64, yaw: f64, z: f64) -> [[f64; 3]; 3] {
+    let (c, s) = (yaw.cos(), yaw.sin());
+    [
+        [r_out * c, r_out * s, z],
+        [r_out * c, r_out * s, z + 2.0 * half],
+        [r_in * c, r_in * s, z + half],
+    ]
+}
+
 /// Convert a millimetre spec into document units.
 pub fn to_units(spec: &ThreadSpec, inch: bool) -> ThreadSpec {
     if !inch {
@@ -239,5 +296,59 @@ mod tests {
     fn numbered_eight_thirty_two() {
         let s = parse_size("#8-32").unwrap();
         assert!((s.major_diameter - 0.164 * 25.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cutter_helix_path_overlaps_plus_x_seam() {
+        let path = cutter_helix_path(4.0, 1.25, 8.0, 0.0, 24);
+        assert!(path.len() >= 16, "path too short: {}", path.len());
+
+        let start_yaw = path[0][1].atan2(path[0][0]);
+        assert!(
+            start_yaw < -0.2,
+            "cutter must start before the +X hex-vertex seam, yaw={start_yaw}"
+        );
+
+        let mut total = 0.0;
+        for w in path.windows(2) {
+            let a0 = w[0][1].atan2(w[0][0]);
+            let a1 = w[1][1].atan2(w[1][0]);
+            let mut d = a1 - a0;
+            if d < -std::f64::consts::PI {
+                d += 2.0 * std::f64::consts::PI;
+            }
+            if d > std::f64::consts::PI {
+                d -= 2.0 * std::f64::consts::PI;
+            }
+            assert!(d > -1e-9, "helix path walked backwards: {d}");
+            total += d;
+        }
+        let nominal = 2.0 * std::f64::consts::PI * (8.0 / 1.25);
+        assert!(
+            total > nominal + 0.5,
+            "angular sweep {total:.3} must overlap past {nominal:.3} (close 360°)"
+        );
+
+        let mut bins = [false; 32];
+        for p in &path {
+            let yaw = p[1].atan2(p[0]);
+            let mut bin = (((yaw + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)) * 32.0)
+                .floor() as isize;
+            if bin < 0 {
+                bin = 0;
+            }
+            bins[(bin as usize).min(31)] = true;
+        }
+        assert!(
+            bins.iter().all(|&hit| hit),
+            "cutter helix missed a yaw sector — that is the uncut sliver"
+        );
+    }
+
+    #[test]
+    fn cutter_meridian_square_matches_xz_at_zero_yaw() {
+        let sq = cutter_meridian_square(4.0, 0.4, 0.0, 0.0);
+        assert!((sq[0][0] - 3.6).abs() < 1e-12 && sq[0][1].abs() < 1e-12);
+        assert!((sq[1][0] - 4.4).abs() < 1e-12 && sq[1][1].abs() < 1e-12);
     }
 }
