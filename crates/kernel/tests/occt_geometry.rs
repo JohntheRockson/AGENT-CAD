@@ -1358,6 +1358,117 @@ fn m8_bolt_length_keeps_head_and_dead_height() {
     );
 }
 
+/// Golden recipe from the leftover-tessellate-crash job: hex → overlapping
+/// cylinder → long thread CUT. Must instance short rods and never mesh the
+/// >8-turn uncut host.
+fn golden_hex_cylinder_thread_cut() -> CadDocument {
+    CadDocument::from_json_value(serde_json::json!({
+        "documentId": "m8_bolt",
+        "units": "mm",
+        "parameters": { "head_width": 13.0, "head_height": 5.3, "bolt_length": 24.0 },
+        "bodies": [{
+            "bodyId": "body_m8_bolt",
+            "features": [
+                { "op": "sketch", "plane": "XY",
+                  "profile": { "hex": { "across_flats": "head_width" } } },
+                { "op": "extrude", "depth": "head_height" },
+                { "op": "cylinder", "diameter": 8, "height": "bolt_length", "at": [0, 0, 3] },
+                { "op": "thread", "kind": "external", "size": "M8", "length": 20, "at": [0, 0, 5.3] }
+            ]
+        }]
+    }))
+    .expect("golden bolt document")
+}
+
+fn assert_not_wasm_trap(err: &kernel::engine::KernelError) {
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        !msg.contains("runtime")
+            && !msg.contains("wasm trap")
+            && !msg.contains("wasm runtime")
+            && !msg.contains("out of bounds")
+            && !msg.contains("memory fault")
+            && !msg.contains("unreachable")
+            && !msg.contains("internal cad kernel crash"),
+        "instance-path failure trapped WASM: {err}"
+    );
+}
+
+/// Golden hex → overlapping cylinder → thread CUT never tessellates a
+/// >8-turn uncut host (instance short rods instead).
+#[test]
+fn golden_hex_cylinder_thread_cut_never_tessellates_long_uncut_host() {
+    let _ = kernel::engine::take_long_host_tessellate_attempts();
+    let t0 = std::time::Instant::now();
+    let out = Engine::new()
+        .execute_document(&golden_hex_cylinder_thread_cut())
+        .expect("golden hex→cylinder→thread CUT should instance, not trap");
+    assert!(
+        t0.elapsed().as_secs() < 25,
+        "golden bolt took {:?} — instance path must stay viewport-fast",
+        t0.elapsed()
+    );
+    assert_eq!(
+        kernel::engine::take_long_host_tessellate_attempts(),
+        0,
+        "tessellated a >8-turn uncut host (old fallthrough)"
+    );
+    let mesh = &out.bodies[0].mesh;
+    assert!(
+        !mesh.positions.is_empty(),
+        "empty mesh — WASM trap / placeholder"
+    );
+    let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
+    assert!(
+        (xmax - xmin).abs() > 12.0 && (ymax - ymin).abs() > 12.0,
+        "expected ~13 mm hex head, bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(
+        (zmax - zmin).abs() > 20.0,
+        "expected shank+head length, bbox={:?}",
+        out.metrics.bbox
+    );
+    let n_yaws = distinct_groove_yaws(mesh, zmin + 8.0, zmin + 18.0, 12);
+    assert!(
+        n_yaws >= 5,
+        "groove must walk around the shank; distinct yaws={n_yaws}"
+    );
+}
+
+/// Force the short-rod instance path to fail. Must not trap WASM and must
+/// not take the old tessellate_solid fallthrough onto the uncut long host.
+#[test]
+fn long_thread_instance_failure_does_not_fallthrough_to_uncut_host() {
+    let _ = kernel::engine::take_long_host_tessellate_attempts();
+    let _guard = kernel::engine::with_forced_thread_instance_failure();
+    let result = Engine::new().execute_document(&golden_hex_cylinder_thread_cut());
+    let attempts = kernel::engine::take_long_host_tessellate_attempts();
+    match result {
+        Err(e) => {
+            assert_not_wasm_trap(&e);
+            let msg = e.to_string();
+            assert!(
+                msg.contains("refusing uncut-host tessellate fallthrough")
+                    || msg.contains("instance path"),
+                "expected fail-closed instance error, got: {msg}"
+            );
+        }
+        Ok(out) => {
+            panic!(
+                "instance-path failure must fail closed, not return an uncut-host mesh \
+                 (verts={}, vol={}, long-host tessellate attempts={attempts})",
+                out.bodies.first().map(|b| b.mesh.positions.len()).unwrap_or(0),
+                out.metrics.volume,
+            );
+        }
+    }
+    assert_eq!(
+        attempts, 0,
+        "old fallthrough tessellated the >8-turn uncut host"
+    );
+}
+
 /// Z span of vertices outside the shank radius (the hex head).
 fn hex_head_z_extent(mesh: &kernel::engine::MeshData, shank_r: f64) -> (f64, f64, f64) {
     let cut = shank_r + 0.45;
