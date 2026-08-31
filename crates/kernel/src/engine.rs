@@ -2808,16 +2808,17 @@ pub(crate) mod occt_backend {
         let r_h = 0.5 * (r_out + r_in);
         let z_start = z0 - half;
         let height = (length + pitch * 1.1).max(pitch * 2.0);
-        let pts = [
-            [r_out, 0.0, 0.0],
-            [r_out, 0.0, 2.0 * half],
-            [r_in, 0.0, half],
-        ];
-        let mut path = helix_polyline(r_h, pitch, height, thread_polyline_samples(height, pitch));
-        for p in &mut path {
-            p[2] += z_start;
-        }
+        let path = crate::thread::cutter_helix_path(
+            r_h,
+            pitch,
+            height,
+            z_start,
+            thread_polyline_samples(height, pitch),
+        );
         let poly = wire_from_polyline3(k, &path)?;
+        let p0 = path[0];
+        let yaw = p0[1].atan2(p0[0]);
+        let pts = crate::thread::cutter_meridian_vee(r_out, r_in, half, yaw, p0[2]);
         if let Ok(face) = face_from_polygon_3d(k, &pts) {
             if let Ok(s) = pipe_along(k, face, poly) {
                 return Ok(s);
@@ -2844,11 +2845,23 @@ pub(crate) mod occt_backend {
         let sec_r = (depth * 0.55).max(pitch * 0.18);
         let z_start = z0 - pitch * 0.12;
         let height = (length + pitch).max(pitch * 2.0);
-        let mut path = helix_polyline(r_h, pitch, height, thread_polyline_samples(height, pitch));
-        for p in &mut path {
-            p[2] += z_start;
-        }
+        let path = crate::thread::cutter_helix_path(
+            r_h,
+            pitch,
+            height,
+            z_start,
+            thread_polyline_samples(height, pitch),
+        );
         let poly = wire_from_polyline3(k, &path)?;
+        if let Some(&p0) = path.first() {
+            let yaw = p0[1].atan2(p0[0]);
+            let square = crate::thread::cutter_meridian_square(r_h, sec_r, yaw, p0[2]);
+            if let Ok(face) = face_from_polygon_3d(k, &square) {
+                if let Ok(s) = pipe_along(k, face, poly) {
+                    return Ok(s);
+                }
+            }
+        }
         helix_solid(k, poly, r_h, pitch, height, sec_r, false)
     }
 
