@@ -84,6 +84,34 @@ pub struct MeshData {
     pub indices: Vec<u32>,
 }
 
+/// Where the drawable mesh came from relative to B-Rep metrics.
+///
+/// Long Z external threads leave hex+shank uncut in B-Rep and instance short
+/// helical rods for the viewport / STL / faceted STEP. Volume and surface
+/// area then describe that uncut solid, not the grooved display mesh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MeshProvenance {
+    /// Mesh, STEP, and metrics all come from the same B-Rep tessellation.
+    #[default]
+    Brep,
+    /// Display / STL / faceted STEP are instanced short thread rods.
+    /// `volume` and `surface_area` are from the uncut hex+shank B-Rep.
+    InstancedThread,
+}
+
+impl MeshProvenance {
+    /// Visible note when metrics describe a different solid than the mesh.
+    pub fn honesty_note(self) -> Option<&'static str> {
+        match self {
+            Self::Brep => None,
+            Self::InstancedThread => Some(
+                "display/STL/STEP mesh is instanced short thread rods; \
+                 volume/surface_area are from the uncut hex+shank B-Rep",
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MetricsData {
     pub volume: f64,
@@ -91,6 +119,8 @@ pub struct MetricsData {
     pub bbox: [f64; 6],
     pub surface_area: f64,
     pub is_solid: bool,
+    /// Names the mesh vs B-Rep split on long instanced threads.
+    pub mesh_provenance: MeshProvenance,
 }
 
 #[derive(Debug, Clone)]
@@ -392,6 +422,7 @@ pub(crate) mod mock_backend {
                 bbox,
                 surface_area,
                 is_solid: true,
+                mesh_provenance: MeshProvenance::Brep,
             },
         })
     }
@@ -409,11 +440,13 @@ pub(crate) mod mock_backend {
                 let out = execute_with_mock(program)?;
                 Ok(export::to_obj(&out.mesh).into_bytes())
             }
-            ExportFormat::Step | ExportFormat::Gltf | ExportFormat::Brep => {
-                Err(KernelError::InvalidState(
-                    "STEP, glTF and BREP export require the `occt` feature".into(),
-                ))
+            ExportFormat::Step => {
+                let out = execute_with_mock(program)?;
+                export::step_export_bytes(&out.mesh).map_err(KernelError::InvalidState)
             }
+            ExportFormat::Gltf | ExportFormat::Brep => Err(KernelError::InvalidState(
+                "glTF and BREP export require the `occt` feature".into(),
+            )),
         }
     }
 
@@ -453,11 +486,12 @@ pub(crate) mod mock_backend {
         match format {
             ExportFormat::Stl => Ok(export::to_stl(&model.mesh)),
             ExportFormat::Obj => Ok(export::to_obj(&model.mesh).into_bytes()),
-            ExportFormat::Step | ExportFormat::Gltf | ExportFormat::Brep => {
-                Err(KernelError::InvalidState(
-                    "STEP, glTF and BREP export require the `occt` feature".into(),
-                ))
+            ExportFormat::Step => {
+                export::step_export_bytes(&model.mesh).map_err(KernelError::InvalidState)
             }
+            ExportFormat::Gltf | ExportFormat::Brep => Err(KernelError::InvalidState(
+                "glTF and BREP export require the `occt` feature".into(),
+            )),
         }
     }
 
@@ -723,7 +757,8 @@ pub(crate) mod occt_backend {
     }
 
     /// Keep only edges whose underlying curve is a straight line.
-    /// Circular/seam edges from hole cylinders cause OCCT fillet to fail.
+    /// Used on thin plates so hole-cylinder seam circles do not enter fillet.
+    /// Do **not** use this to drop the Ø head–shank circle on a bolt.
     fn filter_to_line_edges(k: &mut occt_wasm::OcctKernel, ids: Vec<u32>) -> Vec<u32> {
         ids.into_iter()
             .filter(|&id| {
@@ -732,6 +767,65 @@ pub(crate) mod occt_backend {
                     .map_or(false, |t| t.eq_ignore_ascii_case("line"))
             })
             .collect()
+    }
+
+    /// Tall fastener: Z is the long axis and XY is roughly square (hex head).
+    /// A 13×13×40 bolt must not be treated as a plate whose thin dir is X or Y.
+    fn is_bolt_like(extents: [f64; 3]) -> bool {
+        let z = extents[2];
+        let xy_max = extents[0].max(extents[1]);
+        let xy_min = extents[0].min(extents[1]);
+        z > 1.45 * xy_max && xy_min > 0.55 * xy_max && xy_max > 1.0
+    }
+
+    /// Circular edges lying in a plane ⊥ `axis` (the under-head Ø junction).
+    /// Named circles *or* a flat, nearly-round bbox (boolean seams sometimes
+    /// report as trimmed/bspline). Prefer edges nearer the head than the tip.
+    fn circular_junction_edges(
+        k: &mut occt_wasm::OcctKernel,
+        solid: Handle,
+        ids: &[u32],
+        axis: usize,
+    ) -> Vec<u32> {
+        let solid_bb = k.get_bounding_box(solid, false).ok();
+        let z0 = solid_bb.as_ref().map(|b| aabb_min(b, axis)).unwrap_or(0.0);
+        let z1 = solid_bb.as_ref().map(|b| aabb_max(b, axis)).unwrap_or(1.0);
+        let zspan = (z1 - z0).abs().max(1e-9);
+        let mut scored: Vec<(u32, f64)> = ids
+            .iter()
+            .copied()
+            .filter_map(|id| {
+                let h = id_to_handle(id);
+                let t = k.curve_type(h).unwrap_or_default();
+                let named = t.to_ascii_lowercase().contains("circle");
+                let Ok(eb) = k.get_bounding_box(h, false) else {
+                    return None;
+                };
+                let spans = aabb_extents(&eb);
+                let in_a = spans[(axis + 1) % 3];
+                let in_b = spans[(axis + 2) % 3];
+                let along = spans[axis];
+                let dia = in_a.max(in_b);
+                let dia_min = in_a.min(in_b);
+                if dia < 1.0 || along > 0.35 * dia.max(0.5) {
+                    return None;
+                }
+                let round = dia_min > 0.65 * dia;
+                if !named && !round {
+                    return None;
+                }
+                let mid = 0.5 * (aabb_min(&eb, axis) + aabb_max(&eb, axis));
+                let z_rel = (mid - z0) / zspan;
+                // Under-head sits near the hex (low Z). Drop the free tip circle.
+                if z_rel > 0.45 {
+                    return None;
+                }
+                Some((id, dia))
+            })
+            .collect();
+        // Prefer shank-scale circles (Ø8) over any leftover hex-scale loops.
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().map(|(id, _)| id).collect()
     }
 
     struct EdgeInfo {
@@ -795,7 +889,12 @@ pub(crate) mod occt_backend {
         ids: &[u32],
     ) -> Vec<EdgeInfo> {
         let extents = aabb_extents(solid_bb);
-        let thin = argmin3(extents);
+        // Bolt Z, not argmin3: a 13×13×40 hex-head is not a plate along X/Y.
+        let thin = if is_bolt_like(extents) {
+            2
+        } else {
+            argmin3(extents)
+        };
         let thickness = extents[thin].max(1e-9);
         ids.iter()
             .filter_map(|&id| {
@@ -829,6 +928,10 @@ pub(crate) mod occt_backend {
     /// `"all"` on a thin lid used to include the 6 mm verticals *and* both the
     /// top and bottom perimeters. A 5 mm radius on 6 mm stock then self-intersects
     /// at the corners and tessellates into spikes.
+    ///
+    /// On a tall bolt, the blend is the circular head–shank junction (Ø shank
+    /// in XY). Do not let `argmin3` treat X/Y as plate thickness, and do not
+    /// drop that circle via `filter_to_line_edges`.
     fn select_blend_edges(
         k: &mut occt_wasm::OcctKernel,
         solid: Handle,
@@ -839,7 +942,15 @@ pub(crate) mod occt_backend {
             return ids;
         };
         let extents = aabb_extents(&bb);
-        let thin = argmin3(extents);
+        if is_bolt_like(extents) {
+            let circles = circular_junction_edges(k, solid, &ids, 2);
+            if !circles.is_empty() {
+                return circles;
+            }
+        }
+        // Plates: thin direction. Bolts without a usable circle: bolt Z, not
+        // argmin3 (which picks X/Y on a 13×13×40 hex-head).
+        let thin = if is_bolt_like(extents) { 2 } else { argmin3(extents) };
         let thickness = extents[thin];
         let mut edges = classify_line_edges(k, &bb, &ids);
         if edges.is_empty() {
@@ -1196,6 +1307,7 @@ pub(crate) mod occt_backend {
                 bbox,
                 surface_area: k.get_surface_area(*solid).unwrap_or(0.0),
                 is_solid: true,
+                mesh_provenance: MeshProvenance::Brep,
             });
             meshes.push(*solid);
         }
@@ -1213,6 +1325,7 @@ pub(crate) mod occt_backend {
                 return match tessellate_thread_segments(k, &meshes, tp) {
                     Ok(mesh) if !mesh.positions.is_empty() => {
                         combined.bbox = bbox_from_positions(&mesh.positions);
+                        combined.mesh_provenance = MeshProvenance::InstancedThread;
                         Ok(ModelOutput {
                             mesh,
                             metrics: combined,
@@ -1247,6 +1360,24 @@ pub(crate) mod occt_backend {
             mesh: combine_meshes(&mesh_refs),
             metrics: combined,
         })
+    }
+
+    /// STEP without OCCT `export_step`. Inspector PR #13: that WASM writer
+    /// traps (`internal CAD kernel crash (wasm memory)`) on hex-only, hex+shank,
+    /// and golden M8×40. Tessellate the **same** budget-safe solid the viewport
+    /// uses (instanced short rods on long threads) and write a faceted
+    /// MANIFOLD_SOLID_BREP in Rust. Empty tessellation fails — no AABB box.
+    fn export_step_faceted(
+        k: &mut occt_wasm::OcctKernel,
+        shape: Handle,
+        pitch: Option<f64>,
+        preview: Option<ThreadPreview>,
+    ) -> Result<Vec<u8>, KernelError> {
+        let out = tessellate_solid(k, shape, pitch, preview)?;
+        if out.mesh.positions.is_empty() {
+            return Err(occt_err("step: tessellation was empty"));
+        }
+        crate::export::step_export_bytes(&out.mesh).map_err(occt_err)
     }
 
     fn bbox_diag(k: &mut occt_wasm::OcctKernel, solid: Handle) -> f64 {
@@ -1336,14 +1467,16 @@ pub(crate) mod occt_backend {
         let angular = if level == 0 { 0.32 } else { 0.55 };
         let body = tessellate_safe_host_caps(k, solids, &tp, level, angular)?;
 
+        // Overlap slabs by ~0.4 pitch so instanced rods stitch instead of
+        // butting as open sleeves. Each WASM tessellate stays ≤8 turns.
         let seg = (tp.pitch * 6.4).min(tp.length).max(tp.pitch * 2.0);
         if super::exceeds_inline_thread_budget(seg, tp.pitch) {
             return Err(occt_err(
                 "thread instance segment exceeds 8-turn tessellate budget",
             ));
         }
-        let n_full = (tp.length / seg).floor() as i32;
-        let rem = tp.length - n_full as f64 * seg;
+        let overlap = (tp.pitch * 0.40).clamp(0.20, tp.pitch * 0.55);
+        let stride = (seg - overlap).max(tp.pitch * 1.2);
         let helix_linear = preview_linear(Some(tp.pitch), level, tp.major.max(10.0));
 
         let proto = threaded_rod(k, tp.major, tp.pitch, seg)?;
@@ -1360,32 +1493,29 @@ pub(crate) mod occt_backend {
         if !body.positions.is_empty() {
             parts.push(body);
         }
-        let has_tail = rem > tp.pitch * 0.45;
-        for i in 0..n_full {
-            let z = i as f64 * seg;
-            let strip_bottom = i > 0;
-            let strip_top = i + 1 < n_full || has_tail;
-            let mesh = strip_z_caps(&proto_mesh, pz0, pz1, strip_bottom, strip_top);
-            parts.push(place_thread_mesh(&mesh, &tp, z));
+
+        // Overlapping windows of size `seg`, last start = length - seg so the
+        // rod never overshoots tp.length (bbox must stay tip-to-top honest).
+        let mut starts: Vec<f64> = Vec::new();
+        if tp.length <= seg + 1e-9 {
+            starts.push(0.0);
+        } else {
+            let last_start = tp.length - seg;
+            let mut z = 0.0;
+            while z < last_start - 1e-9 {
+                starts.push(z);
+                z += stride;
+            }
+            starts.push(last_start);
         }
-        if has_tail {
-            if super::exceeds_inline_thread_budget(rem, tp.pitch) {
-                return Err(occt_err(
-                    "thread instance tail exceeds 8-turn tessellate budget",
-                ));
-            }
-            let tail = threaded_rod(k, tp.major, tp.pitch, rem)?;
-            if solid_exceeds_inline_budget(k, tail, tp.pitch) {
-                super::record_long_host_tessellate_attempt();
-                return Err(occt_err(
-                    "thread tail rod exceeds 8-turn tessellate budget",
-                ));
-            }
-            let tail_mesh = tessellate_once(k, tail, helix_linear, angular)?;
-            let (tz0, tz1) = mesh_z_range(&tail_mesh);
-            let mesh = strip_z_caps(&tail_mesh, tz0, tz1, n_full > 0, false);
-            parts.push(place_thread_mesh(&mesh, &tp, n_full as f64 * seg));
-        } else if n_full == 0 {
+
+        for (i, &z_along) in starts.iter().enumerate() {
+            let strip_bottom = i > 0;
+            let strip_top = i + 1 < starts.len();
+            let mesh = strip_z_caps(&proto_mesh, pz0, pz1, strip_bottom, strip_top);
+            parts.push(place_thread_mesh(&mesh, &tp, z_along));
+        }
+        if starts.is_empty() {
             return Err(occt_err("thread preview produced no helical segments"));
         }
         if parts.is_empty() {
@@ -1456,6 +1586,7 @@ pub(crate) mod occt_backend {
             }
             for (a, b) in ranges {
                 let mut z = a;
+                let slab_overlap = (tp.pitch * 0.25).clamp(0.08, 0.35);
                 while z < b - 1e-9 {
                     let seg = (b - z).min(budget_z);
                     match clip_solid_to_z_slab(
@@ -1482,7 +1613,7 @@ pub(crate) mod occt_backend {
                         Err(e) if is_fatal_occt(&e) => return Err(e),
                         Err(_) => {}
                     }
-                    z += seg;
+                    z += (seg - slab_overlap).max(seg * 0.5);
                 }
             }
         }
@@ -1896,12 +2027,7 @@ pub(crate) mod occt_backend {
                     None
                 };
                 match format {
-                    ExportFormat::Step => {
-                        let s = heal_shape(k, solid);
-                        k.export_step(s)
-                            .map(|s| s.into_bytes())
-                            .map_err(|e| occt_err(format!("export_step: {:?}", e)))
-                    }
+                    ExportFormat::Step => export_step_faceted(k, solid, pitch, preview),
                     ExportFormat::Stl => {
                         let out = tessellate_solid(k, solid, pitch, preview)?;
                         Ok(crate::export::to_stl(&out.mesh))
@@ -1942,12 +2068,7 @@ pub(crate) mod occt_backend {
             let pitch = thread_pitch_hint(&program.features, &program.units);
             let preview = long_thread_preview(&program.features, &program.units);
             match format {
-                ExportFormat::Step => {
-                    let s = heal_shape(k, solid);
-                    k.export_step(s)
-                        .map(|s| s.into_bytes())
-                        .map_err(|e| occt_err(format!("export_step: {:?}", e)))
-                }
+                ExportFormat::Step => export_step_faceted(k, solid, pitch, preview),
                 ExportFormat::Stl => {
                     let out = tessellate_solid(k, solid, pitch, preview)?;
                     Ok(crate::export::to_stl(&out.mesh))
@@ -2438,7 +2559,9 @@ pub(crate) mod occt_backend {
             .map_err(|e| occt_err(format!("get_sub_shapes (fillet): {:?}", e)))?;
 
         if edge_ids.is_empty() {
-            return Ok(());
+            return Err(KernelError::InvalidState(
+                "fillet: solid has no edges (refusing silent no-op)".into(),
+            ));
         }
 
         let candidate_ids: Vec<u32> = match &op.edges {
@@ -2451,13 +2574,7 @@ pub(crate) mod occt_backend {
                 .collect(),
         };
 
-        let straight_ids = filter_to_line_edges(k, candidate_ids.clone());
-        let pool = if !straight_ids.is_empty() {
-            straight_ids
-        } else {
-            candidate_ids
-        };
-        let selected = select_blend_edges(k, solid, pool, op.radius);
+        let selected = select_fillet_pool(k, solid, candidate_ids, op.radius);
 
         let result = try_fillet(k, solid, &selected, op.radius)
             .or_else(|| {
@@ -2467,14 +2584,43 @@ pub(crate) mod occt_backend {
             .or_else(|| try_fillet(k, solid, &selected, op.radius * 0.6));
 
         match result {
-            Some(shape) => state.current_solid = Some(shape),
-            None => eprintln!(
-                "[AgentCAD] fillet degraded gracefully (radius {:.3} on {} edges)",
+            Some(shape) => {
+                state.current_solid = Some(shape);
+                Ok(())
+            }
+            None => Err(KernelError::InvalidState(format!(
+                "fillet: could not blend radius {:.3} on {} edges (refusing silent no-op)",
                 op.radius,
                 selected.len()
-            ),
+            ))),
         }
-        Ok(())
+    }
+
+    /// Prefer the circular head–shank junction on a bolt. Only filter to
+    /// straight lines on plate-like solids (hole-cylinder seams break fillet).
+    fn select_fillet_pool(
+        k: &mut occt_wasm::OcctKernel,
+        solid: Handle,
+        candidate_ids: Vec<u32>,
+        radius: f64,
+    ) -> Vec<u32> {
+        let bolt = k
+            .get_bounding_box(solid, false)
+            .ok()
+            .is_some_and(|bb| is_bolt_like(aabb_extents(&bb)));
+        if bolt {
+            let circles = circular_junction_edges(k, solid, &candidate_ids, 2);
+            if !circles.is_empty() {
+                return circles;
+            }
+        }
+        let straight_ids = filter_to_line_edges(k, candidate_ids.clone());
+        let pool = if !straight_ids.is_empty() {
+            straight_ids
+        } else {
+            candidate_ids
+        };
+        select_blend_edges(k, solid, pool, radius)
     }
 
     fn handle_chamfer(
@@ -2492,7 +2638,9 @@ pub(crate) mod occt_backend {
             .map_err(|e| occt_err(format!("get_sub_shapes (chamfer): {:?}", e)))?;
 
         if edge_ids.is_empty() {
-            return Ok(());
+            return Err(KernelError::InvalidState(
+                "chamfer: solid has no edges (refusing silent no-op)".into(),
+            ));
         }
 
         let candidate_ids: Vec<u32> = match &op.edges {
@@ -2505,13 +2653,7 @@ pub(crate) mod occt_backend {
                 .collect(),
         };
 
-        let straight_ids = filter_to_line_edges(k, candidate_ids.clone());
-        let pool = if !straight_ids.is_empty() {
-            straight_ids
-        } else {
-            candidate_ids
-        };
-        let selected = select_blend_edges(k, solid, pool, op.distance);
+        let selected = select_fillet_pool(k, solid, candidate_ids, op.distance);
 
         let result = try_chamfer(k, solid, &selected, op.distance, op.angle)
             .or_else(|| {
@@ -2521,14 +2663,16 @@ pub(crate) mod occt_backend {
             .or_else(|| try_chamfer(k, solid, &selected, op.distance * 0.6, op.angle));
 
         match result {
-            Some(shape) => state.current_solid = Some(shape),
-            None => eprintln!(
-                "[AgentCAD] chamfer degraded gracefully (distance {:.3} on {} edges)",
+            Some(shape) => {
+                state.current_solid = Some(shape);
+                Ok(())
+            }
+            None => Err(KernelError::InvalidState(format!(
+                "chamfer: could not blend distance {:.3} on {} edges (refusing silent no-op)",
                 op.distance,
                 selected.len()
-            ),
+            ))),
         }
-        Ok(())
     }
 
     fn handle_transform(
@@ -3789,11 +3933,13 @@ pub(crate) mod occt_backend {
         solid: Handle,
         edge_ids: &[u32],
         name: &str,
-        blend: f64,
+        _blend: f64,
     ) -> Vec<u32> {
         let name = name.to_ascii_lowercase();
         match name.as_str() {
-            "all" => select_blend_edges(k, solid, edge_ids.to_vec(), blend),
+            // Do not pre-filter here: handle_fillet's select_fillet_pool must
+            // still see the Ø8 head–shank circle on a bolt.
+            "all" => edge_ids.to_vec(),
             "top" => {
                 let Ok(bb) = k.get_bounding_box(solid, false) else {
                     return edge_ids.to_vec();
@@ -4657,16 +4803,21 @@ pub(crate) fn combine_metrics(parts: &[&MetricsData]) -> MetricsData {
             bbox: [0.0; 6],
             surface_area: 0.0,
             is_solid: false,
+            mesh_provenance: MeshProvenance::Brep,
         };
     }
     let mut bbox = parts[0].bbox;
     let mut volume = 0.0;
     let mut surface_area = 0.0;
     let mut is_solid = true;
+    let mut mesh_provenance = MeshProvenance::Brep;
     for m in parts {
         volume += m.volume;
         surface_area += m.surface_area;
         is_solid = is_solid && m.is_solid;
+        if m.mesh_provenance == MeshProvenance::InstancedThread {
+            mesh_provenance = MeshProvenance::InstancedThread;
+        }
         bbox[0] = bbox[0].min(m.bbox[0]);
         bbox[1] = bbox[1].min(m.bbox[1]);
         bbox[2] = bbox[2].min(m.bbox[2]);
@@ -4679,6 +4830,7 @@ pub(crate) fn combine_metrics(parts: &[&MetricsData]) -> MetricsData {
         bbox,
         surface_area,
         is_solid,
+        mesh_provenance,
     }
 }
 
@@ -4779,5 +4931,50 @@ mod document_tests {
         assert_eq!(out.bodies[1].body_id, "body_b");
         assert!(!out.bodies[0].mesh.positions.is_empty());
         assert!(!out.bodies[1].mesh.positions.is_empty());
+    }
+
+    #[test]
+    fn mock_step_export_is_nonempty_solid() {
+        let prog: CadProgram = serde_json::from_str(
+            r#"{ "units": "mm", "features": [{ "op": "box", "size": [10, 8, 40] }] }"#,
+        )
+        .unwrap();
+        let step = Engine::mock()
+            .export(&prog, &ExportFormat::Step)
+            .expect("mock STEP");
+        assert!(step.len() > 512);
+        let text = String::from_utf8_lossy(&step);
+        assert!(text.contains("ISO-10303-21"));
+        assert!(text.contains("MANIFOLD_SOLID_BREP"));
+        let bb = crate::export::cartesian_bbox_from_step(&step).unwrap();
+        assert!((bb[3] - bb[0] - 10.0).abs() < 0.01);
+        assert!((bb[5] - bb[2] - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn empty_tessellation_step_export_is_error_not_success() {
+        let empty = MeshData {
+            positions: vec![],
+            normals: vec![],
+            indices: vec![],
+        };
+        let err = crate::export::step_export_bytes(&empty)
+            .expect_err("empty tessellation must not succeed");
+        assert!(
+            err.contains("empty") || err.contains("no solid"),
+            "unexpected: {err}"
+        );
+        // Ok(vec![]) would be a 0-byte "success".
+        assert!(crate::export::step_export_bytes(&empty).is_err());
+    }
+
+    #[test]
+    fn instanced_thread_provenance_has_visible_honesty_note() {
+        let note = MeshProvenance::InstancedThread
+            .honesty_note()
+            .expect("instanced thread must name the B-Rep vs display split");
+        assert!(note.contains("uncut"));
+        assert!(note.contains("instanced"));
+        assert!(MeshProvenance::Brep.honesty_note().is_none());
     }
 }
