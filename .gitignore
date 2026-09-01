@@ -14,6 +14,7 @@
 !crates/
 !apps/
 !vendor/
+!tests/
 
 # apps/: only the web frontend source (never node_modules / dist)
 /apps/*

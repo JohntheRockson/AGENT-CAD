@@ -1,17 +1,20 @@
-# Inspector: golden M8×40 fillet + STEP/STL
+# Inspector: look-right golden M8×40
 
-Standalone package. It calls public `kernel` APIs only — no edits to
-`crates/kernel/src`, `vendor/occt-wasm`, or `apps/web`.
+Standalone package. Public `kernel` APIs only — no edits to
+`crates/kernel/src`, `vendor/occt-wasm`, or `apps/web`. Kernel owns STEP
+implementation (faceted export / #15). Inspector must not fake a PASS.
 
-Canonical recipe (non-binding; verified against
-`crates/kernel/tests/occt_geometry.rs` test `m8_hex_head_bolt_40mm_builds`):
+**One ISO caliper golden** (do not use AF 10): see [`GOLDEN.md`](GOLDEN.md)
+and [`m8_x40.json`](m8_x40.json). Locked with Kernel via
+`iso_m8_x40_golden_document` in `crates/kernel/tests/occt_geometry.rs`.
 
-- hex sketch `across_flats` 10 → extrude 5.5
-- overlapping cylinder diameter 8 height 35.5 at `[0,0,4.5]`
-- thread kind external size M8 length 34.5 at `[0,0,5.5]`
-- units mm
-
-IR: [`m8_x40.json`](m8_x40.json)
+| Caliper | Value |
+|---|---|
+| Across flats | **13 mm** |
+| Shank / major Ø | **8 mm** |
+| Pitch P | **1.25 mm** |
+| Length L | **40 mm** |
+| Head height | **~5.3 mm** |
 
 ## One command
 
@@ -21,21 +24,37 @@ From the repo root (Rust **1.95+** / current `stable`; `occt-wasm` needs it):
 cargo run --release --manifest-path tests/reports/Cargo.toml --features occt
 ```
 
-`--release` is strongly recommended: debug-mode wasmtime compiling the OCCT
-WASM module is very slow. The `rust-toolchain.toml` in this directory pins
-`stable` so the invocation does not pick up an older default toolchain.
+Look-right acceptance (no OCCT; synthetic helix / smooth-rod / STEP / fillet R):
+
+```bash
+cargo test --manifest-path tests/reports/Cargo.toml
+```
+
+`--release` is strongly recommended for the runner: debug-mode wasmtime
+compiling the OCCT WASM module is very slow. The `rust-toolchain.toml` in
+this directory pins `stable`.
 
 Outputs (gitignored meshes, committed report):
 
 - `tests/reports/out/m8_x40.obj` — viewport mesh
 - `tests/reports/out/m8_x40.stl` — `kernel::export::to_stl` of that mesh
-- `tests/reports/out/m8_x40.step` — B-Rep STEP via `Engine::export`
-- `tests/reports/REPORT.md` — pass/fail, sizes, bbox/volume
+- `tests/reports/out/m8_x40.step` — STEP via `Engine::export_document`
+- `tests/reports/REPORT.md` — pass/fail
 - `tests/reports/report.json` — same facts as JSON
 
-Exit code 0 only if STEP, STL, and fillet checks all pass. A silent no-op
-fillet is **FAIL**. This inspector does not patch the kernel.
+Exit code 0 only if **all** checks pass.
 
-Long external threads may instance rods on an uncut host. STEP of the B-Rep
-host without helical grooves is in-scope-OK (out of scope to put grooves
-into STEP).
+## Pass / fail
+
+1. **Viewport look-right** — helix (`angular_radius_spread`, `distinct_groove_yaws`),
+   ISO-V profile, no vertical uncut strip. Stacked ticks fail.
+2. **STL look-right** — non-empty **and** same bbox as the viewport mesh **and**
+   the same helix/ISO-V/sliver asserts. A smooth Ø8 rod with the same AABB
+   must **FAIL** (AABB-only is not enough).
+3. **STEP honesty** — empty or crash = **FAIL** (honest on current main).
+   When STEP exists: if the viewport is threaded but STEP is essentially the
+   uncut hex+shank (smooth Ø8 / no groove / volume≈uncut), **FAIL**.
+   Inspector does not implement STEP.
+4. **Fillet R** — under-head junction or named edges, measurable R and hex
+   look change. Silent no-op = **FAIL**. Δvolume alone is **not** sufficient.
+5. **ISO golden** — IR is AF 13 / Ø8 / P 1.25 / L 40 / head ~5.3.

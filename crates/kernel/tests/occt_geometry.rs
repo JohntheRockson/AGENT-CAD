@@ -1038,16 +1038,31 @@ fn offset_grows_a_box() {
     );
 }
 
+/// Locked ISO M8×40 caliper golden (AF 13, Ø8, P 1.25, L 40, head ~5.3).
+/// Shared with `tests/reports/m8_x40.json` — do not drift to AF 10.
+fn iso_m8_x40_golden_document() -> CadDocument {
+    const RAW: &str = include_str!("../../../tests/reports/m8_x40.json");
+    CadDocument::from_json_value(serde_json::from_str(RAW).expect("golden JSON"))
+        .expect("golden CadDocument")
+}
+
 /// Canonical hex-head bolt: hex extrude → overlapping shank → thread cut.
 /// ISO-ish golden: AF 13 (M8 wrench, not M6's 10), head ~5.3, Ø8 × 1.25.
 /// `bolt_length` 40 is still tip-to-top in this IR (under-head ISO 4017 follow-up).
+/// Shared with Inspector `tests/reports/m8_x40.json`.
 #[test]
 fn m8_hex_head_bolt_40mm_builds() {
-    let prog = golden_m8_x40_program();
+    let doc = iso_m8_x40_golden_document();
+    assert!(
+        (doc.parameters.get("head_width").copied().unwrap_or(0.0) - 13.0).abs() < 1e-9,
+        "ISO golden must stay AF 13, not AF 10"
+    );
     let t0 = std::time::Instant::now();
     let out = Engine::new()
-        .execute(&prog)
-        .expect("M8×40 hex-head bolt should build");
+        .execute_document(&doc)
+        .expect("M8×40 hex-head bolt should build")
+        .into_model_output()
+        .expect("golden document mesh");
     let elapsed = t0.elapsed();
     assert!(
         elapsed.as_secs() < 25,
@@ -1080,7 +1095,7 @@ fn m8_hex_head_bolt_40mm_builds() {
         out.metrics.bbox
     );
     assert!(
-        out.metrics.volume > 200.0,
+        out.metrics.volume > 400.0,
         "volume vanished: {}",
         out.metrics.volume
     );
@@ -1446,40 +1461,11 @@ fn hex_head_fused_onto_short_thread_does_not_crash() {
 
 /// The live golden M8×40 IR (13 mm hex, 34.7 mm thread). Long enough that the
 /// kernel instances short rods on an uncut host — that path must not leave a
-/// generator-line of the original cylinder.
+/// generator-line of the original cylinder. Same fixture as Inspector
+/// `tests/reports/m8_x40.json`.
 #[test]
 fn m8_bolt_40mm_document_has_no_vertical_sliver() {
-    let doc: CadDocument = serde_json::from_str(
-        r#"{
-          "documentId": "m8_bolt_40mm",
-          "units": "mm",
-          "parameters": {
-            "bolt_length": 40,
-            "head_height": 5.3,
-            "head_width": 13
-          },
-          "bodies": [
-            {
-              "bodyId": "body_m8_bolt",
-              "name": "M8 Bolt",
-              "visible": true,
-              "suppressed": false,
-              "transform": { "position": [0, 0, 0], "rotation": [0, 0, 0] },
-              "features": [
-                { "id": "sketch", "op": "sketch", "origin": [0, 0], "plane": "XY",
-                  "profile": { "hex": { "across_flats": 13, "at": [0, 0] } } },
-                { "depth": 5.3, "id": "body", "op": "extrude", "symmetric": false },
-                { "at": [0, 0, 4.3], "axis": "Z", "diameter": 8, "height": 35.7, "op": "cylinder" },
-                { "at": [0, 0, 5.3], "axis": "Z", "center": [0, 0], "hand": "right",
-                  "kind": "external", "length": 34.7, "op": "thread", "plane": "XY",
-                  "size": "M8", "through": false }
-              ],
-              "references": []
-            }
-          ]
-        }"#,
-    )
-    .unwrap();
+    let doc = iso_m8_x40_golden_document();
     let t0 = std::time::Instant::now();
     let out = Engine::new()
         .execute_document(&doc)
