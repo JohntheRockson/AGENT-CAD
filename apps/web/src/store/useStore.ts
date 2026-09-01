@@ -13,7 +13,7 @@ import type {
   TimelineSource,
 } from '../types/cad'
 import { runProgram, exportModel, streamChat } from '../lib/api'
-import { EXPORT_KINDS, pickSaveTarget, writeSaveTarget } from '../lib/saveFile'
+import { EXPORT_KINDS, canDownloadExport, exportFileName, pickSaveTarget, writeSaveTarget } from '../lib/saveFile'
 import {
   parseScene,
   parseSceneJson,
@@ -64,6 +64,8 @@ function applyRunPayload(
 interface CadStore {
   irCode: string
   setIrCode: (code: string) => void
+  /** IR from the last successful kernel/chat run (mesh + export stay aligned to this). */
+  lastGoodIrCode: string
 
   meshData:   MeshData | null
   metrics:    MetricsData | null
@@ -112,12 +114,18 @@ interface RunGeometryOptions {
   skipBranch?: boolean
   /** Skip recording a timeline snapshot after success. */
   skipSnapshot?: boolean
+  /**
+   * Run this document without writing it to `irCode` first. On success the
+   * store commits it; on failure the previous IR (and mesh) stay put.
+   */
+  document?: CadDocument
 }
 
 // ── Zustand store ─────────────────────────────────────────────────────────────
 
 export const useCadStore = create<CadStore>((set, get) => ({
   irCode:        EMPTY_IR,
+  lastGoodIrCode: EMPTY_IR,
   setIrCode:     (code) => set({ irCode: code }),
 
   meshData:   null,
@@ -177,6 +185,7 @@ export const useCadStore = create<CadStore>((set, get) => ({
     set({
       timelineIndex: index,
       irCode:        snap.irCode,
+      lastGoodIrCode: snap.irCode,
       bodies:        snap.bodies,
       meshData:      snap.meshData,
       metrics:       snap.metrics,
@@ -191,8 +200,10 @@ export const useCadStore = create<CadStore>((set, get) => ({
     if (current != null && Math.abs(current - value) < 1e-9) return
     get().branchTimeline()
     const updated = setDocumentParameter(doc, name, value)
-    set({ irCode: prettyDocument(updated) })
+    // Do not commit IR until the kernel succeeds — failed rebuilds keep
+    // panel, mesh, and export on the last good document.
     await get().runGeometry({
+      document:   updated,
       label:      `${name} → ${value}`,
       source:     'parameter',
       skipBranch: true,
@@ -209,8 +220,10 @@ export const useCadStore = create<CadStore>((set, get) => ({
     const doc = currentDocument(get().irCode)
     if (!doc) return
     doc.bodies = doc.bodies.map((b) => (b.bodyId === id ? { ...b, visible } : b))
+    const nextIr = prettyDocument(doc)
     set({
-      irCode: prettyDocument(doc),
+      irCode: nextIr,
+      lastGoodIrCode: get().lastGoodIrCode === get().irCode ? nextIr : get().lastGoodIrCode,
       bodies: get().bodies.map((b) => (b.bodyId === id ? { ...b, visible } : b)),
     })
   },
@@ -223,8 +236,10 @@ export const useCadStore = create<CadStore>((set, get) => ({
     const doc = currentDocument(get().irCode)
     if (!doc) return
     doc.bodies = doc.bodies.map((b) => (b.bodyId === id ? { ...b, name } : b))
+    const nextIr = prettyDocument(doc)
     set({
-      irCode: prettyDocument(doc),
+      irCode: nextIr,
+      lastGoodIrCode: get().lastGoodIrCode === get().irCode ? nextIr : get().lastGoodIrCode,
       bodies: get().bodies.map((b) => (b.bodyId === id ? { ...b, name } : b)),
     })
   },
@@ -234,8 +249,10 @@ export const useCadStore = create<CadStore>((set, get) => ({
     if (!doc) return
     doc.bodies = doc.bodies.filter((b) => b.bodyId !== id)
     const bodies = get().bodies.filter((b) => b.bodyId !== id)
+    const nextIr = doc.bodies.length ? prettyDocument(doc) : ''
     set({
-      irCode: doc.bodies.length ? prettyDocument(doc) : '',
+      irCode: nextIr,
+      lastGoodIrCode: get().lastGoodIrCode === get().irCode ? nextIr : get().lastGoodIrCode,
       bodies,
       meshData: bodies.find((b) => b.visible)?.mesh ?? null,
       selectedBodyId: get().selectedBodyId === id ? null : get().selectedBodyId,
@@ -247,7 +264,8 @@ export const useCadStore = create<CadStore>((set, get) => ({
 
   runGeometry: async (opts) => {
     const { irCode } = get()
-    if (!irCode.trim()) {
+    const pending = opts?.document
+    if (!pending && !irCode.trim()) {
       set({ runError: 'No CAD program to run. Describe a part in chat, or paste JSON here.' })
       return
     }
@@ -257,20 +275,29 @@ export const useCadStore = create<CadStore>((set, get) => ({
     set({ isRunning: true, runError: null })
 
     let document: CadDocument
-    try {
-      document = parseSceneJson(irCode)
-    } catch (e) {
-      set({
-        isRunning: false,
-        runError: `JSON parse error: ${e instanceof Error ? e.message : String(e)}`,
-      })
-      return
+    if (pending) {
+      document = pending
+    } else {
+      try {
+        document = parseSceneJson(irCode)
+      } catch (e) {
+        set({
+          isRunning: false,
+          runError: `JSON parse error: ${e instanceof Error ? e.message : String(e)}`,
+        })
+        return
+      }
     }
 
     try {
       const resp = await runProgram(document)
       if (resp.success && (resp.bodies?.length || resp.mesh)) {
-        applyRunPayload(set, resp, { isRunning: false, irCode: prettyDocument(document) })
+        const nextIr = prettyDocument(document)
+        applyRunPayload(set, resp, {
+          isRunning: false,
+          irCode: nextIr,
+          lastGoodIrCode: nextIr,
+        })
         if (!opts?.skipSnapshot) {
           get().pushTimelineSnapshot(
             opts?.label ?? 'Manual rebuild',
@@ -294,14 +321,17 @@ export const useCadStore = create<CadStore>((set, get) => ({
   // ── Export ──────────────────────────────────────────────────────────────────
 
   downloadExport: async (format) => {
-    const { irCode } = get()
-    if (!irCode.trim()) {
-      set({ runError: 'Nothing to export. Generate or paste a CAD program first.' })
+    const { irCode, runError, lastGoodIrCode } = get()
+    const gate = canDownloadExport({ runError, irCode, lastGoodIrCode })
+    if (!gate.ok) {
+      if (!runError) set({ runError: gate.reason })
       return
     }
+
     let document: CadDocument
     try {
-      document = parseSceneJson(irCode)
+      // Always export last good IR — never a mutated draft while dirty/errored.
+      document = parseSceneJson(lastGoodIrCode)
     } catch {
       set({ runError: 'Fix JSON before exporting' })
       return
@@ -314,6 +344,8 @@ export const useCadStore = create<CadStore>((set, get) => ({
       return
     }
 
+    const fileName = exportFileName(document.documentId, kind.ext)
+
     set({
       isExporting: true,
       exportStatus: 'Choose where to save…',
@@ -321,7 +353,7 @@ export const useCadStore = create<CadStore>((set, get) => ({
     })
 
     try {
-      const target = await pickSaveTarget(kind)
+      const target = await pickSaveTarget(kind, fileName)
       if (target.kind === 'cancelled') {
         set({ isExporting: false, exportStatus: null })
         return
@@ -331,7 +363,7 @@ export const useCadStore = create<CadStore>((set, get) => ({
       const blob = await exportModel(document, kind.id)
 
       set({ exportStatus: `Writing ${kind.label}…` })
-      const result = await writeSaveTarget(target, blob, kind)
+      const result = await writeSaveTarget(target, blob, kind, fileName)
       set({
         isExporting: false,
         exportStatus: result === 'saved' ? `Saved ${kind.label}` : null,
@@ -505,7 +537,7 @@ export const useCadStore = create<CadStore>((set, get) => ({
             }
             const renderStart = performance.now()
             upsertStep('rendering', { status: 'running', startedAt: Date.now() })
-            applyRunPayload(set, ev, { irCode: newIrCode })
+            applyRunPayload(set, ev, { irCode: newIrCode, lastGoodIrCode: newIrCode })
             get().pushTimelineSnapshot(
               truncateTimelineLabel(`Agent: ${text}`),
               'agent',
@@ -521,20 +553,11 @@ export const useCadStore = create<CadStore>((set, get) => ({
               })
             })
           } else {
-            let irPatch: { irCode?: string } = {}
-            if (ev.program) {
-              try {
-                irPatch = { irCode: prettyDocument(parseScene(ev.program)) }
-              } catch {
-                irPatch = { irCode: JSON.stringify(ev.program, null, 2) }
-              }
-            }
             patchAssistant((m) => ({
               ...m,
               content: ev.message || ev.error || 'Could not generate a valid model.',
             }))
             set({
-              ...irPatch,
               isChatLoading: false,
               isRunning:     false,
               runError:      ev.error ?? 'AI could not generate a valid model.',

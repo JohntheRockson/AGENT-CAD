@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { Download, Loader2, ChevronDown, Check, FileBox, FileText, Package } from 'lucide-react'
+import { Download, Loader2, ChevronDown, Check, FileBox, FileText, Package, AlertTriangle } from 'lucide-react'
 import { useCadStore } from '../store/useStore'
-import { EXPORT_KINDS } from '../lib/saveFile'
+import { canDownloadExport, EXPORT_KINDS } from '../lib/saveFile'
 import type { ExportFormat } from '../types/cad'
 
 // ── Format icon mapping ───────────────────────────────────────────────
@@ -26,6 +26,8 @@ const FORMAT_COLOR: Record<string, string> = {
 
 export function ExportMenu() {
   const irCode         = useCadStore((s) => s.irCode)
+  const lastGoodIrCode = useCadStore((s) => s.lastGoodIrCode)
+  const runError       = useCadStore((s) => s.runError)
   const isRunning      = useCadStore((s) => s.isRunning)
   const isExporting    = useCadStore((s) => s.isExporting)
   const exportStatus   = useCadStore((s) => s.exportStatus)
@@ -45,7 +47,8 @@ export function ExportMenu() {
     return () => document.removeEventListener('mousedown', onPointer)
   }, [menuOpen])
 
-  const disabled = isRunning || isExporting || !irCode.trim()
+  const gate = canDownloadExport({ runError, irCode, lastGoodIrCode })
+  const disabled = isRunning || isExporting || !gate.ok
 
   return (
     <div className="flex items-center gap-2">
@@ -66,6 +69,7 @@ export function ExportMenu() {
         <button
           onClick={() => setMenuOpen((o) => !o)}
           disabled={disabled}
+          title={gate.ok ? 'Export' : gate.reason}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border
                      text-[11px] font-medium text-gray-200
                      hover:border-accent/50 hover:bg-raised
@@ -88,7 +92,9 @@ export function ExportMenu() {
             {/* Menu header */}
             <div className="px-3 py-2 border-b border-divide">
               <p className="text-[11px] font-semibold text-gray-300">Export Model</p>
-              <p className="text-[10px] text-dim mt-0.5">Choose output format</p>
+              <p className="text-[10px] text-dim mt-0.5">
+                {gate.ok ? 'Choose output format' : gate.reason}
+              </p>
             </div>
 
             {/* Format list */}
@@ -113,8 +119,16 @@ export function ExportMenu() {
                         <span className="text-[9px] font-mono text-dim border border-divide rounded px-1">
                           .{kind.ext}
                         </span>
+                        {kind.caution && (
+                          <span className="inline-flex items-center gap-0.5 text-[9px] font-semibold uppercase tracking-wide text-amber-400/90">
+                            <AlertTriangle size={9} />
+                            Experimental
+                          </span>
+                        )}
                       </div>
-                      <div className="text-[10px] text-muted mt-0.5 truncate">{kind.hint}</div>
+                      <div className="text-[10px] text-muted mt-0.5 truncate">
+                        {kind.caution ?? kind.hint}
+                      </div>
                     </div>
                     <Download
                       size={13}
