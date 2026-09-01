@@ -24,20 +24,21 @@ Feature tag is "op". Sizes > 0. Coordinates may be negative.
 
 ## Parameters
 ALWAYS emit a "parameters" map (never omit it). Put overall dims there
-(`bolt_length`, `head_width`, `plate_thickness`). Reference by name or expression:
-"size": ["w","d","t"], "depth": "head_height", "length": "bolt_length - head_height".
+(`bolt_length`, `head_width`, `head_height`, `dead_height`, `major_diameter`, `pitch`).
+Reference by name or expression: "size": ["w","d","t"], "depth": "head_height".
 Hex heads: { "hex": { "across_flats": "head_width" } } — never hard-code hex points.
 
 ## Default bolt recipe
 Recipe: hex extrude → overlapping cylinder → thread CUT.
-NEVER default to thread-first then fuse a head. Helical end-caps cannot union with a prism.
-1) sketch { "hex": { "across_flats": "head_width" } } (ISO M8 wrench = 13; use 10 if asked), extrude "head_height".
-2) cylinder Ø major that OVERLAPS the head by ~1 mm:
-   "diameter": 8, "height": "bolt_length - head_height + 1", "at": [0, 0, "head_height - 1"].
-3) { "op": "thread", "kind": "external", "size": "M8", "length": "bolt_length - head_height", "at": [0, 0, "head_height"] }
-   On an existing solid this CUTS the helical groove — it does not fuse a second rod.
-size is an ISO/UN designation (M8, M8x1, 1/4-20). For M8, omit diameter and pitch (null/absent is correct; ISO 261 coarse is Ø8 × 1.25). Do not invent numeric diameter/pitch for M8.
-Do not fake threads with patterned tori, stacked rings, or revolved grooves.
+NEVER default to thread-first then fuse a head (helical caps cannot union with a prism).
+M8 table (ISO 261/4014/4017): Ø8, pitch 1.25, AF 13 — emit head_width 13, NOT 10. Parameters: major_diameter 8, pitch 1.25, head_width 13, dead_height. Thread size:"M8"; diameter/pitch stay null.
+1) sketch { "hex": { "across_flats": "head_width" } }, extrude "head_height".
+2) overlapping cylinder: "diameter":"major_diameter", "height":"bolt_length - head_height + 1", "at":[0,0,"head_height - 1"].
+3) Unthreaded grip — do not fully-thread head-to-tip:
+   "length":"bolt_length - head_height - dead_height", "at":[0,0,"head_height + dead_height"].
+4) Under-head fillet BEFORE thread (small r, edges:"longest"). Tip chamfer edges:"top". NEVER fillet edges:"all" after thread (rounds the helix).
+5) { "op":"thread", "kind":"external", "size":"M8" } on an existing solid CUTS the groove.
+size is M8 / M8x1 / 1/4-20. Do not fake threads with tori, rings, or revolved grooves.
 
 ## Multi-body
 Assemblies = separate bodies, not one fused blob. Holes live on the body they pierce.
@@ -90,7 +91,7 @@ hole { "op":"hole", "diameter":<d>, "depth":<h>, "center":[x,y], "plane":"XY", "
 cut { "op":"cut", "profile":<P>, "depth":<h>, "at":[x,y,z], "plane":"XY", "face":"largest"|<i>, "through": true }
 fuse { "op":"fuse", "profile":<P>, "depth":<h>, "at":[x,y,z], "plane":"XY", "face":"largest"|<i> }
 common { "op":"common", "profile":<P>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
-fillet { "op":"fillet", "radius":<r>, "edges":"all"|"top"|"longest"|[i] }  r < half wall
+fillet { "op":"fillet", "radius":<r>, "edges":"all"|"top"|"longest"|[i] }  r < half wall. Never edges:"all" after thread.
 chamfer { "op":"chamfer", "distance":<d>, "angle":<deg>, "edges":"all"|"top"|[i] }
 transform { "op":"transform", "translate":[x,y,z], "rotate":{"axis":[x,y,z],"angle":<deg>,"origin":[x,y,z]}, "scale":<s> }
 mirror { "op":"mirror", "plane":"YZ"|"XZ"|"XY", "origin":[x,y,z], "fuse": true }
@@ -104,14 +105,17 @@ Face: "largest"|"top"|"bottom"|index. Edges: "all"|"top"|"longest"|[i].
 ## Example — M8 bolt (hex → overlapping cylinder → thread CUT)
 {
   "units": "mm",
-  "parameters": { "bolt_length": 40, "head_width": 10, "head_height": 5.5 },
+  "parameters": { "bolt_length": 40, "head_width": 13, "head_height": 5.3,
+    "dead_height": 8, "major_diameter": 8, "pitch": 1.25 },
   "features": [
     { "op": "sketch", "plane": "XY", "profile": { "hex": { "across_flats": "head_width" } } },
     { "op": "extrude", "depth": "head_height" },
-    { "op": "cylinder", "diameter": 8, "height": "bolt_length - head_height + 1",
+    { "op": "cylinder", "diameter": "major_diameter", "height": "bolt_length - head_height + 1",
       "at": [0, 0, "head_height - 1"] },
+    { "op": "fillet", "radius": 0.4, "edges": "longest" },
     { "op": "thread", "kind": "external", "size": "M8",
-      "length": "bolt_length - head_height", "at": [0, 0, "head_height"] }
+      "length": "bolt_length - head_height - dead_height", "at": [0, 0, "head_height + dead_height"] },
+    { "op": "chamfer", "distance": 0.5, "edges": "top" }
   ]
 }
 
@@ -130,14 +134,20 @@ Face: "largest"|"top"|"bottom"|index. Edges: "all"|"top"|"longest"|[i].
 ///
 /// Must not include the Feature-op catalog. Generation already sent
 /// [`SYSTEM_PROMPT`]; re-sending it on every verify is the size/cost leak.
+/// Short fastener-order rules only — catch thread-first again.
 pub const VERIFY_SYSTEM_PROMPT: &str = r#"You judge whether built CAD solids match the user's request.
-Do not emit Feature ops. Do not list or repeat an op catalog, profile schemas, or bolt recipes.
+Do not emit Feature ops. Do not list or repeat an op catalog or profile schemas.
 Reply with JSON only:
 { "ok": true, "say": "<2-4 sentence description>" }
 or
 { "ok": false, "reason": "<what's wrong>", "say": "...", "document": { ...fixed CadDocument } }
 If you return a document, always include a "parameters" map.
 Do not diagnose tessellation or wasm crashes; that is the kernel's job.
+
+Fastener order (judge only):
+A hex-head bolt must be hex extrude → overlapping cylinder → thread CUT.
+Reject thread-first then fuse a head.
+Reject fillet edges:"all" after thread (that rounds the helix).
 "#;
 
 #[cfg(test)]
@@ -205,6 +215,43 @@ mod tests {
     }
 
     #[test]
+    fn prompt_teaches_m8_iso_size_table_af13() {
+        let p = SYSTEM_PROMPT.to_ascii_lowercase();
+        assert!(p.contains("across-flats") || p.contains("across flats") || p.contains("af 13"));
+        assert!(
+            p.contains("head_width 13") || SYSTEM_PROMPT.contains(r#""head_width": 13"#),
+            "must teach AF 13, not 10"
+        );
+        assert!(
+            !SYSTEM_PROMPT.contains(r#""head_width": 10"#),
+            "old AF 10 example is still in the prompt"
+        );
+        assert!(p.contains("1.25"));
+        assert!(
+            p.contains("major_diameter") && SYSTEM_PROMPT.contains("8"),
+            "size table must expose Ø8"
+        );
+    }
+
+    #[test]
+    fn prompt_teaches_unthreaded_grip_and_safe_finishing() {
+        let p = SYSTEM_PROMPT.to_ascii_lowercase();
+        assert!(
+            p.contains("dead_height") || p.contains("unthreaded"),
+            "must teach unthreaded grip"
+        );
+        assert!(
+            p.contains("fillet") && (p.contains("under-head") || p.contains("under head")),
+            "must teach under-head fillet"
+        );
+        assert!(p.contains("chamfer"), "must teach tip chamfer");
+        assert!(
+            p.contains("never") && p.contains("edges:\"all\"") && p.contains("after thread"),
+            "must forbid fillet edges:all after thread"
+        );
+    }
+
+    #[test]
     fn prompt_always_emits_parameters_and_allows_null_m8_pitch() {
         let p = SYSTEM_PROMPT.to_ascii_lowercase();
         assert!(
@@ -215,6 +262,7 @@ mod tests {
         assert!(
             p.contains("omit diameter and pitch")
                 || p.contains("diameter/pitch may be null")
+                || p.contains("diameter/pitch stay null")
                 || p.contains("diameter and pitch (null")
         );
     }
@@ -236,7 +284,6 @@ mod tests {
             "ellipsoid",
             "across_flats",
             "## feature ops",
-            "hex extrude",
             r#""op":"sketch""#,
         ] {
             assert!(
@@ -244,5 +291,26 @@ mod tests {
                 "verify prompt must not re-send the op catalog (found {needle:?})"
             );
         }
+    }
+
+    #[test]
+    fn verify_prompt_catches_thread_first_without_catalog() {
+        let v = VERIFY_SYSTEM_PROMPT.to_ascii_lowercase();
+        assert!(
+            v.contains("hex extrude") && v.contains("overlapping cylinder") && v.contains("thread"),
+            "verify must restate the golden fastener order"
+        );
+        assert!(
+            v.contains("thread-first") || v.contains("thread first"),
+            "verify must reject thread-first"
+        );
+        assert!(
+            v.contains("edges:\"all\"") && v.contains("after thread"),
+            "verify must reject fillet-all after thread"
+        );
+        assert!(
+            !v.contains("draft_extrude") && !v.contains("## feature ops"),
+            "short fastener-order rules only — no catalog dump"
+        );
     }
 }

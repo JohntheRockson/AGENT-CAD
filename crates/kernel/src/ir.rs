@@ -30,6 +30,11 @@ pub struct CadDocument {
     pub units: Units,
     /// Named scalar dimensions (mm or in per `units`). Feature fields may reference
     /// these by name instead of embedding literals.
+    ///
+    /// ISO hex-bolt size table the Recipe UI binds (M8 / ISO 261 + 4014/4017):
+    /// `major_diameter` 8, `pitch` 1.25, `head_width` / across-flats 13 — not 10.
+    /// Also emit `dead_height` / `unthreaded_length` for the unthreaded grip
+    /// under the head (do not always fully-thread from head to tip).
     #[serde(default)]
     pub parameters: BTreeMap<String, f64>,
     pub bodies: Vec<CadBody>,
@@ -858,6 +863,8 @@ pub enum ThreadHand {
 pub struct ThreadOp {
     pub kind: ThreadKind,
     /// `"M8"`, `"M8x1"`, `"1/4-20"`, `"#8-32"`. Optional if `diameter`+`pitch` given.
+    /// For M8, leave diameter/pitch unset (ISO 261 coarse Ø8 × 1.25 belongs in
+    /// `parameters`, not on this op).
     #[serde(default)]
     pub size: Option<String>,
     /// Override major diameter (document units).
