@@ -1,99 +1,126 @@
 {
   "baseline": {
     "bbox": [
-      -5.773502826690674,
-      -5.0,
+      -7.505553722381592,
+      -6.5,
       0.0,
-      5.773502826690674,
-      5.0,
+      7.505553722381592,
+      6.5,
       40.0
     ],
     "is_solid": true,
     "mesh_bbox": [
-      -5.773502826690674,
-      -5.0,
+      -7.505553722381592,
+      -6.5,
       0.0,
-      5.773502826690674,
-      5.0,
+      7.505553722381592,
+      6.5,
       40.0
     ],
-    "surface_area": 1230.8102419802472,
-    "volume": 2210.473116863007
+    "surface_area": 1403.499308398658,
+    "volume": 2519.9111954427744
   },
   "checks": {
-    "fillet_changes_hex_head": {
-      "detail": "hex-head metrics changed vs unfilleted bolt: Δvolume=6.9973 mm³ Δbbox_max=0.1238 mm Δmax_r=0.0000 mm Δhead_dz=0.0000 mm (radius 0.8 mm, edges=all after hex extrude)",
+    "fillet_under_head_or_named_r": {
+      "detail": "fillet R + hex look: named/hex-corner R≈0.8 mm (median err 0.124 mm, n=462); ΔAF=0.000 Δmin_r=0.924 Δmax_r=0.000 Δvolume=6.015 (Δvol alone is not sufficient)",
       "result": "PASS"
     },
-    "step_nonempty_solid": {
-      "detail": "export failed: Engine::export Step FAILED: OCCT kernel error: export_step: internal CAD kernel crash (wasm memory). Body rotation and cylinders on X/Y are valid — do not drop those ops. Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude.",
+    "iso_caliper_golden": {
+      "detail": "locked ISO caliper: AF 13, Ø8, P 1.25, L 40, head ~5.3",
+      "result": "PASS"
+    },
+    "step_honesty": {
+      "detail": "export failed (honest FAIL): Engine::export_document Step FAILED: OCCT kernel error: export_step: internal CAD kernel crash (wasm memory). Body rotation and cylinders on X/Y are valid — do not drop those ops. Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude.",
       "result": "FAIL"
     },
-    "stl_bbox_matches_mesh": {
-      "detail": "non-empty (77564 tris, 3878284 bytes); STL bbox \"[-5.7735, -5.0000, 0.0000, 5.7735, 5.0000, 40.0000]\" matches mesh bbox \"[-5.7735, -5.0000, 0.0000, 5.7735, 5.0000, 40.0000]\" within 0.05 mm",
+    "stl_look_right_not_aabb_only": {
+      "detail": "non-empty (77990 tris); bbox [-7.5056, -6.5000, 0.0000, 7.5056, 6.5000, 40.0000] matches mesh within 0.05 mm; helix/ISO-V/sliver ok",
+      "result": "PASS"
+    },
+    "viewport_look_right": {
+      "detail": "helix + ISO-V + no sliver: variation=0.238 spread=0.359 yaws=11",
       "result": "PASS"
     }
   },
   "failed": [
-    "Engine::export Step FAILED: OCCT kernel error: export_step: internal CAD kernel crash (wasm memory). Body rotation and cylinders on X/Y are valid — do not drop those ops. Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude.",
-    "STEP check: export failed: Engine::export Step FAILED: OCCT kernel error: export_step: internal CAD kernel crash (wasm memory). Body rotation and cylinders on X/Y are valid — do not drop those ops. Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude."
+    "Engine::export_document Step FAILED: OCCT kernel error: export_step: internal CAD kernel crash (wasm memory). Body rotation and cylinders on X/Y are valid — do not drop those ops. Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude.",
+    "STEP honesty: export failed (honest FAIL): Engine::export_document Step FAILED: OCCT kernel error: export_step: internal CAD kernel crash (wasm memory). Body rotation and cylinders on X/Y are valid — do not drop those ops. Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude."
   ],
   "files": {
-    "obj_bytes": 19448758,
+    "obj_bytes": 19559534,
     "step_bytes": 0,
-    "stl_bytes": 3878284
+    "stl_bytes": 3899584
   },
   "fillet": {
     "bbox": [
-      -5.649742126464844,
-      -5.0,
-      -1.1102230246251565e-16,
-      5.649742126464844,
-      5.0,
+      -7.505553722381592,
+      -6.5,
+      0.0,
+      7.505553722381592,
+      6.5,
       40.0
     ],
     "is_solid": true,
-    "volume": 2203.4758109735185
+    "volume": 2513.8961236197965
+  },
+  "golden": {
+    "af_mm": 13.0,
+    "head_height_mm": 5.3,
+    "length_mm": 40.0,
+    "pitch_mm": 1.25,
+    "shank_d_mm": 8.0
   },
   "hex_head_baseline": {
-    "count": 100,
-    "dz": 5.5,
-    "max_r": 5.773502826690674,
-    "min_r": 5.773502725594862,
+    "across_flats": 13.0,
+    "count": 54,
+    "dz": 5.300000190734863,
+    "max_r": 7.505553722381592,
+    "min_r": 7.50555355519425,
     "z0": 0.0,
-    "z1": 5.5
+    "z1": 5.300000190734863
   },
   "hex_head_fillet": {
-    "count": 2008,
-    "dz": 5.5,
-    "max_r": 5.773502725594862,
-    "min_r": 4.849742133855193,
-    "z0": -1.1102230246251565e-16,
-    "z1": 5.5
+    "across_flats": 13.0,
+    "count": 462,
+    "dz": 5.300000190734863,
+    "max_r": 7.505553722381592,
+    "min_r": 6.581792831420898,
+    "z0": 0.0,
+    "z1": 5.300000190734863
   },
   "log": [
     "cwd=/workspace crate_dir=/workspace/tests/reports",
-    "rustc=rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "rustc=rustc 1.95.0 (59807616e 2026-04-14)",
+    "ISO golden: AF 13, Ø8, P 1.25, L 40, head ~5.3 (see GOLDEN.md)",
     "built with feature `occt` (kernel/occt)",
+    "golden IR: locked ISO caliper: AF 13, Ø8, P 1.25, L 40, head ~5.3",
     "Engine::uses_occt = true",
-    "Engine::warmup ok in 0.45s",
-    "Engine::execute (golden M8) ok in 10.43s  volume=2210.473 bbox=[-5.773502826690674, -5.0, 0.0, 5.773502826690674, 5.0, 40.0] is_solid=true verts=232692",
-    "wrote m8_x40.obj (19448758 bytes)",
-    "wrote m8_x40.stl (3878284 bytes) via kernel::export::to_stl",
+    "Engine::warmup ok in 11.52s",
+    "Engine::execute_document (golden M8 AF13) ok in 10.80s  volume=2519.911 bbox=[-7.505553722381592, -6.5, 0.0, 7.505553722381592, 6.5, 40.0] is_solid=true verts=233970",
+    "wrote m8_x40.obj (19559534 bytes)",
+    "wrote m8_x40.stl (3899584 bytes) via kernel::export::to_stl",
     "STEP probe hex-only (sketch+extrude) FAILED: OCCT kernel error: export_step: internal CAD kernel crash (wasm memory). Body rotation and cylinders on X/Y are valid — do not drop those ops. Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude.",
     "STEP probe hex+shank (no thread) FAILED: OCCT kernel error: export_step: internal CAD kernel crash (wasm memory). Body rotation and cylinders on X/Y are valid — do not drop those ops. Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude.",
-    "Engine::export Step FAILED: OCCT kernel error: export_step: internal CAD kernel crash (wasm memory). Body rotation and cylinders on X/Y are valid — do not drop those ops. Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude.",
-    "also wrote m8_x40.export.stl (3878284 bytes) via Engine::export Stl (B-Rep tessellation; check b uses to_stl mesh)",
-    "list_topology(hex head): faces=8 edges=18 tip=\"Use face: \\\"largest\\\"|\\\"top\\\"|\\\"bottom\\\"|<index> on cut/fuse/hole/sketch. Use edges: \\\"all\\\"|\\\"top\\\"|\\\"longest\\\"|[indices] on fillet/chamfer. Pattern holes with scope:\\\"feature\\\" after hole/cut.\"",
-    "Engine::execute (M8 + hex-head fillet r=0.8 edges=all after extrude) ok in 10.68s  volume=2203.476 bbox=[-5.649742126464844, -5.0, -1.1102230246251565e-16, 5.649742126464844, 5.0, 40.0] is_solid=true"
+    "uncut hex+shank execute: volume=2519.911 bbox=[-7.505553499465135, -6.5, 0.0, 7.505553499465135, 6.500000000000001, 40.0]",
+    "uncut hex+shank STEP failed: OCCT kernel error: export_step: internal CAD kernel crash (wasm memory). Body rotation and cylinders on X/Y are valid — do not drop those ops. Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude.",
+    "Engine::export_document Step FAILED: OCCT kernel error: export_step: internal CAD kernel crash (wasm memory). Body rotation and cylinders on X/Y are valid — do not drop those ops. Start each body with box, cylinder, sphere, cone, torus, fuse, or sketch+extrude.",
+    "also wrote m8_x40.export.stl (3899584 bytes) via Engine::export_document Stl (look-right uses to_stl mesh)",
+    "list_topology(hex+shank): faces=10 edges=21 tip=\"Use face: \\\"largest\\\"|\\\"top\\\"|\\\"bottom\\\"|<index> on cut/fuse/hole/sketch. Use edges: \\\"all\\\"|\\\"top\\\"|\\\"longest\\\"|[indices] on fillet/chamfer. Pattern holes with scope:\\\"feature\\\" after hole/cut.\"",
+    "under-head junction edge indices: [1, 5, 7, 13, 14, 15]",
+    "Engine::execute (M8 + under-head/named fillet r=0.8) ok in 10.85s  volume=2513.896 bbox=[-7.505553722381592, -6.5, 0.0, 7.505553722381592, 6.5, 40.0] is_solid=true"
   ],
+  "look_right": {
+    "distinct_yaws": 11,
+    "spread": 0.3590543687036387,
+    "variation": 0.2383587354696393
+  },
   "overall": "FAIL",
   "stl_bbox": [
-    -5.773502826690674,
-    -5.0,
+    -7.505553722381592,
+    -6.5,
     0.0,
-    5.773502826690674,
-    5.0,
+    7.505553722381592,
+    6.5,
     40.0
   ],
   "uses_occt": true

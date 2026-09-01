@@ -1,19 +1,48 @@
 {
+  "documentId": "m8_bolt_40mm",
   "units": "mm",
-  "features": [
+  "parameters": {
+    "bolt_length": 40,
+    "head_height": 5.3,
+    "head_width": 13
+  },
+  "bodies": [
     {
-      "op": "sketch",
-      "plane": "XY",
-      "profile": { "hex": { "across_flats": 10 } }
-    },
-    { "op": "extrude", "depth": 5.5 },
-    { "op": "cylinder", "diameter": 8, "height": 35.5, "at": [0, 0, 4.5] },
-    {
-      "op": "thread",
-      "kind": "external",
-      "size": "M8",
-      "length": 34.5,
-      "at": [0, 0, 5.5]
+      "bodyId": "body_m8_bolt",
+      "name": "M8 Bolt",
+      "visible": true,
+      "suppressed": false,
+      "transform": { "position": [0, 0, 0], "rotation": [0, 0, 0] },
+      "features": [
+        {
+          "id": "sketch",
+          "op": "sketch",
+          "origin": [0, 0],
+          "plane": "XY",
+          "profile": { "hex": { "across_flats": 13, "at": [0, 0] } }
+        },
+        { "depth": 5.3, "id": "body", "op": "extrude", "symmetric": false },
+        {
+          "at": [0, 0, 4.3],
+          "axis": "Z",
+          "diameter": 8,
+          "height": 35.7,
+          "op": "cylinder"
+        },
+        {
+          "at": [0, 0, 5.3],
+          "axis": "Z",
+          "center": [0, 0],
+          "hand": "right",
+          "kind": "external",
+          "length": 34.7,
+          "op": "thread",
+          "plane": "XY",
+          "size": "M8",
+          "through": false
+        }
+      ],
+      "references": []
     }
   ]
 }

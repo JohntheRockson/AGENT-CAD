@@ -3,11 +3,19 @@ name = "inspect-m8"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Inspector: golden M8×40 fillet + STEP/STL report (no kernel edits)"
+description = "Inspector: look-right golden M8×40 (helix, STEP honesty, fillet R, ISO AF13)"
 
 # Nested single-crate workspace so `cargo run --manifest-path` works without
 # adding this package to the repo-root workspace members list.
 [workspace]
+
+[lib]
+name = "inspect_m8"
+path = "src/lib.rs"
+
+[[bin]]
+name = "inspect-m8"
+path = "src/main.rs"
 
 [dependencies]
 kernel = { path = "../../crates/kernel" }
