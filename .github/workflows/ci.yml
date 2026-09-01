@@ -103,10 +103,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # Real OCCT WASM (wasmtime). Not mock. Lib tests above do not cover this.
-      - name: kernel OCCT geometry tests
-        run: cargo test -p kernel --features occt --test occt_geometry
+      # --release: debug wasmtime/Cranelift is too slow for the viewport-fast
+      # asserts (25s). Do not loosen those helix/timing checks in the tests.
+      - name: kernel OCCT geometry tests (release)
+        run: cargo test --release -p kernel --features occt --test occt_geometry
 
       # Golden M8 + STEP/STL honesty via tests/reports inspector.
       # Expected RED on current main until Kernel STEP (PR #15 area) lands.
+      # if: always() so STEP/STL still reports when a prior geometry test fails.
       - name: inspector golden M8 STEP/STL
+        if: always()
         run: cargo run --release --manifest-path tests/reports/Cargo.toml --features occt
