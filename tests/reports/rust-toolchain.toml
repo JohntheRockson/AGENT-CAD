@@ -1,2 +1,5 @@
+# Same pin as the repo-root rust-toolchain.toml / vendor/occt-wasm
+# (edition 2024, rust-version 1.95). Do not drift to "stable".
 [toolchain]
-channel = "stable"
+channel = "1.95.0"
+profile = "minimal"

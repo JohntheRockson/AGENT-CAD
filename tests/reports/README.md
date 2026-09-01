@@ -18,7 +18,7 @@ and [`m8_x40.json`](m8_x40.json). Locked with Kernel via
 
 ## One command
 
-From the repo root (Rust **1.95+** / current `stable`; `occt-wasm` needs it):
+From the repo root (Rust **1.95.0**; `occt-wasm` needs edition 2024 / rust-version 1.95):
 
 ```bash
 cargo run --release --manifest-path tests/reports/Cargo.toml --features occt
@@ -32,7 +32,8 @@ cargo test --manifest-path tests/reports/Cargo.toml
 
 `--release` is strongly recommended for the runner: debug-mode wasmtime
 compiling the OCCT WASM module is very slow. The `rust-toolchain.toml` in
-this directory pins `stable`.
+this directory pins **1.95.0** (same as the repo root) so the invocation does
+not pick up an older or drifting `stable` toolchain.
 
 Outputs (gitignored meshes, committed report):
 
