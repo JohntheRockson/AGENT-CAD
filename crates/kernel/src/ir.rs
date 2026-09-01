@@ -293,6 +293,7 @@ pub enum Profile {
     Compound(CompoundProfile),
     Ellipse(EllipseProfile),
     /// Regular hexagon. `across_flats` is the wrench size (ISO hex-head width).
+    /// Golden M8 uses AF **13** (M8 wrench). AF 10 is M6.
     Hex(HexProfile),
 }
 
@@ -1868,7 +1869,7 @@ mod tests {
         let doc = CadDocument::from_json_value(serde_json::json!({
             "documentId": "m8_bolt",
             "units": "mm",
-            "parameters": { "bolt_length": 40.0, "head_width": 10.0, "head_height": 5.5 },
+            "parameters": { "bolt_length": 40.0, "head_width": 13.0, "head_height": 5.3 },
             "bodies": [{
                 "bodyId": "body_bolt",
                 "name": "M8 bolt",
@@ -1888,26 +1889,26 @@ mod tests {
         assert!(doc.validate().is_ok(), "{:?}", doc.validate().err());
         match &doc.bodies[0].features[0] {
             Feature::Sketch(op) => match &op.profile {
-                Profile::Hex(h) => assert!((h.across_flats - 10.0).abs() < 1e-9),
+                Profile::Hex(h) => assert!((h.across_flats - 13.0).abs() < 1e-9),
                 other => panic!("expected hex, got {other:?}"),
             },
             other => panic!("expected sketch, got {other:?}"),
         }
         match &doc.bodies[0].features[1] {
-            Feature::Extrude(op) => assert!((op.depth - 5.5).abs() < 1e-9),
+            Feature::Extrude(op) => assert!((op.depth - 5.3).abs() < 1e-9),
             other => panic!("expected extrude, got {other:?}"),
         }
         match &doc.bodies[0].features[2] {
             Feature::Cylinder(op) => {
-                assert!((op.height - 35.5).abs() < 1e-9, "height={}", op.height);
-                assert!((op.at[2] - 4.5).abs() < 1e-9, "at.z={}", op.at[2]);
+                assert!((op.height - 35.7).abs() < 1e-9, "height={}", op.height);
+                assert!((op.at[2] - 4.3).abs() < 1e-9, "at.z={}", op.at[2]);
             }
             other => panic!("expected cylinder, got {other:?}"),
         }
         match &doc.bodies[0].features[3] {
             Feature::Thread(op) => {
-                assert!((op.length - 34.5).abs() < 1e-9, "length={}", op.length);
-                assert!((op.at[2] - 5.5).abs() < 1e-9, "at.z={}", op.at[2]);
+                assert!((op.length - 34.7).abs() < 1e-9, "length={}", op.length);
+                assert!((op.at[2] - 5.3).abs() < 1e-9, "at.z={}", op.at[2]);
             }
             other => panic!("expected thread, got {other:?}"),
         }

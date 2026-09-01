@@ -27,8 +27,8 @@ pub mod verify;
 pub mod thread;
 
 pub use engine::{
-    BodyOutput, DocumentOutput, Engine, ExportFormat, KernelError, MeshData, MetricsData,
-    ModelOutput,
+    BodyOutput, DocumentOutput, Engine, ExportFormat, KernelError, MeshData, MeshProvenance,
+    MetricsData, ModelOutput,
 };
 pub use ir::{CadBody, CadDocument, CadProgram, Units, ValidationError};
 pub use topology::{EdgeInfo, FaceInfo, TopologyReport, TopologySummary};

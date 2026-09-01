@@ -2,7 +2,7 @@
 //!
 //! Run with: `cargo test -p kernel --features occt --test occt_geometry`
 
-use kernel::engine::Engine;
+use kernel::engine::{Engine, ExportFormat, MeshData, MeshProvenance};
 use kernel::ir::{CadDocument, CadProgram};
 
 fn venturi_program() -> CadProgram {
@@ -1039,22 +1039,11 @@ fn offset_grows_a_box() {
 }
 
 /// Canonical hex-head bolt: hex extrude → overlapping shank → thread cut.
-/// This is the recipe that must work for "M8 × 40 mm, 10 mm hex head".
+/// ISO-ish golden: AF 13 (M8 wrench, not M6's 10), head ~5.3, Ø8 × 1.25.
+/// `bolt_length` 40 is still tip-to-top in this IR (under-head ISO 4017 follow-up).
 #[test]
 fn m8_hex_head_bolt_40mm_builds() {
-    let prog: CadProgram = serde_json::from_str(
-        r#"{
-          "units": "mm",
-          "features": [
-            { "op": "sketch", "plane": "XY",
-              "profile": { "hex": { "across_flats": 10 } } },
-            { "op": "extrude", "depth": 5.5 },
-            { "op": "cylinder", "diameter": 8, "height": 35.5, "at": [0, 0, 4.5] },
-            { "op": "thread", "kind": "external", "size": "M8", "length": 34.5, "at": [0, 0, 5.5] }
-          ]
-        }"#,
-    )
-    .unwrap();
+    let prog = golden_m8_x40_program();
     let t0 = std::time::Instant::now();
     let out = Engine::new()
         .execute(&prog)
@@ -1069,9 +1058,21 @@ fn m8_hex_head_bolt_40mm_builds() {
     let dy = (ymax - ymin).abs();
     let dz = (zmax - zmin).abs();
     assert!(
-        dx > 9.0 && dy > 9.0,
-        "expected ~10 mm hex head, bbox={:?}",
+        dx > 12.0 && dy > 12.0,
+        "expected ~13 mm hex head (AF 13, not M6's 10), bbox={:?}",
         out.metrics.bbox
+    );
+    assert_eq!(
+        out.metrics.mesh_provenance,
+        MeshProvenance::InstancedThread,
+        "long 34.7 mm thread must instance; metrics must name the uncut B-Rep"
+    );
+    assert!(
+        out.metrics
+            .mesh_provenance
+            .honesty_note()
+            .is_some_and(|n| n.contains("uncut")),
+        "one-body honesty note must be visible to the caller"
     );
     assert!(
         dz > 38.0 && dz < 48.0,
@@ -1103,6 +1104,233 @@ fn m8_hex_head_bolt_40mm_builds() {
     if let Ok(path) = std::env::var("AGENTCAD_DUMP_MESH") {
         std::fs::write(&path, kernel::export::to_obj(&out.mesh)).expect("dump mesh");
     }
+}
+
+/// Locked ISO-ish golden: AF 13, head 5.3, Ø8 × 1.25. Overall Z is still
+/// tip-to-top ~40 mm (`bolt_length` under-head ISO 4017 is a follow-up).
+fn golden_m8_x40_program() -> CadProgram {
+    serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": { "hex": { "across_flats": 13 } } },
+            { "op": "extrude", "depth": 5.3 },
+            { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+            { "op": "thread", "kind": "external", "size": "M8", "length": 34.7, "at": [0, 0, 5.3] }
+          ]
+        }"#,
+    )
+    .unwrap()
+}
+
+fn hex_shank_program() -> CadProgram {
+    serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": { "hex": { "across_flats": 13 } } },
+            { "op": "extrude", "depth": 5.3 },
+            { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] }
+          ]
+        }"#,
+    )
+    .unwrap()
+}
+
+fn assert_step_is_solid_in_mesh_bbox_family(step: &[u8], mesh_bbox: [f64; 6], label: &str) {
+    assert!(
+        step.len() > 512,
+        "{label}: STEP must be non-empty, got {} bytes",
+        step.len()
+    );
+    let text = std::str::from_utf8(step).unwrap_or("");
+    assert!(
+        text.contains("ISO-10303-21") || text.contains("STEP"),
+        "{label}: missing ISO-10303/STEP header"
+    );
+    assert!(
+        text.contains("MANIFOLD_SOLID_BREP")
+            || text.contains("FACETED_BREP")
+            || text.contains("CLOSED_SHELL")
+            || text.contains("BREP_WITH_VOIDS"),
+        "{label}: STEP does not parse as a solid (no MANIFOLD_SOLID_BREP/CLOSED_SHELL)"
+    );
+    let bb = kernel::export::cartesian_bbox_from_step(step)
+        .unwrap_or_else(|| panic!("{label}: no CARTESIAN_POINT bbox in STEP"));
+    assert!(
+        bbox_same_family(mesh_bbox, bb),
+        "{label}: STEP bbox {bb:?} not in the same family as mesh {mesh_bbox:?}"
+    );
+}
+
+fn bbox_same_family(a: [f64; 6], b: [f64; 6]) -> bool {
+    for i in 0..3 {
+        let ea = (a[i + 3] - a[i]).abs();
+        let eb = (b[i + 3] - b[i]).abs();
+        let tol = 2.0_f64.max(0.15 * ea.max(eb).max(1.0));
+        if (ea - eb).abs() > tol {
+            return false;
+        }
+        let ca = 0.5 * (a[i] + a[i + 3]);
+        let cb = 0.5 * (b[i] + b[i + 3]);
+        if (ca - cb).abs() > 2.0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Golden M8×40 STEP is a faceted solid of the **viewport** instanced mesh
+/// (threaded-looking), not OCCT `export_step`. Must not WASM-trap.
+#[test]
+fn golden_m8_x40_step_export_is_nonempty_solid() {
+    let prog = golden_m8_x40_program();
+    let engine = Engine::new();
+    let mesh_out = engine
+        .execute(&prog)
+        .expect("golden M8 execute (needed for bbox family)");
+    let mesh_bbox = kernel::engine::bbox_from_positions(&mesh_out.mesh.positions);
+    let t0 = std::time::Instant::now();
+    let step = engine
+        .export(&prog, &ExportFormat::Step)
+        .expect("golden M8×40 STEP must not WASM-trap");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed.as_secs() < 40,
+        "40 mm bolt STEP took {elapsed:?} — must stay seconds, not a minute"
+    );
+    assert_step_is_solid_in_mesh_bbox_family(&step, mesh_bbox, "golden M8×40");
+    assert_eq!(
+        mesh_out.metrics.mesh_provenance,
+        MeshProvenance::InstancedThread
+    );
+}
+
+/// Inspector PR #13: hex-only and hex+shank probes crashed the same way as
+/// golden M8. STEP must succeed for those prefixes too.
+#[test]
+fn hex_only_and_hex_shank_step_export_no_wasm_crash() {
+    let engine = Engine::new();
+    let golden = golden_m8_x40_program();
+
+    let hex_only = CadProgram {
+        units: golden.units.clone(),
+        features: golden.features[..2].to_vec(),
+    };
+    let hex_mesh = engine.execute(&hex_only).expect("hex-only execute");
+    let hex_step = engine
+        .export(&hex_only, &ExportFormat::Step)
+        .expect("hex-only STEP must not WASM-trap");
+    assert_step_is_solid_in_mesh_bbox_family(
+        &hex_step,
+        kernel::engine::bbox_from_positions(&hex_mesh.mesh.positions),
+        "hex-only",
+    );
+
+    let hex_shank = hex_shank_program();
+    let shank_mesh = engine.execute(&hex_shank).expect("hex+shank execute");
+    let shank_step = engine
+        .export(&hex_shank, &ExportFormat::Step)
+        .expect("hex+shank STEP must not WASM-trap");
+    assert_step_is_solid_in_mesh_bbox_family(
+        &shank_step,
+        kernel::engine::bbox_from_positions(&shank_mesh.mesh.positions),
+        "hex+shank",
+    );
+}
+
+/// Empty tessellation must fail the export. A bbox-sized box would pass
+/// `bbox_same_family` and is a placeholder solid — not allowed.
+#[test]
+fn empty_tessellation_step_export_fails_not_bbox_box() {
+    let empty = MeshData {
+        positions: vec![],
+        normals: vec![],
+        indices: vec![],
+    };
+    let err = kernel::export::step_export_bytes(&empty)
+        .expect_err("empty tessellation must not write STEP");
+    assert!(
+        err.contains("empty") || err.contains("no solid"),
+        "unexpected: {err}"
+    );
+    let text = kernel::export::to_step(&empty);
+    assert!(text.is_empty());
+    assert!(!text.contains("MANIFOLD_SOLID_BREP"));
+    assert!(kernel::export::cartesian_bbox_from_step(text.as_bytes()).is_none());
+}
+
+/// Under-head fillet keeps the Ø8 circular junction (not `filter_to_line_edges`)
+/// and uses bolt Z (not argmin3 X/Y). Failure is Err, not eprintln-only Ok.
+#[test]
+fn m8_underhead_fillet_keeps_circular_junction() {
+    let unfilleted = Engine::new()
+        .execute(&hex_shank_program())
+        .expect("hex+shank");
+    let filleted: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": { "hex": { "across_flats": 13 } } },
+            { "op": "extrude", "depth": 5.3 },
+            { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+            { "op": "fillet", "radius": 0.4, "edges": "all" }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let out = Engine::new()
+        .execute(&filleted)
+        .expect("under-head fillet must apply, not silent Ok");
+    let [xmin, ymin, zmin, xmax, ymax, zmax] = out.metrics.bbox;
+    assert!(
+        (xmax - xmin).abs() > 12.0 && (ymax - ymin).abs() > 12.0,
+        "expected AF 13 hex after fillet, bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(
+        (zmax - zmin).abs() > 38.0 && (zmax - zmin).abs() < 48.0,
+        "fillet must not explode Z, bbox={:?}",
+        out.metrics.bbox
+    );
+    assert!(
+        out.metrics.volume > 200.0,
+        "volume vanished: {}",
+        out.metrics.volume
+    );
+    // Blend removes a small torus-like wedge vs the sharp Ø8 junction.
+    assert!(
+        out.metrics.volume < unfilleted.metrics.volume - 0.05,
+        "fillet did not change volume (circle dropped?): {} vs {}",
+        out.metrics.volume,
+        unfilleted.metrics.volume
+    );
+}
+
+/// Impossible fillet must Err — no eprintln-only success.
+#[test]
+fn fillet_failure_is_err_not_silent_ok() {
+    let prog: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "box", "size": [4, 4, 4], "centered": true },
+            { "op": "fillet", "radius": 50, "edges": "all" }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let err = Engine::new()
+        .execute(&prog)
+        .expect_err("oversized fillet must not silently succeed");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("fillet") && (msg.contains("silent") || msg.contains("could not")),
+        "unexpected: {err}"
+    );
 }
 
 /// Job 1 regression: viewport M8 must be a 60° V, not the boxy wide-crest bead.
@@ -1195,8 +1423,8 @@ fn hex_head_fused_onto_short_thread_does_not_crash() {
           "units": "mm",
           "features": [
             { "op": "thread", "kind": "external", "size": "M8", "length": 8 },
-            { "op": "fuse", "depth": 5.5, "at": [0, 0, 8],
-              "profile": { "hex": { "across_flats": 10 } } }
+            { "op": "fuse", "depth": 5.3, "at": [0, 0, 8],
+              "profile": { "hex": { "across_flats": 13 } } }
           ]
         }"#,
     )
@@ -1275,6 +1503,11 @@ fn m8_bolt_40mm_document_has_no_vertical_sliver() {
         out.metrics.volume > 400.0,
         "placeholder volume: {}",
         out.metrics.volume
+    );
+    assert_eq!(
+        out.metrics.mesh_provenance,
+        MeshProvenance::InstancedThread,
+        "document golden must name the instanced-vs-uncut split"
     );
     let n_yaws = distinct_groove_yaws(mesh, zmin + 12.0, zmin + 28.0, 16);
     assert!(
