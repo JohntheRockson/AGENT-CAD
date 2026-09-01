@@ -309,11 +309,13 @@ async fn verify_handler(Json(body): Json<RunRequest>) -> Json<serde_json::Value>
     match result {
         Ok(output) => {
             let report = verify::verify_structure(&document, &output);
+            let recipe_err = agent::fastener_recipe_violation(&document);
             Json(serde_json::json!({
                 "success": true,
-                "passed": report.passed,
+                "passed": report.passed && recipe_err.is_none(),
                 "verification": verification_payload(&report),
                 "metrics": metrics_payload(&output.metrics, &document.units),
+                "fastener_recipe": recipe_err,
             }))
         }
         Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
@@ -738,6 +740,7 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                             });
                             continue;
                         }
+                        last_document = Some(fixed.clone());
                         emit(&tx, ChatSseEvent::CalculatingStart).await;
                         let calc_start = Instant::now();
                         let engine = state.engine;
@@ -861,11 +864,13 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                             parts: {
                                 let mut parts = vec![gemini_text(format!(
                                     "The kernel built solids, but they do NOT look like what the user asked for. {reason}\n\
+                                     {}\
                                      Mesh quality:\n{quality_text}\n\
                                      Bounding box {bbox:?}, volume {vol:.1}.\n\
                                      Look at the attached isometric render. Fix jagged/self-intersecting \
                                      control arms, disconnected primitive bags, and missing fillets. \
                                      Return {{ \"say\", \"document\" }}.",
+                                    fastener_repair_hint(&reason),
                                     bbox = output.metrics.bbox,
                                     vol = output.metrics.volume,
                                 ))];
@@ -999,6 +1004,14 @@ async fn verify_against_report(
     quality_text: &str,
     preview_png: Option<&[u8]>,
 ) -> VerifyVerdict {
+    if let Some(reason) = agent::fastener_recipe_violation(document) {
+        tracing::warn!("fastener recipe rejected: {reason}");
+        return VerifyVerdict::Mismatch {
+            reason,
+            document: None,
+        };
+    }
+
     if !report.passed {
         tracing::warn!("deterministic verify failed: {}", report.summary());
         return VerifyVerdict::Mismatch {
@@ -1325,8 +1338,14 @@ fn kernel_error_for_model(err: &kernel::engine::KernelError) -> String {
 
 fn fastener_repair_hint(err: &str) -> String {
     let l = err.to_lowercase();
-    if l.contains("fuse") || l.contains("tessellate") || l.contains("thread") {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Never thread first and fuse a hex head on. Never sketch-on-face onto a threaded end. ".into()
+    if l.contains("fuse")
+        || l.contains("tessellate")
+        || l.contains("thread")
+        || l.contains("fastener")
+        || l.contains("hex")
+        || l.contains("fillet")
+    {
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head. Never thread first and fuse a hex head on. Never fillet edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13. ".into()
     } else {
         String::new()
     }
@@ -1607,7 +1626,43 @@ mod tests {
         assert!(!lower.contains("draft_extrude"));
         assert!(!lower.contains("across_flats"));
         assert!(!lower.contains("## feature ops"));
-        assert!(!lower.contains("hex extrude"));
+        assert!(
+            lower.contains("thread-first") || lower.contains("thread first"),
+            "verify must catch thread-first with short fastener-order rules"
+        );
+        assert!(
+            lower.contains("hex extrude") && lower.contains("overlapping cylinder"),
+            "verify fastener-order rules must restate the golden recipe"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_thread_first_recipe() {
+        let thread_first = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_bad",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "thread", "kind": "external", "size": "M8", "length": 24 },
+                    { "op": "cylinder", "diameter": 13, "height": 5.3, "at": [0, 0, 24] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&thread_first)
+            .expect("thread-first bolt must fail verify rules");
+        assert!(
+            reason.to_ascii_lowercase().contains("thread-first")
+                || reason.to_ascii_lowercase().contains("hex extrude"),
+            "{reason}"
+        );
+
+        let golden = agent::example_m8_bolt_document();
+        assert!(
+            agent::fastener_recipe_violation(&golden).is_none(),
+            "golden hex→cylinder→thread must pass"
+        );
     }
 
     #[test]

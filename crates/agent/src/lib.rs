@@ -12,8 +12,8 @@ mod ir_emit;
 mod prompt;
 
 pub use ir_emit::{
-    example_m8_bolt_document, example_m8_bolt_json, keep_document_on_kernel_failure,
-    program_json_for_chat,
+    example_m8_bolt_document, example_m8_bolt_json, fastener_recipe_violation,
+    keep_document_on_kernel_failure, program_json_for_chat,
 };
 pub use prompt::{SYSTEM_PROMPT, VERIFY_SYSTEM_PROMPT};
 
