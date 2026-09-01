@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict'
 import {
   inferBoltParameters,
+  parameterAllowsZero,
   parameterEntries,
+  parseParameterDraft,
   parseSceneJson,
   resolvedParameters,
   setDocumentParameter,
+  sliderBounds,
 } from './document.ts'
 import type { CadDocument, CylinderOp, ExtrudeOp, Feature, ThreadOp } from '../types/cad.ts'
 
@@ -141,18 +144,83 @@ function almost(a: number, b: number, eps = 1e-9) {
   almost((feat(next, 'extrude') as ExtrudeOp).depth, 20)
 }
 
-// 3. head_height commit updates hex only
+// 3. head_height commit moves hex and shank/thread together
 {
   const doc = parseSceneJson(goldenM8NoParams())
   const next = setDocumentParameter(doc, 'head_height', 8)
   const hex = feat(next, 'extrude') as ExtrudeOp
   const cyl = feat(next, 'cylinder') as CylinderOp
   const thread = feat(next, 'thread') as ThreadOp
+  const delta = 8 - 5.3
   almost(hex.depth, 8)
-  almost(cyl.height, 35.7)
-  almost(cyl.at![2], 4.3)
-  almost(thread.length!, 34.7)
+  almost(cyl.at![2], 4.3 + delta)
+  almost(cyl.height, 35.7 - delta)
+  almost(thread.at![2], 5.3 + delta)
+  almost(thread.length!, 34.7 - delta)
+  almost(thread.at![2] + thread.length!, 40)
+  almost(next.parameters!.head_height, 8)
+  almost(next.parameters!.bolt_length, 40)
+  almost(next.parameters!.dead_height, 0)
+  const inferred = inferBoltParameters(next)
+  almost(inferred.bolt_length ?? NaN, 40)
+  almost(inferred.head_height ?? NaN, 8)
+  almost(inferred.dead_height ?? NaN, 0)
+}
+
+// head_height shrink moves shank back and preserves overall length
+{
+  const doc = parseSceneJson(goldenM8NoParams())
+  const next = setDocumentParameter(doc, 'head_height', 4)
+  const delta = 4 - 5.3
+  const cyl = feat(next, 'cylinder') as CylinderOp
+  const thread = feat(next, 'thread') as ThreadOp
+  almost((feat(next, 'extrude') as ExtrudeOp).depth, 4)
+  almost(cyl.at![2], 4.3 + delta)
+  almost(cyl.height, 35.7 - delta)
+  almost(thread.at![2], 5.3 + delta)
+  almost(thread.length!, 34.7 - delta)
+  almost(inferBoltParameters(next).bolt_length ?? NaN, 40)
+}
+
+// head_height keeps an existing dead under the head
+{
+  const doc = parseSceneJson(goldenM8NoParams({ threadZ: 7.3, threadLength: 32.7 }))
+  const next = setDocumentParameter(doc, 'head_height', 8)
+  const thread = feat(next, 'thread') as ThreadOp
+  const delta = 8 - 5.3
+  almost(thread.at![2], 7.3 + delta)
+  almost(thread.length!, 32.7 - delta)
+  almost(inferBoltParameters(next).dead_height ?? NaN, 2)
+  almost(inferBoltParameters(next).bolt_length ?? NaN, 40)
+}
+
+// dead_height 0 is valid and can be committed
+{
+  const doc = parseSceneJson(goldenM8NoParams({ threadZ: 7.3, threadLength: 32.7 }))
+  almost(resolvedParameters(doc).dead_height, 2)
+  const next = setDocumentParameter(doc, 'dead_height', 0)
+  const thread = feat(next, 'thread') as ThreadOp
   almost(thread.at![2], 5.3)
+  almost(thread.length!, 34.7)
+  almost(next.parameters!.dead_height, 0)
+  almost(inferBoltParameters(next).dead_height ?? NaN, 0)
+}
+
+{
+  assert.equal(parameterAllowsZero('dead_height'), true)
+  assert.equal(parameterAllowsZero('unthreaded_length'), true)
+  assert.equal(parameterAllowsZero('bolt_length'), false)
+  assert.equal(parameterAllowsZero('head_height'), false)
+  assert.equal(parseParameterDraft('0', 'dead_height'), 0)
+  assert.equal(parseParameterDraft('0', 'bolt_length'), null)
+  assert.equal(parseParameterDraft('-1', 'dead_height'), null)
+  assert.equal(parseParameterDraft('5.3', 'head_height'), 5.3)
+  const zeroSlider = sliderBounds(0, true)
+  assert.equal(zeroSlider.min, 0)
+  assert.ok(zeroSlider.max > zeroSlider.min, 'zero slider must not collapse')
+  const tiny = sliderBounds(0.01, true)
+  assert.equal(tiny.min, 0)
+  assert.ok(tiny.max > 1)
 }
 
 // 4. Unchanged value does not rewrite feature literals

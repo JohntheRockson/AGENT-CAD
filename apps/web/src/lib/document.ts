@@ -134,7 +134,7 @@ export function setDocumentParameter(
     return next
   }
   if (isHeadHeightName(name)) {
-    next = applyHexHeadHeight(next, value)
+    next = applyHexHeadHeight(next, old, value)
     next.parameters = { ...resolved, [name]: value }
     return next
   }
@@ -316,6 +316,28 @@ function isDeadHeightName(name: string): boolean {
   )
 }
 
+/** `dead_height` of 0 is a valid fastener (thread starts at the head). */
+export function parameterAllowsZero(name: string): boolean {
+  return isDeadHeightName(name)
+}
+
+/** Parse a typed parameter. Reject negatives; allow 0 only where physically valid. */
+export function parseParameterDraft(raw: string, name: string): number | null {
+  const value = Number.parseFloat(raw)
+  if (!Number.isFinite(value)) return null
+  if (parameterAllowsZero(name) ? value < 0 : value <= 0) return null
+  return value
+}
+
+/** Slider span that stays usable when the current value is 0 or near-zero. */
+export function sliderBounds(value: number, allowZero: boolean): { min: number; max: number } {
+  const magnitude = Math.abs(value)
+  const min = allowZero ? 0 : Math.max(0.1, magnitude * 0.1 || 0.1)
+  const span = magnitude > 0.05 ? magnitude * 3 : 10
+  const max = Math.max(min + 1, span, min * 2)
+  return { min, max }
+}
+
 function isAxialOverallName(name: string): boolean {
   const n = name.toLowerCase()
   if (isIndependentBoltDim(n)) return false
@@ -411,15 +433,49 @@ function inferBoltDims(features: Feature[]): {
   return { bolt_length: boltLength, head_height: headHeight, dead_height: deadHeight }
 }
 
-/** `head_height` drives hex extrude/fuse depth only — not shank or thread. */
-function applyHexHeadHeight(doc: CadDocument, value: number): CadDocument {
+/**
+ * `head_height` patches hex depth and translates the shank/thread with the
+ * head so the thread cannot start inside the new hex. Cylinder/thread axial
+ * extents shrink or grow by the same delta so overall bolt length is kept.
+ */
+function applyHexHeadHeight(doc: CadDocument, oldVal: number, newVal: number): CadDocument {
+  const delta = newVal - oldVal
   return {
     ...doc,
     bodies: doc.bodies.map((body) => ({
       ...body,
-      features: patchHexDepth(body.features, value),
+      features: shiftShankWithHead(patchHexDepth(body.features, newVal), delta),
     })),
   }
+}
+
+function shiftShankWithHead(features: Feature[], delta: number): Feature[] {
+  if (!Number.isFinite(delta) || Math.abs(delta) < 1e-12) return features
+  return features.map((feat) => {
+    if (feat.op === 'cylinder') {
+      const at = feat.at ?? [0, 0, 0]
+      const next = {
+        ...feat,
+        at: [at[0], at[1], at[2] + delta] as [number, number, number],
+      }
+      if (typeof feat.height === 'number') {
+        next.height = Math.max(0.05, feat.height - delta)
+      }
+      return next
+    }
+    if (feat.op === 'thread') {
+      const at = feat.at ?? [0, 0, 0]
+      const next: ThreadOp = {
+        ...feat,
+        at: [at[0], at[1], at[2] + delta],
+      }
+      if (typeof feat.length === 'number') {
+        next.length = Math.max(0.05, feat.length - delta)
+      }
+      return next
+    }
+    return feat
+  })
 }
 
 function patchHexDepth(features: Feature[], value: number): Feature[] {

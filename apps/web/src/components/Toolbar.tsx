@@ -191,7 +191,15 @@ export function Toolbar({ showJson, onToggleJson, chatOpen, onToggleChat }: Tool
             <ToolGroupSection
               group={group}
               disabled={busy}
-              onTool={(prompt) => sendChatMessage(prompt)}
+              onTool={(prompt) => {
+                if (irCode.trim()) {
+                  const ok = window.confirm(
+                    'This tool asks the AI to rewrite the current solid, including a loaded golden. Continue?',
+                  )
+                  if (!ok) return
+                }
+                sendChatMessage(prompt)
+              }}
             />
           </div>
         ))}
@@ -233,6 +241,11 @@ function ToolGroupSection({
             icon={tool.icon}
             label={tool.label}
             disabled={disabled}
+            title={
+              disabled
+                ? tool.label
+                : `${tool.label} — asks the AI to generate or rewrite the model`
+            }
             onClick={() => onTool(tool.prompt)}
           />
         ))}
@@ -249,18 +262,20 @@ function ToolBtn({
   label,
   disabled,
   onClick,
+  title,
 }: {
   icon: LucideIcon
   label: string
   disabled: boolean
   onClick: () => void
+  title?: string
 }) {
   return (
     <button
       type="button"
       disabled={disabled}
       onClick={onClick}
-      title={label}
+      title={title ?? label}
       className="flex flex-col items-center justify-center gap-0.5 w-11 h-9 rounded
                  hover:bg-raised active:bg-border
                  disabled:opacity-25 disabled:cursor-not-allowed

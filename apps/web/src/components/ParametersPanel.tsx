@@ -3,20 +3,17 @@ import { SlidersHorizontal, Loader2 } from 'lucide-react'
 import { useCadStore } from '../store/useStore'
 import {
   formatParameterName,
+  parameterAllowsZero,
   parameterEntries,
+  parseParameterDraft,
   parseSceneJson,
+  sliderBounds,
   unitSuffix,
 } from '../lib/document'
 
 /** Treat as unchanged so blur / Enter on the current value does not rebuild. */
 function sameParameterValue(a: number, b: number): boolean {
   return Math.abs(a - b) < 1e-9
-}
-
-function parseDraft(raw: string): number | null {
-  const value = Number.parseFloat(raw)
-  if (!Number.isFinite(value) || value <= 0) return null
-  return value
 }
 
 export function ParametersPanel() {
@@ -41,7 +38,7 @@ export function ParametersPanel() {
 
   const commit = useCallback(
     (name: string, raw: string, current: number) => {
-      const value = parseDraft(raw)
+      const value = parseParameterDraft(raw, name)
       if (value == null) return false
       if (sameParameterValue(value, current)) return false
       void setParameter(name, value)
@@ -147,13 +144,13 @@ function ParameterRow({
   }, [value, editing])
 
   const parsed = Number.parseFloat(draft)
-  const min = Math.max(0.1, value * 0.1)
-  const max = Math.max(min * 2, value * 3)
+  const allowZero = parameterAllowsZero(name)
+  const { min, max } = sliderBounds(value, allowZero)
   const sliderValue = Number.isFinite(parsed) ? parsed : value
 
   const finishEdit = () => {
     const raw = draftRef.current
-    const next = parseDraft(raw)
+    const next = parseParameterDraft(raw, name)
     if (next != null && pendingRef.current != null && sameParameterValue(next, pendingRef.current)) {
       setEditing(false)
       return
