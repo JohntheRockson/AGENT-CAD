@@ -1,19 +1,23 @@
-# PR compile+test CI. Any failing step fails this job (red).
+# PR compile+test CI. Triggers on pull_request so PRs get check runs
+# (not only post-push to main). Any failing step fails that job (red).
 #
-# Required:
-#   cargo test -p kernel --lib
-#   cargo test -p kernel --test ir_tests
-#   apps/web: npm ci && npm run build  (tsc -b && vite build)
+# Jobs are independent so Atlas can merge Kernel STEP (#15 area) first,
+# then require the OCCT golden job. Mock lib tests do NOT cover OCCT.
 #
-# occt_geometry is omitted on purpose. It is optional and needs wasmtime to
-# decompress/JIT the bundled OCCT WASM (~21 MB). That is not a reliable
-# default on GitHub-hosted runners, and we will not add mock/stub coverage.
+# Required-check names (Settings → Branches / Rulesets → require these
+# status checks — names must match exactly):
+#   compile and test
+#   shipping server (occt)
+#   OCCT golden M8 STEP/STL    ← expect RED on current main until Kernel STEP
+#
+# Explicitly not added: mock/stub helix coverage.
 
 name: CI
 
 on:
   pull_request:
   push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -23,7 +27,7 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  ci:
+  compile-and-test:
     name: compile and test
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -37,11 +41,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: kernel lib tests
+      - name: kernel lib tests (mock — not OCCT)
         run: cargo test -p kernel --lib
 
-      - name: kernel ir tests
+      - name: kernel ir tests (mock — not OCCT)
         run: cargo test -p kernel --test ir_tests
+
+      - name: agent tests
+        run: cargo test -p agent
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -54,6 +61,52 @@ jobs:
         working-directory: apps/web
         run: npm ci
 
+      - name: apps/web unit tests
+        working-directory: apps/web
+        run: npm test
+
       - name: apps/web typecheck and build
         working-directory: apps/web
         run: npm run build
+
+  shipping-server-occt:
+    name: shipping server (occt)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Default features include `occt` (see crates/server/Cargo.toml).
+      # Do not pass --no-default-features — that would be mock-only.
+      - name: cargo build -p server --release (links occt)
+        run: cargo build -p server --release
+
+  occt-golden:
+    name: OCCT golden M8 STEP/STL
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Real OCCT WASM (wasmtime). Not mock. Lib tests above do not cover this.
+      - name: kernel OCCT geometry tests
+        run: cargo test -p kernel --features occt --test occt_geometry
+
+      # Golden M8 + STEP/STL honesty via tests/reports inspector.
+      # Expected RED on current main until Kernel STEP (PR #15 area) lands.
+      - name: inspector golden M8 STEP/STL
+        run: cargo run --release --manifest-path tests/reports/Cargo.toml --features occt

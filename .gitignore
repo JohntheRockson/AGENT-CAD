@@ -11,6 +11,8 @@
 !Cargo.lock
 !README.md
 !SPEC.md
+!rust-toolchain.toml
+!.github/
 !crates/
 !apps/
 !vendor/
