@@ -779,30 +779,53 @@ pub(crate) mod occt_backend {
     }
 
     /// Circular edges lying in a plane ⊥ `axis` (the under-head Ø junction).
+    /// Named circles *or* a flat, nearly-round bbox (boolean seams sometimes
+    /// report as trimmed/bspline). Prefer edges nearer the head than the tip.
     fn circular_junction_edges(
         k: &mut occt_wasm::OcctKernel,
+        solid: Handle,
         ids: &[u32],
         axis: usize,
     ) -> Vec<u32> {
-        ids.iter()
+        let solid_bb = k.get_bounding_box(solid, false).ok();
+        let z0 = solid_bb.as_ref().map(|b| aabb_min(b, axis)).unwrap_or(0.0);
+        let z1 = solid_bb.as_ref().map(|b| aabb_max(b, axis)).unwrap_or(1.0);
+        let zspan = (z1 - z0).abs().max(1e-9);
+        let mut scored: Vec<(u32, f64)> = ids
+            .iter()
             .copied()
-            .filter(|&id| {
+            .filter_map(|id| {
                 let h = id_to_handle(id);
                 let t = k.curve_type(h).unwrap_or_default();
-                if !t.to_ascii_lowercase().contains("circle") {
-                    return false;
-                }
+                let named = t.to_ascii_lowercase().contains("circle");
                 let Ok(eb) = k.get_bounding_box(h, false) else {
-                    return false;
+                    return None;
                 };
                 let spans = aabb_extents(&eb);
                 let in_a = spans[(axis + 1) % 3];
                 let in_b = spans[(axis + 2) % 3];
                 let along = spans[axis];
                 let dia = in_a.max(in_b);
-                dia > 1.0 && along < 0.35 * dia.max(0.5)
+                let dia_min = in_a.min(in_b);
+                if dia < 1.0 || along > 0.35 * dia.max(0.5) {
+                    return None;
+                }
+                let round = dia_min > 0.65 * dia;
+                if !named && !round {
+                    return None;
+                }
+                let mid = 0.5 * (aabb_min(&eb, axis) + aabb_max(&eb, axis));
+                let z_rel = (mid - z0) / zspan;
+                // Under-head sits near the hex (low Z). Drop the free tip circle.
+                if z_rel > 0.45 {
+                    return None;
+                }
+                Some((id, dia))
             })
-            .collect()
+            .collect();
+        // Prefer shank-scale circles (Ø8) over any leftover hex-scale loops.
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().map(|(id, _)| id).collect()
     }
 
     struct EdgeInfo {
@@ -920,7 +943,7 @@ pub(crate) mod occt_backend {
         };
         let extents = aabb_extents(&bb);
         if is_bolt_like(extents) {
-            let circles = circular_junction_edges(k, &ids, 2);
+            let circles = circular_junction_edges(k, solid, &ids, 2);
             if !circles.is_empty() {
                 return circles;
             }
@@ -1471,53 +1494,28 @@ pub(crate) mod occt_backend {
             parts.push(body);
         }
 
+        // Overlapping windows of size `seg`, last start = length - seg so the
+        // rod never overshoots tp.length (bbox must stay tip-to-top honest).
         let mut starts: Vec<f64> = Vec::new();
-        let mut z = 0.0;
-        while z + 1e-9 < tp.length {
-            let remaining = tp.length - z;
-            if remaining + overlap < seg * 0.55 && !starts.is_empty() {
-                break;
+        if tp.length <= seg + 1e-9 {
+            starts.push(0.0);
+        } else {
+            let last_start = tp.length - seg;
+            let mut z = 0.0;
+            while z < last_start - 1e-9 {
+                starts.push(z);
+                z += stride;
             }
-            starts.push(z);
-            if z + seg >= tp.length - 1e-9 {
-                break;
-            }
-            z += stride;
+            starts.push(last_start);
         }
-        let n_full = starts.len() as i32;
-        let last_end = starts
-            .last()
-            .map(|&s| (s + seg).min(tp.length))
-            .unwrap_or(0.0);
-        let rem = tp.length - last_end;
-        let has_tail = rem > tp.pitch * 0.45;
 
         for (i, &z_along) in starts.iter().enumerate() {
             let strip_bottom = i > 0;
-            let strip_top = i + 1 < starts.len() || has_tail;
+            let strip_top = i + 1 < starts.len();
             let mesh = strip_z_caps(&proto_mesh, pz0, pz1, strip_bottom, strip_top);
             parts.push(place_thread_mesh(&mesh, &tp, z_along));
         }
-        if has_tail {
-            let tail_len = (tp.length - starts.last().copied().unwrap_or(0.0)).min(seg);
-            if super::exceeds_inline_thread_budget(tail_len, tp.pitch) {
-                return Err(occt_err(
-                    "thread instance tail exceeds 8-turn tessellate budget",
-                ));
-            }
-            let tail_z = (tp.length - tail_len).max(0.0);
-            let tail = threaded_rod(k, tp.major, tp.pitch, tail_len)?;
-            if solid_exceeds_inline_budget(k, tail, tp.pitch) {
-                super::record_long_host_tessellate_attempt();
-                return Err(occt_err(
-                    "thread tail rod exceeds 8-turn tessellate budget",
-                ));
-            }
-            let tail_mesh = tessellate_once(k, tail, helix_linear, angular)?;
-            let (tz0, tz1) = mesh_z_range(&tail_mesh);
-            let mesh = strip_z_caps(&tail_mesh, tz0, tz1, n_full > 0, false);
-            parts.push(place_thread_mesh(&mesh, &tp, tail_z));
-        } else if n_full == 0 {
+        if starts.is_empty() {
             return Err(occt_err("thread preview produced no helical segments"));
         }
         if parts.is_empty() {
@@ -2611,7 +2609,7 @@ pub(crate) mod occt_backend {
             .ok()
             .is_some_and(|bb| is_bolt_like(aabb_extents(&bb)));
         if bolt {
-            let circles = circular_junction_edges(k, &candidate_ids, 2);
+            let circles = circular_junction_edges(k, solid, &candidate_ids, 2);
             if !circles.is_empty() {
                 return circles;
             }
@@ -3939,7 +3937,9 @@ pub(crate) mod occt_backend {
     ) -> Vec<u32> {
         let name = name.to_ascii_lowercase();
         match name.as_str() {
-            "all" => select_blend_edges(k, solid, edge_ids.to_vec(), blend),
+            // Do not pre-filter here: handle_fillet's select_fillet_pool must
+            // still see the Ø8 head–shank circle on a bolt.
+            "all" => edge_ids.to_vec(),
             "top" => {
                 let Ok(bb) = k.get_bounding_box(solid, false) else {
                     return edge_ids.to_vec();
