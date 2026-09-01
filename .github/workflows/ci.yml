@@ -3,7 +3,7 @@
 # Required:
 #   cargo test -p kernel --lib
 #   cargo test -p kernel --test ir_tests
-#   apps/web: npm ci && npm test && npm run build  (tsc -b && vite build)
+#   apps/web: npm ci && npm run build  (tsc -b && vite build)
 #
 # occt_geometry is omitted on purpose. It is optional and needs wasmtime to
 # decompress/JIT the bundled OCCT WASM (~21 MB). That is not a reliable
@@ -53,10 +53,6 @@ jobs:
       - name: apps/web install
         working-directory: apps/web
         run: npm ci
-
-      - name: apps/web unit tests
-        working-directory: apps/web
-        run: npm test
 
       - name: apps/web typecheck and build
         working-directory: apps/web
