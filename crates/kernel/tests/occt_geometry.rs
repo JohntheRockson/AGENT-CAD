@@ -1301,10 +1301,12 @@ fn m8_underhead_fillet_keeps_circular_junction() {
         "volume vanished: {}",
         out.metrics.volume
     );
-    // Blend removes a small torus-like wedge vs the sharp Ø8 junction.
+    // Concave under-head junction: blend *adds* a torus-like wedge (~0.8 mm³
+    // at r=0.4 on Ø8). A dropped circle / silent no-op would stay within noise.
+    let dv = out.metrics.volume - unfilleted.metrics.volume;
     assert!(
-        out.metrics.volume < unfilleted.metrics.volume - 0.05,
-        "fillet did not change volume (circle dropped?): {} vs {}",
+        dv > 0.3,
+        "fillet did not add under-head blend (circle dropped?): ΔV={dv} ({} vs {})",
         out.metrics.volume,
         unfilleted.metrics.volume
     );

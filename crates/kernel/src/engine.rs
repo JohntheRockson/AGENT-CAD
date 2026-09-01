@@ -3933,7 +3933,7 @@ pub(crate) mod occt_backend {
         solid: Handle,
         edge_ids: &[u32],
         name: &str,
-        blend: f64,
+        _blend: f64,
     ) -> Vec<u32> {
         let name = name.to_ascii_lowercase();
         match name.as_str() {
