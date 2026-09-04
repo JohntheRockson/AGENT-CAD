@@ -124,20 +124,13 @@ pub fn plan_thread_instances(length: f64, pitch: f64) -> Result<ThreadInstancePl
     // That pipe, and the tessellated rod, must both stay ≤ 8 turns.
     let tess_budget = MAX_INLINE_THREAD_TURNS * pitch;
     let proto_budget = ((MAX_INLINE_THREAD_TURNS - 1.0) * pitch).min(tess_budget);
-    // Usable window + run-in/out must fit in proto_budget (7 turns).
-    let mut run_in = pitch * 0.85;
-    let mut run_out = pitch * 0.65;
-    let mut usable = (pitch * 5.4).min(length).max(pitch * 2.0);
-    let mut proto_len = usable + run_in + run_out;
-    if proto_len > proto_budget + 1e-12 {
-        let overflow = proto_len - proto_budget;
-        run_out = (run_out - overflow * 0.35).max(pitch * 0.40);
-        run_in = (run_in - overflow * 0.40).max(pitch * 0.50);
-        usable = (proto_budget - run_in - run_out)
-            .min(usable)
-            .max(pitch * 2.0);
-        proto_len = usable + run_in + run_out;
-    }
+    // Integer-turn run-in / usable / stride: instances are Z-translates
+    // (yaw = 0 mod 2π). A fractional-turn stride left a ~50° generator
+    // step where Frenet/bead residuals did not match after yaw.
+    let run_in = pitch * 1.0;
+    let run_out = pitch * 0.55;
+    let usable = (pitch * 5.0).min(length).max(pitch * 2.0);
+    let proto_len = usable + run_in + run_out;
     if proto_len > proto_budget + 1e-12
         || proto_len > tess_budget + 1e-12
         || exceeds_inline_thread_budget(proto_len, pitch)
@@ -145,22 +138,22 @@ pub fn plan_thread_instances(length: f64, pitch: f64) -> Result<ThreadInstancePl
     {
         return Err("thread instance prototype exceeds 8-turn tessellate budget".into());
     }
-    let overlap = instance_overlap(pitch, usable);
+    let overlap = pitch * 1.0;
+    let overlap = overlap.min(usable * 0.45).max(pitch * 0.5);
+    // Prefer an integer-turn stride so interior seams are pure translates.
+    let stride = {
+        let raw = (usable - overlap).max(pitch * 1.0);
+        let turns = (raw / pitch).round().max(1.0);
+        (turns * pitch).min(usable - pitch * 0.5)
+    };
     Ok(ThreadInstancePlan {
         usable,
         run_in,
         run_out,
         proto_len,
-        overlap,
-        stride: (usable - overlap).max(pitch * 1.2),
+        overlap: (usable - stride).max(pitch * 0.5),
+        stride,
     })
-}
-
-fn instance_overlap(pitch: f64, usable: f64) -> f64 {
-    (pitch * 0.70)
-        .clamp(0.25, pitch * 0.85)
-        .min(usable * 0.30)
-        .max(pitch * 0.40)
 }
 
 // ── Output types ─────────────────────────────────────────────────────────────
@@ -5114,6 +5107,11 @@ mod thread_budget_tests {
         assert!(
             plan.overlap >= 1.25 * 0.25,
             "windows must overlap so crop edges stitch"
+        );
+        let stride_turns = plan.stride / 1.25;
+        assert!(
+            (stride_turns - stride_turns.round()).abs() < 1e-9,
+            "interior stride must be an integer number of pitches (got {stride_turns})"
         );
         let starts = plan.window_starts(34.7);
         assert!(starts.len() >= 3, "34.7 mm thread needs several windows");
