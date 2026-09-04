@@ -1749,6 +1749,7 @@ pub(crate) mod occt_backend {
         Ok(out)
     }
 
+    #[allow(dead_code)]
     fn mesh_z_range(mesh: &MeshData) -> (f32, f32) {
         let mut z0 = f32::MAX;
         let mut z1 = f32::MIN;
