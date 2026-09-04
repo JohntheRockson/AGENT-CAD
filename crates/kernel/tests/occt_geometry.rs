@@ -871,12 +871,48 @@ fn shank_samples(mesh: &kernel::engine::MeshData, z0: f64, z1: f64, r_min: f64) 
     pts
 }
 
-/// Groove helix phase at `z`: `z/P − yaw/2π` (turns, wrapped to `[0, 1)`).
-/// A continuous helix holds this nearly constant; an instance-window jump
-/// steps it.
-fn helix_phase_at_z(mesh: &kernel::engine::MeshData, z: f64, pitch: f64, band: f64) -> Option<f64> {
-    let yaw = groove_yaw_at_z(mesh, z, band)?;
-    Some((z / pitch.max(1e-9) - yaw / (2.0 * std::f64::consts::PI)).rem_euclid(1.0))
+/// Circular mean yaw of the deepest groove vertices in a thin Z band.
+/// More stable than a 32-bin argmin (that flips between U-flanks).
+fn deep_groove_yaw_at_z(
+    mesh: &kernel::engine::MeshData,
+    z: f64,
+    band: f64,
+    r_major: f64,
+    pitch: f64,
+) -> Option<f64> {
+    let depth = kernel::thread::external_depth(pitch);
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    for chunk in mesh.positions.chunks(3) {
+        if chunk.len() < 3 {
+            continue;
+        }
+        if (chunk[2] as f64 - z).abs() > band {
+            continue;
+        }
+        let x = chunk[0] as f64;
+        let y = chunk[1] as f64;
+        let r = (x * x + y * y).sqrt();
+        if r < r_major * 0.55 || r > r_major - 0.18 * depth {
+            continue;
+        }
+        pts.push((y.atan2(x), r));
+    }
+    if pts.len() < 6 {
+        return None;
+    }
+    pts.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let take = (pts.len() / 3).max(4);
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    for (yaw, _) in pts.iter().take(take) {
+        sx += yaw.cos();
+        sy += yaw.sin();
+    }
+    Some(sy.atan2(sx))
+}
+
+fn helix_phase_from_yaw(z: f64, yaw: f64, pitch: f64) -> f64 {
+    (z / pitch.max(1e-9) - yaw / (2.0 * std::f64::consts::PI)).rem_euclid(1.0)
 }
 
 /// Fail if instanced slabs meet with a visible helix step (Ian's mid-shank
@@ -887,26 +923,21 @@ fn assert_helix_continuous_across_instance_windows(
     z0: f64,
     z1: f64,
 ) {
-    let step = (pitch * 0.35).clamp(0.30, 0.50);
-    let mut zs = Vec::new();
+    let step = (pitch * 0.40).clamp(0.35, 0.55);
+    let mut phases: Vec<(f64, f64)> = Vec::new();
     let mut z = z0;
     while z <= z1 + 1e-9 {
-        zs.push(z);
-        z += step;
-    }
-    let mut phases: Vec<(f64, f64)> = Vec::new();
-    for &zi in &zs {
-        if let Some(p) = helix_phase_at_z(mesh, zi, pitch, 0.12) {
-            phases.push((zi, p));
+        if let Some(yaw) = deep_groove_yaw_at_z(mesh, z, 0.14, 4.0, pitch) {
+            phases.push((z, helix_phase_from_yaw(z, yaw, pitch)));
         }
+        z += step;
     }
     assert!(
         phases.len() >= 8,
-        "too few helix-phase samples ({}) between {z0:.1} and {z1:.1} — \
+        "too few deep-groove phase samples ({}) between {z0:.1} and {z1:.1} — \
          cannot inspect instance seams",
         phases.len()
     );
-    // Unwrap, then 3-sample median so a single tip-cap misfire is not a seam.
     let mut unwrapped = vec![phases[0].1];
     for i in 1..phases.len() {
         let mut p = phases[i].1;
@@ -919,26 +950,21 @@ fn assert_helix_continuous_across_instance_windows(
         }
         unwrapped.push(p);
     }
-    let median3 = |i: usize| -> f64 {
-        let a = unwrapped[i.saturating_sub(1)];
-        let b = unwrapped[i];
-        let c = unwrapped[(i + 1).min(unwrapped.len() - 1)];
-        let mut v = [a, b, c];
-        v.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-        v[1]
-    };
     let mut worst = 0.0_f64;
     let mut worst_at = phases[0].0;
-    for i in 1..phases.len() {
-        let d = (median3(i) - median3(i - 1)).abs();
+    for i in 1..unwrapped.len() {
+        let d = (unwrapped[i] - unwrapped[i - 1]).abs();
         if d > worst {
             worst = d;
             worst_at = 0.5 * (phases[i - 1].0 + phases[i].0);
         }
     }
+    let mean = unwrapped.iter().sum::<f64>() / unwrapped.len() as f64;
+    let var = unwrapped.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / unwrapped.len() as f64;
+    let rms = var.sqrt();
     assert!(
-        worst < 0.10,
-        "helix phase jumps {worst:.3} turn near z={worst_at:.2} \
+        worst < 0.10 && rms < 0.08,
+        "helix phase jumps {worst:.3} turn (rms {rms:.3}) near z={worst_at:.2} \
          (instance window seam / yaw discontinuity)"
     );
 }

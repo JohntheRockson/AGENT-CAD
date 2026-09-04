@@ -1591,7 +1591,6 @@ pub(crate) mod occt_backend {
                  (refusing uncut-host tessellate fallthrough)",
             ));
         }
-        let (pz0, pz1) = mesh_z_range(&cropped);
 
         let mut parts: Vec<MeshData> = Vec::new();
         if !body.positions.is_empty() {
@@ -1599,11 +1598,11 @@ pub(crate) mod occt_backend {
         }
 
         let starts = plan.window_starts(tp.length);
-        for (i, &z_along) in starts.iter().enumerate() {
-            let strip_bottom = i > 0;
-            let strip_top = i + 1 < starts.len();
-            let mesh = strip_z_caps(&cropped, pz0, pz1, strip_bottom, strip_top);
-            parts.push(place_thread_mesh(&mesh, &tp, z_along));
+        // Do not strip_z_caps on the cropped rod: the crop plane already
+        // removed proto end disks, and |nz|≈1 tests also eat U-groove flanks
+        // at every window, which starved yaw and looked like a seam.
+        for &z_along in &starts {
+            parts.push(place_thread_mesh(&cropped, &tp, z_along));
         }
         if starts.is_empty() {
             return Err(occt_err("thread preview produced no helical segments"));
