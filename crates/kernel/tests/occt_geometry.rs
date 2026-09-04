@@ -906,16 +906,34 @@ fn assert_helix_continuous_across_instance_windows(
          cannot inspect instance seams",
         phases.len()
     );
+    // Unwrap, then 3-sample median so a single tip-cap misfire is not a seam.
+    let mut unwrapped = vec![phases[0].1];
+    for i in 1..phases.len() {
+        let mut p = phases[i].1;
+        let prev = unwrapped[i - 1];
+        while p - prev > 0.5 {
+            p -= 1.0;
+        }
+        while p - prev < -0.5 {
+            p += 1.0;
+        }
+        unwrapped.push(p);
+    }
+    let median3 = |i: usize| -> f64 {
+        let a = unwrapped[i.saturating_sub(1)];
+        let b = unwrapped[i];
+        let c = unwrapped[(i + 1).min(unwrapped.len() - 1)];
+        let mut v = [a, b, c];
+        v.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        v[1]
+    };
     let mut worst = 0.0_f64;
     let mut worst_at = phases[0].0;
-    for w in phases.windows(2) {
-        let mut d = (w[1].1 - w[0].1).abs();
-        if d > 0.5 {
-            d = 1.0 - d;
-        }
+    for i in 1..phases.len() {
+        let d = (median3(i) - median3(i - 1)).abs();
         if d > worst {
             worst = d;
-            worst_at = 0.5 * (w[0].0 + w[1].0);
+            worst_at = 0.5 * (phases[i - 1].0 + phases[i].0);
         }
     }
     assert!(

@@ -120,37 +120,30 @@ impl ThreadInstancePlan {
 /// `Err`.
 pub fn plan_thread_instances(length: f64, pitch: f64) -> Result<ThreadInstancePlan, String> {
     let pitch = pitch.max(1e-9);
-    let usable = (pitch * 6.0).min(length).max(pitch * 2.0);
-    // ~1 turn of run-in buries the pipe-entry triangle on the proto start
-    // face; ~0.8 turn of run-out buries the exit. Stay under 8 turns total.
-    let mut run_in = pitch * 1.0;
-    let mut run_out = pitch * 0.80;
-    let budget = MAX_INLINE_THREAD_TURNS * pitch;
+    // `helical_round_groove` pipes a cutter of height proto_len + pitch.
+    // That pipe, and the tessellated rod, must both stay ≤ 8 turns.
+    let tess_budget = MAX_INLINE_THREAD_TURNS * pitch;
+    let proto_budget = ((MAX_INLINE_THREAD_TURNS - 1.0) * pitch).min(tess_budget);
+    // Usable window + run-in/out must fit in proto_budget (7 turns).
+    let mut run_in = pitch * 0.85;
+    let mut run_out = pitch * 0.65;
+    let mut usable = (pitch * 5.4).min(length).max(pitch * 2.0);
     let mut proto_len = usable + run_in + run_out;
-    if proto_len > budget + 1e-12 {
-        let overflow = proto_len - budget;
-        run_out = (run_out - overflow * 0.40).max(pitch * 0.35);
-        run_in = (run_in - overflow * 0.60).max(pitch * 0.45);
+    if proto_len > proto_budget + 1e-12 {
+        let overflow = proto_len - proto_budget;
+        run_out = (run_out - overflow * 0.35).max(pitch * 0.40);
+        run_in = (run_in - overflow * 0.40).max(pitch * 0.50);
+        usable = (proto_budget - run_in - run_out)
+            .min(usable)
+            .max(pitch * 2.0);
         proto_len = usable + run_in + run_out;
     }
-    if proto_len > budget + 1e-12 || exceeds_inline_thread_budget(proto_len, pitch) {
-        let ends = run_in + run_out;
-        let usable = (budget - ends).min(usable).max(pitch * 2.0);
-        proto_len = usable + ends;
-        if proto_len > budget + 1e-12 || exceeds_inline_thread_budget(proto_len, pitch) {
-            return Err(
-                "thread instance prototype exceeds 8-turn tessellate budget".into(),
-            );
-        }
-        let overlap = instance_overlap(pitch, usable);
-        return Ok(ThreadInstancePlan {
-            usable,
-            run_in,
-            run_out,
-            proto_len,
-            overlap,
-            stride: (usable - overlap).max(pitch * 1.2),
-        });
+    if proto_len > proto_budget + 1e-12
+        || proto_len > tess_budget + 1e-12
+        || exceeds_inline_thread_budget(proto_len, pitch)
+        || exceeds_inline_thread_budget(proto_len + pitch, pitch)
+    {
+        return Err("thread instance prototype exceeds 8-turn tessellate budget".into());
     }
     let overlap = instance_overlap(pitch, usable);
     Ok(ThreadInstancePlan {
@@ -164,10 +157,10 @@ pub fn plan_thread_instances(length: f64, pitch: f64) -> Result<ThreadInstancePl
 }
 
 fn instance_overlap(pitch: f64, usable: f64) -> f64 {
-    (pitch * 0.50)
-        .clamp(0.20, pitch * 0.60)
-        .min(usable * 0.28)
-        .max(pitch * 0.25)
+    (pitch * 0.70)
+        .clamp(0.25, pitch * 0.85)
+        .min(usable * 0.30)
+        .max(pitch * 0.40)
 }
 
 // ── Output types ─────────────────────────────────────────────────────────────
@@ -1572,7 +1565,9 @@ pub(crate) mod occt_backend {
         // face repeats the pipe-entry triangle at every slab — the viewport
         // "jumps" and the dead-height notch.
         let plan = super::plan_thread_instances(tp.length, tp.pitch).map_err(occt_err)?;
-        if super::exceeds_inline_thread_budget(plan.proto_len, tp.pitch) {
+        if super::exceeds_inline_thread_budget(plan.proto_len, tp.pitch)
+            || super::exceeds_inline_thread_budget(plan.proto_len + tp.pitch, tp.pitch)
+        {
             return Err(occt_err(
                 "thread instance prototype exceeds 8-turn tessellate budget",
             ));
@@ -1587,12 +1582,16 @@ pub(crate) mod occt_backend {
             ));
         }
         let proto_mesh = tessellate_once(k, proto, helix_linear, angular)?;
-        let cropped = super::crop_and_rephase_thread_mesh(
-            &proto_mesh,
-            plan.run_in,
-            plan.run_in + plan.usable,
-            tp.pitch,
-        );
+        let (mz0, mz1) = mesh_z_range(&proto_mesh);
+        let z_lo = mz0 as f64 + plan.run_in;
+        let z_hi = (z_lo + plan.usable).min(mz1 as f64 - plan.run_out * 0.35);
+        if z_hi - z_lo < tp.pitch * 1.5 {
+            return Err(occt_err(
+                "long-thread instance crop left no settled helix \
+                 (refusing uncut-host tessellate fallthrough)",
+            ));
+        }
+        let cropped = super::crop_and_rephase_thread_mesh(&proto_mesh, z_lo, z_hi, tp.pitch);
         if cropped.positions.is_empty() {
             return Err(occt_err(
                 "long-thread instance path produced no mesh \
@@ -4925,17 +4924,14 @@ pub fn crop_and_rephase_thread_mesh(
 ) -> MeshData {
     let z_lo_f = z_lo as f32;
     let z_hi_f = z_hi as f32;
-    let pad = ((z_hi - z_lo).abs() * 0.004).max(0.012) as f32;
+    // Keep by centroid so long crest triangles that straddle the crop plane
+    // are not dropped (all-vertices-inside was too hungry and starved yaw).
     let cropped = filter_mesh_triangles(mesh, |mesh, a, b, c| {
         let za = mesh.positions[a * 3 + 2];
         let zb = mesh.positions[b * 3 + 2];
         let zc = mesh.positions[c * 3 + 2];
-        za >= z_lo_f - pad
-            && za <= z_hi_f + pad
-            && zb >= z_lo_f - pad
-            && zb <= z_hi_f + pad
-            && zc >= z_lo_f - pad
-            && zc <= z_hi_f + pad
+        let zmid = (za + zb + zc) / 3.0;
+        zmid >= z_lo_f && zmid <= z_hi_f
     });
     yaw_translate_mesh(&cropped, -2.0 * std::f64::consts::PI * (z_lo / pitch.max(1e-9)), [0.0, 0.0, -z_lo], false)
 }
@@ -5100,6 +5096,11 @@ mod thread_budget_tests {
             helical_turns(plan.proto_len, 1.25) <= MAX_INLINE_THREAD_TURNS,
             "proto is {} turns",
             helical_turns(plan.proto_len, 1.25)
+        );
+        assert!(
+            !exceeds_inline_thread_budget(plan.proto_len + 1.25, 1.25),
+            "cutter height proto+pitch is {} turns — pipe must stay ≤8",
+            helical_turns(plan.proto_len + 1.25, 1.25)
         );
         assert!(
             plan.run_in >= 1.25 * 0.45,
