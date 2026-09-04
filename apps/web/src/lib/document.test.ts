@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict'
 import {
+  applyParameterBatch,
+  collectParameterBatch,
+  explicitParameterNames,
   inferBoltParameters,
+  isExplicitParameter,
   parameterAllowsZero,
+  parameterBatchHasWork,
+  parameterBatchLabel,
   parameterEntries,
   parseParameterDraft,
   parseSceneJson,
+  prettyDocument,
   resolvedParameters,
   setDocumentParameter,
   sliderBounds,
@@ -242,6 +249,144 @@ function almost(a: number, b: number, eps = 1e-9) {
   assert.equal(current, 40)
   const shouldRebuild = Math.abs(40 - current) >= 1e-9
   assert.equal(shouldRebuild, false)
+}
+
+// 5. Batch calculate: several dirty drafts become one document, one rebuild payload
+{
+  const doc = parseSceneJson(goldenM8NoParams())
+  const next = applyParameterBatch(doc, {
+    values: { bolt_length: 50, head_height: 7, dead_height: 2 },
+  })
+  const hex = feat(next, 'extrude') as ExtrudeOp
+  const cyl = feat(next, 'cylinder') as CylinderOp
+  const thread = feat(next, 'thread') as ThreadOp
+  almost(hex.depth, 7)
+  almost(next.parameters!.bolt_length, 50)
+  almost(next.parameters!.head_height, 7)
+  almost(next.parameters!.dead_height, 2)
+  almost(cyl.height + (cyl.at![2] ?? 0), 50, 0.05)
+  almost(thread.at![2]! + thread.length!, 50, 0.05)
+  assert.equal(parameterBatchHasWork(doc, { values: { bolt_length: 40 } }), false)
+  assert.equal(
+    parameterBatchHasWork(doc, { values: { bolt_length: 50, head_height: 7 } }),
+    true,
+  )
+  assert.equal(parameterBatchLabel({ values: { bolt_length: 50 } }), 'bolt_length → 50')
+  assert.equal(
+    parameterBatchLabel({
+      values: { bolt_length: 50, head_height: 7 },
+      deletes: ['head_width'],
+    }),
+    'Parameters (3)',
+  )
+  // Original document is not mutated (panel drafts stay local until Calculate).
+  assert.equal(doc.parameters, undefined)
+}
+
+{
+  const committed = resolvedParameters(parseSceneJson(goldenM8NoParams()))
+  const collected = collectParameterBatch({
+    committed,
+    explicitNames: [],
+    drafts: { bolt_length: '50', head_height: '7', dead_height: '0' },
+    pendingDeletes: [],
+  })
+  assert.deepEqual(collected.invalid, [])
+  almost(collected.values.bolt_length, 50)
+  almost(collected.values.head_height, 7)
+  assert.equal(collected.values.dead_height, undefined, 'unchanged dead_height is not dirty')
+  assert.deepEqual(collected.deletes, [])
+}
+
+{
+  const collected = collectParameterBatch({
+    committed: { bolt_length: 50, head_width: 15 },
+    explicitNames: ['bolt_length', 'head_width'],
+    drafts: { bolt_length: 'nope', head_width: '16' },
+    pendingDeletes: [],
+  })
+  assert.deepEqual(collected.invalid, ['bolt_length'])
+  almost(collected.values.head_width, 16)
+}
+
+// 6. Delete removes explicit map entries; inferred-only delete is a no-op
+{
+  const doc = setDocumentParameter(parseSceneJson(goldenM8NoParams()), 'bolt_length', 50)
+  assert.equal(isExplicitParameter(doc, 'bolt_length'), true)
+  assert.ok(explicitParameterNames(doc).includes('bolt_length'))
+
+  const deleted = applyParameterBatch(doc, { deletes: ['bolt_length'] })
+  assert.equal(isExplicitParameter(deleted, 'bolt_length'), false)
+  assert.equal(deleted.parameters?.bolt_length, undefined)
+  // Feature literals stay at the last committed values (no reverse rewrite).
+  almost((feat(deleted, 'cylinder') as CylinderOp).height, (feat(doc, 'cylinder') as CylinderOp).height)
+  // Envelope dim is still inferable, so the panel may re-show it as inferred-only.
+  almost(resolvedParameters(deleted).bolt_length, 50)
+  assert.equal(parameterBatchHasWork(doc, { deletes: ['bolt_length'] }), true)
+}
+
+{
+  const inferredOnly = parseSceneJson(goldenM8NoParams())
+  assert.equal(isExplicitParameter(inferredOnly, 'bolt_length'), false)
+  const after = applyParameterBatch(inferredOnly, { deletes: ['bolt_length'] })
+  assert.equal(prettyDocument(after), prettyDocument(inferredOnly))
+  assert.equal(parameterBatchHasWork(inferredOnly, { deletes: ['bolt_length'] }), false)
+  const collected = collectParameterBatch({
+    committed: resolvedParameters(inferredOnly),
+    explicitNames: explicitParameterNames(inferredOnly),
+    drafts: {},
+    pendingDeletes: ['bolt_length'],
+  })
+  assert.deepEqual(collected.deletes, [], 'inferred-only pending delete is not in the map')
+}
+
+// 7. Calculate batches value edits and deletes in one document
+{
+  const doc = parseSceneJson(
+    JSON.stringify({
+      ...JSON.parse(goldenM8NoParams()),
+      parameters: {
+        bolt_length: 50,
+        dead_height: 20,
+        head_height: 7,
+        head_width: 15,
+      },
+    }),
+  )
+  const next = applyParameterBatch(doc, {
+    values: { bolt_length: 55, dead_height: 18 },
+    deletes: ['head_width'],
+  })
+  almost(next.parameters!.bolt_length, 55)
+  almost(next.parameters!.dead_height, 18)
+  almost(next.parameters!.head_height, 7)
+  assert.equal(next.parameters!.head_width, undefined)
+  assert.ok(!explicitParameterNames(next).includes('head_width'))
+  // Delete-of-dirty-value is skipped (the name is not written, then dropped).
+  const skipDeletedEdit = applyParameterBatch(doc, {
+    values: { head_width: 20 },
+    deletes: ['head_width'],
+  })
+  assert.equal(skipDeletedEdit.parameters!.head_width, undefined)
+}
+
+{
+  const collected = collectParameterBatch({
+    committed: {
+      bolt_length: 50,
+      dead_height: 20,
+      head_height: 7,
+      head_width: 15,
+    },
+    explicitNames: ['bolt_length', 'dead_height', 'head_height', 'head_width'],
+    drafts: { bolt_length: '55', dead_height: '18', head_width: '99' },
+    pendingDeletes: ['head_width'],
+  })
+  almost(collected.values.bolt_length, 55)
+  almost(collected.values.dead_height, 18)
+  assert.equal(collected.values.head_width, undefined)
+  assert.deepEqual(collected.deletes, ['head_width'])
+  assert.deepEqual(collected.invalid, [])
 }
 
 console.log('document.test.ts: all assertions passed')

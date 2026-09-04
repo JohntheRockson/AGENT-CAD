@@ -15,11 +15,13 @@ import type {
 import { runProgram, exportModel, streamChat } from '../lib/api'
 import { EXPORT_KINDS, canDownloadExport, exportFileName, pickSaveTarget, writeSaveTarget } from '../lib/saveFile'
 import {
+  applyParameterBatch,
+  parameterBatchHasWork,
+  parameterBatchLabel,
   parseScene,
   parseSceneJson,
   prettyDocument,
-  resolvedParameters,
-  setDocumentParameter,
+  type ParameterBatch,
 } from '../lib/document'
 import { makeSnapshot, truncateTimelineLabel } from '../lib/timeline'
 
@@ -90,6 +92,8 @@ interface CadStore {
 
   runGeometry:     (opts?: RunGeometryOptions) => Promise<void>
   setParameter:    (name: string, value: number) => Promise<void>
+  /** Commit every dirty draft + pending delete, then run one kernel rebuild. */
+  calculateParameters: (batch: ParameterBatch) => Promise<void>
   pushTimelineSnapshot: (label: string, source: TimelineSource) => void
   restoreTimelineIndex: (index: number) => void
   branchTimeline:  () => void
@@ -194,17 +198,20 @@ export const useCadStore = create<CadStore>((set, get) => ({
   },
 
   setParameter: async (name, value) => {
+    await get().calculateParameters({ values: { [name]: value } })
+  },
+
+  calculateParameters: async (batch) => {
     const doc = currentDocument(get().irCode)
     if (!doc) return
-    const current = resolvedParameters(doc)[name]
-    if (current != null && Math.abs(current - value) < 1e-9) return
+    if (!parameterBatchHasWork(doc, batch)) return
+    const updated = applyParameterBatch(doc, batch)
     get().branchTimeline()
-    const updated = setDocumentParameter(doc, name, value)
     // Do not commit IR until the kernel succeeds — failed rebuilds keep
-    // panel, mesh, and export on the last good document.
+    // panel, mesh, and export on the last good document. One batch = one run.
     await get().runGeometry({
       document:   updated,
-      label:      `${name} → ${value}`,
+      label:      parameterBatchLabel(batch),
       source:     'parameter',
       skipBranch: true,
     })
