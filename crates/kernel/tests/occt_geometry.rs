@@ -1800,7 +1800,9 @@ fn golden_hex_cylinder_thread_cut_never_tessellates_long_uncut_host() {
         "expected shank+head length, bbox={:?}",
         out.metrics.bbox
     );
-    let n_yaws = distinct_groove_yaws(mesh, zmin + 8.0, zmin + 18.0, 12);
+    // 12 samples over 10 mm is exactly 2/3 pitch — aliases a real helix
+    // into 3 yaw bins. 17 samples over the same band still require a walk.
+    let n_yaws = distinct_groove_yaws(mesh, zmin + 8.0, zmin + 18.0, 17);
     assert!(
         n_yaws >= 5,
         "groove must walk around the shank; distinct yaws={n_yaws}"
