@@ -573,7 +573,9 @@ fn distinct_groove_yaws(mesh: &kernel::engine::MeshData, z0: f64, z1: f64, sampl
     let mut bins = std::collections::HashSet::new();
     for i in 0..samples {
         let z = z0 + (z1 - z0) * (i as f64) / (samples as f64);
-        if let Some(y) = groove_yaw_at_z(mesh, z, 0.1) {
+        let yaw = deep_groove_yaw_at_z(mesh, z, 0.12, 4.0, 1.25)
+            .or_else(|| groove_yaw_at_z(mesh, z, 0.1));
+        if let Some(y) = yaw {
             let bin = (((y + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)) * 16.0).floor()
                 as i32;
             bins.insert(bin.rem_euclid(16));

@@ -1794,6 +1794,7 @@ pub(crate) mod occt_backend {
         })
     }
 
+    #[allow(dead_code)]
     fn strip_z_caps(
         mesh: &MeshData,
         z0: f32,
