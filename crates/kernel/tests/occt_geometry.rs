@@ -871,6 +871,105 @@ fn shank_samples(mesh: &kernel::engine::MeshData, z0: f64, z1: f64, r_min: f64) 
     pts
 }
 
+/// Groove helix phase at `z`: `z/P − yaw/2π` (turns, wrapped to `[0, 1)`).
+/// A continuous helix holds this nearly constant; an instance-window jump
+/// steps it.
+fn helix_phase_at_z(mesh: &kernel::engine::MeshData, z: f64, pitch: f64, band: f64) -> Option<f64> {
+    let yaw = groove_yaw_at_z(mesh, z, band)?;
+    Some((z / pitch.max(1e-9) - yaw / (2.0 * std::f64::consts::PI)).rem_euclid(1.0))
+}
+
+/// Fail if instanced slabs meet with a visible helix step (Ian's mid-shank
+/// horizontal jumps). Does not loosen the mid-shank helix / ISO checks.
+fn assert_helix_continuous_across_instance_windows(
+    mesh: &kernel::engine::MeshData,
+    pitch: f64,
+    z0: f64,
+    z1: f64,
+) {
+    let step = (pitch * 0.35).clamp(0.30, 0.50);
+    let mut zs = Vec::new();
+    let mut z = z0;
+    while z <= z1 + 1e-9 {
+        zs.push(z);
+        z += step;
+    }
+    let mut phases: Vec<(f64, f64)> = Vec::new();
+    for &zi in &zs {
+        if let Some(p) = helix_phase_at_z(mesh, zi, pitch, 0.12) {
+            phases.push((zi, p));
+        }
+    }
+    assert!(
+        phases.len() >= 8,
+        "too few helix-phase samples ({}) between {z0:.1} and {z1:.1} — \
+         cannot inspect instance seams",
+        phases.len()
+    );
+    let mut worst = 0.0_f64;
+    let mut worst_at = phases[0].0;
+    for w in phases.windows(2) {
+        let mut d = (w[1].1 - w[0].1).abs();
+        if d > 0.5 {
+            d = 1.0 - d;
+        }
+        if d > worst {
+            worst = d;
+            worst_at = 0.5 * (w[0].0 + w[1].0);
+        }
+    }
+    assert!(
+        worst < 0.10,
+        "helix phase jumps {worst:.3} turn near z={worst_at:.2} \
+         (instance window seam / yaw discontinuity)"
+    );
+}
+
+/// Fail if the first turn is leftover uncut cylinder / a triangular pipe-entry
+/// notch (dead-height → thread start).
+fn assert_clean_thread_entry(
+    mesh: &kernel::engine::MeshData,
+    r_major: f64,
+    pitch: f64,
+    thread_z0: f64,
+) {
+    let z_probe = thread_z0 + pitch * 0.55;
+    let variation = radius_variation_at_z(mesh, z_probe, 0.16);
+    assert!(
+        variation > 0.08,
+        "dead→thread start is uncut or notched (variation={variation:.4} at z={z_probe:.2})"
+    );
+    let yaw = groove_yaw_at_z(mesh, z_probe, 0.14);
+    assert!(
+        yaw.is_some(),
+        "no groove just after thread start (z={z_probe:.2}) — leftover triangular notch"
+    );
+    // Mid-shank helix phase must already hold this close to the first turn.
+    let z_mid = thread_z0 + pitch * 10.0;
+    if let (Some(y0), Some(ym)) = (yaw, groove_yaw_at_z(mesh, z_mid, 0.14)) {
+        let expected = ym - 2.0 * std::f64::consts::PI * (z_mid - z_probe) / pitch.max(1e-9);
+        let mut d = y0 - expected;
+        while d > std::f64::consts::PI {
+            d -= 2.0 * std::f64::consts::PI;
+        }
+        while d < -std::f64::consts::PI {
+            d += 2.0 * std::f64::consts::PI;
+        }
+        assert!(
+            d.abs() < 0.45,
+            "thread-start groove yaw is off the helix by {d:.3} rad \
+             (entry notch or wrong first-rod phase)"
+        );
+    }
+    assert_no_vertical_uncut_strip(
+        mesh,
+        r_major,
+        pitch,
+        thread_z0 + pitch * 0.35,
+        thread_z0 + pitch * 1.8,
+    );
+}
+
 /// Fail if the thread form is a boxy/wide bead (screenshot) instead of an
 /// ISO-width groove: ~P/8 crest, 5H/8-class depth, sloped flanks, yaw walks.
 fn assert_iso_v_thread_profile(
@@ -1116,6 +1215,9 @@ fn m8_hex_head_bolt_40mm_builds() {
     );
     assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
     assert_iso_v_thread_profile(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    // Ian retest after #19: instance-window seams + dead→thread entry notch.
+    assert_helix_continuous_across_instance_windows(&out.mesh, 1.25, zmin + 8.0, zmin + 36.0);
+    assert_clean_thread_entry(&out.mesh, 4.0, 1.25, zmin + 5.3);
     if let Ok(path) = std::env::var("AGENTCAD_DUMP_MESH") {
         std::fs::write(&path, kernel::export::to_obj(&out.mesh)).expect("dump mesh");
     }
@@ -1507,6 +1609,8 @@ fn m8_bolt_40mm_document_has_no_vertical_sliver() {
     }
     assert_no_vertical_uncut_strip(mesh, 4.0, 1.25, zmin + 8.0, zmin + 36.0);
     assert_iso_v_thread_profile(mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    assert_helix_continuous_across_instance_windows(mesh, 1.25, zmin + 8.0, zmin + 36.0);
+    assert_clean_thread_entry(mesh, 4.0, 1.25, zmin + 5.3);
 }
 
 /// Head height and dead height must stay put when only `bolt_length` changes.

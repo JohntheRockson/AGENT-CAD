@@ -72,6 +72,104 @@ pub fn with_forced_thread_instance_failure() -> ThreadInstanceFailureGuard {
     ThreadInstanceFailureGuard { _priv: () }
 }
 
+/// How a long Z thread is split into ≤8-turn prototype rods.
+///
+/// The prototype is cut longer than the placed window: `run_in` / `run_out`
+/// bury the MakePipeShell entry/exit notch (the leftover triangle at the
+/// first turn) and the Frenet start transient. Only the settled middle is
+/// instanced, then yaw-rephased so the helix continues across windows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThreadInstancePlan {
+    /// Placed window length along Z (the cropped rod).
+    pub usable: f64,
+    /// Extra proto length below the window (cropped away).
+    pub run_in: f64,
+    /// Extra proto length above the window (cropped away).
+    pub run_out: f64,
+    /// Full prototype rod length (`usable + run_in + run_out`).
+    pub proto_len: f64,
+    /// Z overlap between consecutive placed windows.
+    pub overlap: f64,
+    /// Distance between window starts (`usable - overlap`).
+    pub stride: f64,
+}
+
+impl ThreadInstancePlan {
+    /// Window starts along the thread, last start = `length - usable` so the
+    /// rod never overshoots the tip (bbox stays tip-to-top honest).
+    pub fn window_starts(&self, length: f64) -> Vec<f64> {
+        if length <= self.usable + 1e-9 {
+            return vec![0.0];
+        }
+        let last_start = length - self.usable;
+        let mut starts = Vec::new();
+        let mut z = 0.0;
+        while z < last_start - 1e-9 {
+            starts.push(z);
+            z += self.stride;
+        }
+        starts.push(last_start);
+        starts
+    }
+}
+
+/// Plan short-rod instancing for a long external thread.
+///
+/// Prototype length is always ≤ [`MAX_INLINE_THREAD_TURNS`] pitches. Callers
+/// must fail closed rather than tessellate the uncut host if this returns
+/// `Err`.
+pub fn plan_thread_instances(length: f64, pitch: f64) -> Result<ThreadInstancePlan, String> {
+    let pitch = pitch.max(1e-9);
+    let usable = (pitch * 6.0).min(length).max(pitch * 2.0);
+    // ~1 turn of run-in buries the pipe-entry triangle on the proto start
+    // face; ~0.8 turn of run-out buries the exit. Stay under 8 turns total.
+    let mut run_in = pitch * 1.0;
+    let mut run_out = pitch * 0.80;
+    let budget = MAX_INLINE_THREAD_TURNS * pitch;
+    let mut proto_len = usable + run_in + run_out;
+    if proto_len > budget + 1e-12 {
+        let overflow = proto_len - budget;
+        run_out = (run_out - overflow * 0.40).max(pitch * 0.35);
+        run_in = (run_in - overflow * 0.60).max(pitch * 0.45);
+        proto_len = usable + run_in + run_out;
+    }
+    if proto_len > budget + 1e-12 || exceeds_inline_thread_budget(proto_len, pitch) {
+        let ends = run_in + run_out;
+        let usable = (budget - ends).min(usable).max(pitch * 2.0);
+        proto_len = usable + ends;
+        if proto_len > budget + 1e-12 || exceeds_inline_thread_budget(proto_len, pitch) {
+            return Err(
+                "thread instance prototype exceeds 8-turn tessellate budget".into(),
+            );
+        }
+        let overlap = instance_overlap(pitch, usable);
+        return Ok(ThreadInstancePlan {
+            usable,
+            run_in,
+            run_out,
+            proto_len,
+            overlap,
+            stride: (usable - overlap).max(pitch * 1.2),
+        });
+    }
+    let overlap = instance_overlap(pitch, usable);
+    Ok(ThreadInstancePlan {
+        usable,
+        run_in,
+        run_out,
+        proto_len,
+        overlap,
+        stride: (usable - overlap).max(pitch * 1.2),
+    })
+}
+
+fn instance_overlap(pitch: f64, usable: f64) -> f64 {
+    (pitch * 0.50)
+        .clamp(0.20, pitch * 0.60)
+        .min(usable * 0.28)
+        .max(pitch * 0.25)
+}
+
 // ── Output types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1450,7 +1548,9 @@ pub(crate) mod occt_backend {
 
     /// Viewport path for long Z bolts: do not tessellate a 30-turn B-Rep.
     /// Mesh only safe pieces (hex head / dead caps whose Z span is ≤8 turns),
-    /// then instance an 8-turn V-groove rod along Z.
+    /// then instance a cropped ≤8-turn V-groove rod along Z. The prototype
+    /// includes run-in/out so the pipe-entry notch is not stamped at every
+    /// window (and at the dead-height → first thread).
     fn tessellate_thread_segments(
         k: &mut occt_wasm::OcctKernel,
         solids: &[Handle],
@@ -1467,19 +1567,19 @@ pub(crate) mod occt_backend {
         let angular = if level == 0 { 0.32 } else { 0.55 };
         let body = tessellate_safe_host_caps(k, solids, &tp, level, angular)?;
 
-        // Overlap slabs by ~0.4 pitch so instanced rods stitch instead of
-        // butting as open sleeves. Each WASM tessellate stays ≤8 turns.
-        let seg = (tp.pitch * 6.4).min(tp.length).max(tp.pitch * 2.0);
-        if super::exceeds_inline_thread_budget(seg, tp.pitch) {
+        // Cut a proto with run-in/out (still ≤8 turns), crop the settled
+        // helix, then instance overlapping windows. Placing the raw start
+        // face repeats the pipe-entry triangle at every slab — the viewport
+        // "jumps" and the dead-height notch.
+        let plan = super::plan_thread_instances(tp.length, tp.pitch).map_err(occt_err)?;
+        if super::exceeds_inline_thread_budget(plan.proto_len, tp.pitch) {
             return Err(occt_err(
-                "thread instance segment exceeds 8-turn tessellate budget",
+                "thread instance prototype exceeds 8-turn tessellate budget",
             ));
         }
-        let overlap = (tp.pitch * 0.40).clamp(0.20, tp.pitch * 0.55);
-        let stride = (seg - overlap).max(tp.pitch * 1.2);
         let helix_linear = preview_linear(Some(tp.pitch), level, tp.major.max(10.0));
 
-        let proto = threaded_rod(k, tp.major, tp.pitch, seg)?;
+        let proto = threaded_rod(k, tp.major, tp.pitch, plan.proto_len)?;
         if solid_exceeds_inline_budget(k, proto, tp.pitch) {
             super::record_long_host_tessellate_attempt();
             return Err(occt_err(
@@ -1487,32 +1587,30 @@ pub(crate) mod occt_backend {
             ));
         }
         let proto_mesh = tessellate_once(k, proto, helix_linear, angular)?;
-        let (pz0, pz1) = mesh_z_range(&proto_mesh);
+        let cropped = super::crop_and_rephase_thread_mesh(
+            &proto_mesh,
+            plan.run_in,
+            plan.run_in + plan.usable,
+            tp.pitch,
+        );
+        if cropped.positions.is_empty() {
+            return Err(occt_err(
+                "long-thread instance path produced no mesh \
+                 (refusing uncut-host tessellate fallthrough)",
+            ));
+        }
+        let (pz0, pz1) = mesh_z_range(&cropped);
 
         let mut parts: Vec<MeshData> = Vec::new();
         if !body.positions.is_empty() {
             parts.push(body);
         }
 
-        // Overlapping windows of size `seg`, last start = length - seg so the
-        // rod never overshoots tp.length (bbox must stay tip-to-top honest).
-        let mut starts: Vec<f64> = Vec::new();
-        if tp.length <= seg + 1e-9 {
-            starts.push(0.0);
-        } else {
-            let last_start = tp.length - seg;
-            let mut z = 0.0;
-            while z < last_start - 1e-9 {
-                starts.push(z);
-                z += stride;
-            }
-            starts.push(last_start);
-        }
-
+        let starts = plan.window_starts(tp.length);
         for (i, &z_along) in starts.iter().enumerate() {
             let strip_bottom = i > 0;
             let strip_top = i + 1 < starts.len();
-            let mesh = strip_z_caps(&proto_mesh, pz0, pz1, strip_bottom, strip_top);
+            let mesh = strip_z_caps(&cropped, pz0, pz1, strip_bottom, strip_top);
             parts.push(place_thread_mesh(&mesh, &tp, z_along));
         }
         if starts.is_empty() {
@@ -1804,38 +1902,7 @@ pub(crate) mod occt_backend {
     }
 
     fn place_thread_mesh(mesh: &MeshData, tp: &ThreadPreview, z_along: f64) -> MeshData {
-        let theta = 2.0 * PI * (z_along / tp.pitch.max(1e-9));
-        let (ct, st) = (theta.cos() as f32, theta.sin() as f32);
-        let (dx, dy, dz) = (tp.at[0] as f32, tp.at[1] as f32, (tp.at[2] + z_along) as f32);
-        let mut out = mesh.clone();
-        let n = out.positions.len() / 3;
-        for i in 0..n {
-            let x = out.positions[i * 3];
-            let y = out.positions[i * 3 + 1];
-            let z = out.positions[i * 3 + 2];
-            let x2 = x * ct - y * st;
-            let mut y2 = x * st + y * ct;
-            if tp.left {
-                y2 = -y2;
-            }
-            out.positions[i * 3] = x2 + dx;
-            out.positions[i * 3 + 1] = y2 + dy;
-            out.positions[i * 3 + 2] = z + dz;
-            if out.normals.len() >= (i + 1) * 3 {
-                let nx = out.normals[i * 3];
-                let ny = out.normals[i * 3 + 1];
-                let nz = out.normals[i * 3 + 2];
-                let nx2 = nx * ct - ny * st;
-                let mut ny2 = nx * st + ny * ct;
-                if tp.left {
-                    ny2 = -ny2;
-                }
-                out.normals[i * 3] = nx2;
-                out.normals[i * 3 + 1] = ny2;
-                out.normals[i * 3 + 2] = nz;
-            }
-        }
-        out
+        super::place_thread_segment(mesh, tp.at, tp.pitch, z_along, tp.left)
     }
 
     fn apply_body_transform(
@@ -4844,6 +4911,131 @@ fn document_output_from_bodies(bodies: Vec<BodyOutput>) -> DocumentOutput {
     DocumentOutput { bodies, metrics }
 }
 
+/// Keep triangles whose vertices lie in `[z_lo, z_hi]`, shift that slab to
+/// local z = 0, and yaw-rotate by `-2π z_lo / pitch` so helix phase at the
+/// new origin matches a helix that starts at z = 0.
+///
+/// Instancing the raw prototype start face repeats the pipe-entry triangle
+/// (viewport notch / horizontal jumps). Crop to the settled groove first.
+pub fn crop_and_rephase_thread_mesh(
+    mesh: &MeshData,
+    z_lo: f64,
+    z_hi: f64,
+    pitch: f64,
+) -> MeshData {
+    let z_lo_f = z_lo as f32;
+    let z_hi_f = z_hi as f32;
+    let pad = ((z_hi - z_lo).abs() * 0.004).max(0.012) as f32;
+    let cropped = filter_mesh_triangles(mesh, |mesh, a, b, c| {
+        let za = mesh.positions[a * 3 + 2];
+        let zb = mesh.positions[b * 3 + 2];
+        let zc = mesh.positions[c * 3 + 2];
+        za >= z_lo_f - pad
+            && za <= z_hi_f + pad
+            && zb >= z_lo_f - pad
+            && zb <= z_hi_f + pad
+            && zc >= z_lo_f - pad
+            && zc <= z_hi_f + pad
+    });
+    yaw_translate_mesh(&cropped, -2.0 * std::f64::consts::PI * (z_lo / pitch.max(1e-9)), [0.0, 0.0, -z_lo], false)
+}
+
+/// Rotate a cropped thread-rod mesh about Z by the helix phase for `z_along`
+/// and translate it to `at + (0, 0, z_along)`.
+pub fn place_thread_segment(
+    mesh: &MeshData,
+    at: [f64; 3],
+    pitch: f64,
+    z_along: f64,
+    left: bool,
+) -> MeshData {
+    let theta = 2.0 * std::f64::consts::PI * (z_along / pitch.max(1e-9));
+    yaw_translate_mesh(mesh, theta, [at[0], at[1], at[2] + z_along], left)
+}
+
+fn yaw_translate_mesh(mesh: &MeshData, theta: f64, delta: [f64; 3], left: bool) -> MeshData {
+    let (ct, st) = (theta.cos() as f32, theta.sin() as f32);
+    let (dx, dy, dz) = (delta[0] as f32, delta[1] as f32, delta[2] as f32);
+    let mut out = mesh.clone();
+    let n = out.positions.len() / 3;
+    for i in 0..n {
+        let x = out.positions[i * 3];
+        let y = out.positions[i * 3 + 1];
+        let z = out.positions[i * 3 + 2];
+        let x2 = x * ct - y * st;
+        let mut y2 = x * st + y * ct;
+        if left {
+            y2 = -y2;
+        }
+        out.positions[i * 3] = x2 + dx;
+        out.positions[i * 3 + 1] = y2 + dy;
+        out.positions[i * 3 + 2] = z + dz;
+        if out.normals.len() >= (i + 1) * 3 {
+            let nx = out.normals[i * 3];
+            let ny = out.normals[i * 3 + 1];
+            let nz = out.normals[i * 3 + 2];
+            let nx2 = nx * ct - ny * st;
+            let mut ny2 = nx * st + ny * ct;
+            if left {
+                ny2 = -ny2;
+            }
+            out.normals[i * 3] = nx2;
+            out.normals[i * 3 + 1] = ny2;
+            out.normals[i * 3 + 2] = nz;
+        }
+    }
+    out
+}
+
+fn filter_mesh_triangles(
+    mesh: &MeshData,
+    keep: impl Fn(&MeshData, usize, usize, usize) -> bool,
+) -> MeshData {
+    let tris: Vec<[u32; 3]> = if mesh.indices.is_empty() {
+        (0..mesh.positions.len() / 9)
+            .map(|t| {
+                let i = (t * 3) as u32;
+                [i, i + 1, i + 2]
+            })
+            .collect()
+    } else {
+        mesh.indices
+            .chunks(3)
+            .filter_map(|c| {
+                if c.len() == 3 {
+                    Some([c[0], c[1], c[2]])
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut indices = Vec::new();
+    for [a, b, c] in tris {
+        let (ai, bi, ci) = (a as usize, b as usize, c as usize);
+        if !keep(mesh, ai, bi, ci) {
+            continue;
+        }
+        let base = (positions.len() / 3) as u32;
+        for vi in [ai, bi, ci] {
+            positions.extend_from_slice(&mesh.positions[vi * 3..vi * 3 + 3]);
+            if mesh.normals.len() >= (vi + 1) * 3 {
+                normals.extend_from_slice(&mesh.normals[vi * 3..vi * 3 + 3]);
+            } else {
+                normals.extend_from_slice(&[0.0, 0.0, 1.0]);
+            }
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2]);
+    }
+    MeshData {
+        positions,
+        normals,
+        indices,
+    }
+}
+
 /// Compute axis-aligned bounding box from flat position array.
 pub fn bbox_from_positions(positions: &[f32]) -> [f64; 6] {
     if positions.is_empty() {
@@ -4899,6 +5091,119 @@ mod thread_budget_tests {
     fn long_host_attempt_counter_starts_empty() {
         let _ = take_long_host_tessellate_attempts();
         assert_eq!(take_long_host_tessellate_attempts(), 0);
+    }
+
+    #[test]
+    fn m8_instance_proto_stays_within_eight_turns() {
+        let plan = plan_thread_instances(34.7, 1.25).expect("M8×40 must instance");
+        assert!(
+            helical_turns(plan.proto_len, 1.25) <= MAX_INLINE_THREAD_TURNS,
+            "proto is {} turns",
+            helical_turns(plan.proto_len, 1.25)
+        );
+        assert!(
+            plan.run_in >= 1.25 * 0.45,
+            "run-in must bury the pipe-entry notch, got {}",
+            plan.run_in
+        );
+        assert!(
+            plan.usable + 1e-9 < plan.proto_len,
+            "usable window must be cropped out of a longer proto"
+        );
+        assert!(
+            plan.overlap >= 1.25 * 0.25,
+            "windows must overlap so crop edges stitch"
+        );
+        let starts = plan.window_starts(34.7);
+        assert!(starts.len() >= 3, "34.7 mm thread needs several windows");
+        assert!((starts[0]).abs() < 1e-12);
+        let last = *starts.last().unwrap();
+        assert!(
+            (last + plan.usable - 34.7).abs() < 1e-9,
+            "last window must end at thread tip, last={last} usable={}",
+            plan.usable
+        );
+        assert!(
+            starts.windows(2).all(|w| w[1] - w[0] > 0.0),
+            "window starts must be increasing"
+        );
+    }
+
+    #[test]
+    fn instance_plan_fails_closed_if_proto_cannot_fit_budget() {
+        // Degenerate tiny pitch with huge length still plans ≤8-turn proto
+        // windows rather than one long helix.
+        let plan = plan_thread_instances(100.0, 1.25).unwrap();
+        assert!(helical_turns(plan.proto_len, 1.25) <= MAX_INLINE_THREAD_TURNS);
+    }
+
+    fn synthetic_helix_ribbon(pitch: f64, length: f64, r: f32, ppt: usize) -> MeshData {
+        let n = ((length / pitch) * ppt as f64).ceil() as usize + 1;
+        let mut positions = Vec::with_capacity(n * 6);
+        let mut indices = Vec::with_capacity((n - 1) * 6);
+        for i in 0..n {
+            let z = (i as f64 / ppt as f64) * pitch;
+            let a = 2.0 * std::f64::consts::PI * (z / pitch);
+            let (c, s) = (a.cos() as f32, a.sin() as f32);
+            positions.extend_from_slice(&[r * c, r * s, z as f32]);
+            positions.extend_from_slice(&[(r + 0.2) * c, (r + 0.2) * s, z as f32]);
+            if i + 1 < n {
+                let b = (i * 2) as u32;
+                indices.extend_from_slice(&[b, b + 1, b + 2, b + 1, b + 3, b + 2]);
+            }
+        }
+        MeshData {
+            positions,
+            normals: vec![0.0; n * 6],
+            indices,
+        }
+    }
+
+    #[test]
+    fn crop_rephase_overlapping_windows_share_helix_phase() {
+        let pitch = 1.25;
+        let proto = synthetic_helix_ribbon(pitch, pitch * 8.0, 3.3, 24);
+        // Non-integer run-in so rephase is not a no-op.
+        let z_lo = pitch * 0.7;
+        let usable = pitch * 6.0;
+        let cropped = crop_and_rephase_thread_mesh(&proto, z_lo, z_lo + usable, pitch);
+        assert!(
+            !cropped.positions.is_empty(),
+            "crop should keep the settled helix"
+        );
+        let a = place_thread_segment(&cropped, [0.0, 0.0, 5.3], pitch, 0.0, false);
+        let z_along = pitch * 5.5;
+        let b = place_thread_segment(&cropped, [0.0, 0.0, 5.3], pitch, z_along, false);
+        // Overlap at world z = 5.3 + 5.5 P + 0.25 P.
+        let z_world = 5.3 + z_along + pitch * 0.25;
+        let yaw = |mesh: &MeshData| {
+            let mut best = None;
+            let mut best_d = f32::MAX;
+            for chunk in mesh.positions.chunks(3) {
+                if chunk.len() < 3 {
+                    continue;
+                }
+                let d = (chunk[2] - z_world as f32).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = Some(chunk[1].atan2(chunk[0]));
+                }
+            }
+            best.filter(|_| best_d < 0.08)
+        };
+        let ya = yaw(&a).expect("window 0 should cover the overlap Z");
+        let yb = yaw(&b).expect("window 1 should cover the overlap Z");
+        let mut d = (ya - yb) as f64;
+        if d > std::f64::consts::PI {
+            d -= 2.0 * std::f64::consts::PI;
+        }
+        if d < -std::f64::consts::PI {
+            d += 2.0 * std::f64::consts::PI;
+        }
+        assert!(
+            d.abs() < 0.08,
+            "overlapping instances must share helix yaw, Δ={d:.4} ({ya} vs {yb})"
+        );
     }
 }
 
