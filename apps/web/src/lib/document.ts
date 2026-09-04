@@ -148,6 +148,116 @@ export function setDocumentParameter(
   return next
 }
 
+/** Treat as unchanged so draft/commit guards skip a no-op rebuild. */
+export function sameParameterValue(a: number, b: number): boolean {
+  return Math.abs(a - b) < 1e-9
+}
+
+export function isExplicitParameter(doc: CadDocument, name: string): boolean {
+  const value = doc.parameters?.[name]
+  return value != null && Number.isFinite(value)
+}
+
+export function explicitParameterNames(doc: CadDocument): string[] {
+  return Object.entries(doc.parameters ?? {})
+    .filter(([, value]) => Number.isFinite(value))
+    .map(([name]) => name)
+}
+
+export interface ParameterBatch {
+  values?: Record<string, number>
+  deletes?: string[]
+}
+
+/**
+ * Apply every value edit, then drop deleted keys from `document.parameters`.
+ * Feature literals are not rewritten on delete — only the map entry is removed.
+ * Inferred-only names (no map entry) are ignored on delete; they are not in the map.
+ */
+export function applyParameterBatch(doc: CadDocument, batch: ParameterBatch): CadDocument {
+  const deletes = new Set(batch.deletes ?? [])
+  const values = batch.values ?? {}
+  let next = doc
+  for (const [name, value] of Object.entries(values)) {
+    if (deletes.has(name)) continue
+    next = setDocumentParameter(next, name, value)
+  }
+  if (deletes.size === 0) return next
+
+  const parameters = { ...(next.parameters ?? {}) }
+  let removed = false
+  for (const name of deletes) {
+    if (Object.prototype.hasOwnProperty.call(parameters, name)) {
+      delete parameters[name]
+      removed = true
+    }
+  }
+  if (!removed) return next
+  return {
+    ...next,
+    parameters: Object.keys(parameters).length > 0 ? parameters : undefined,
+  }
+}
+
+export function parameterBatchHasWork(doc: CadDocument, batch: ParameterBatch): boolean {
+  const deletes = batch.deletes ?? []
+  if (deletes.some((name) => isExplicitParameter(doc, name))) return true
+  const resolved = resolvedParameters(doc)
+  for (const [name, value] of Object.entries(batch.values ?? {})) {
+    if (deletes.includes(name)) continue
+    const current = resolved[name]
+    if (current == null || !sameParameterValue(current, value)) return true
+  }
+  return false
+}
+
+export function parameterBatchLabel(batch: ParameterBatch): string {
+  const edits = Object.entries(batch.values ?? {})
+  const deletes = batch.deletes ?? []
+  const parts = [
+    ...edits.map(([name, value]) => `${name} → ${value}`),
+    ...deletes.map((name) => `delete ${name}`),
+  ]
+  if (parts.length === 0) return 'Parameters'
+  if (parts.length === 1) return parts[0]!
+  return `Parameters (${parts.length})`
+}
+
+/**
+ * Turn panel drafts + pending deletes into one Calculate payload.
+ * Enter/blur only update `drafts`; this runs when the user clicks Calculate.
+ */
+export function collectParameterBatch(opts: {
+  committed: Record<string, number>
+  explicitNames: readonly string[]
+  drafts: Record<string, string>
+  pendingDeletes: readonly string[]
+}): { values: Record<string, number>; deletes: string[]; invalid: string[] } {
+  const explicit = new Set(opts.explicitNames)
+  const pending = new Set(opts.pendingDeletes)
+  const deletes = [...pending].filter((name) => explicit.has(name))
+  const values: Record<string, number> = {}
+  const invalid: string[] = []
+
+  for (const [name, current] of Object.entries(opts.committed)) {
+    if (pending.has(name)) continue
+    const raw = opts.drafts[name]
+    if (raw == null) continue
+    const parsed = parseParameterDraft(raw, name)
+    if (parsed == null) {
+      if (raw.trim() !== '' && raw.trim() !== String(current)) {
+        invalid.push(name)
+      }
+      continue
+    }
+    if (!sameParameterValue(parsed, current)) {
+      values[name] = parsed
+    }
+  }
+
+  return { values, deletes, invalid }
+}
+
 /** Scale numbers that match common ratios of the old parameter (hex vertices, halves). */
 function scaleLike(v: number, oldVal: number, newVal: number, key?: string): number | null {
   const tol = numberTol(oldVal)
