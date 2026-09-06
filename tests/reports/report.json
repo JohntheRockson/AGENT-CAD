@@ -21,9 +21,13 @@
     "volume": 2519.9111954427744
   },
   "checks": {
+    "fillet_under_head_junction_r": {
+      "detail": "no measurable under-head junction R (FAIL): Δvolume=4.1234 hex_look=true under_head=none hex_corner=n=2820 err=0.121 ΔAF=0.0000 Δmin_r=0.9238. Fillet must show R≈0.8 mm at the head≈5.3 / Ø8 junction. Hex-corner R or Δvolume alone is not enough.",
+      "result": "FAIL"
+    },
     "fillet_under_head_or_named_r": {
-      "detail": "fillet R + hex look: named/hex-corner R≈0.8 mm (median err 0.121 mm, n=2820); ΔAF=0.000 Δmin_r=0.924 Δmax_r=0.000 Δvolume=4.123 (Δvol alone is not sufficient)",
-      "result": "PASS"
+      "detail": "no measurable under-head junction R (FAIL): Δvolume=4.1234 hex_look=true under_head=none hex_corner=n=2820 err=0.121 ΔAF=0.0000 Δmin_r=0.9238. Fillet must show R≈0.8 mm at the head≈5.3 / Ø8 junction. Hex-corner R or Δvolume alone is not enough.",
+      "result": "FAIL"
     },
     "helix_continuous_and_clean_entry": {
       "detail": "helix continuous across instance windows (worst < 0.10 turn, rms < 0.08); clean thread entry (first-turn groove on helix)",
@@ -46,7 +50,9 @@
       "result": "PASS"
     }
   },
-  "failed": [],
+  "failed": [
+    "fillet R: no measurable under-head junction R (FAIL): Δvolume=4.1234 hex_look=true under_head=none hex_corner=n=2820 err=0.121 ΔAF=0.0000 Δmin_r=0.9238. Fillet must show R≈0.8 mm at the head≈5.3 / Ø8 junction. Hex-corner R or Δvolume alone is not enough."
+  ],
   "files": {
     "obj_bytes": 24980219,
     "step_bytes": 84004491,
@@ -96,7 +102,7 @@
     "built with feature `occt` (kernel/occt)",
     "golden IR: locked ISO caliper: AF 13, Ø8, P 1.25, L 40, head ~5.3",
     "Engine::uses_occt = true",
-    "Engine::warmup ok in 11.54s",
+    "Engine::warmup ok in 0.59s",
     "Engine::execute_document (golden M8 AF13) ok in 8.38s  volume=2519.911 bbox=[-7.505553722381592, -6.5, 0.0, 7.505553722381592, 6.5, 40.095184326171875] is_solid=true verts=297735",
     "wrote m8_x40.obj (24980219 bytes)",
     "wrote m8_x40.stl (4962334 bytes) via kernel::export::to_stl",
@@ -108,7 +114,7 @@
     "also wrote m8_x40.export.stl (3958534 bytes) via Engine::export_document Stl (look-right uses to_stl mesh)",
     "list_topology(hex+shank): faces=10 edges=21 tip=\"Use face: \\\"largest\\\"|\\\"top\\\"|\\\"bottom\\\"|<index> on cut/fuse/hole/sketch. Use edges: \\\"all\\\"|\\\"top\\\"|\\\"longest\\\"|[indices] on fillet/chamfer. Pattern holes with scope:\\\"feature\\\" after hole/cut.\"",
     "under-head junction edge indices: [1, 5, 7, 13, 14, 15]",
-    "Engine::execute (M8 + under-head/named fillet r=0.8) ok in 8.39s  volume=2515.788 bbox=[-7.505553722381592, -6.5, 0.0, 7.505553722381592, 6.5, 40.095184326171875] is_solid=true"
+    "Engine::execute (M8 + under-head/named fillet r=0.8) ok in 8.65s  volume=2515.788 bbox=[-7.505553722381592, -6.5, 0.0, 7.505553722381592, 6.5, 40.095184326171875] is_solid=true"
   ],
   "look_right": {
     "continuous_ok": true,
@@ -117,7 +123,7 @@
     "spread": 0.3509010762133653,
     "variation": 0.24909675028466036
   },
-  "overall": "PASS",
+  "overall": "FAIL",
   "stl_bbox": [
     -7.505553722381592,
     -6.5,
