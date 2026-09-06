@@ -17,11 +17,13 @@ import { EXPORT_KINDS, canDownloadExport, exportFileName, pickSaveTarget, writeS
 import {
   applyParameterBatch,
   documentForAgent,
+  metricsFromBodies,
   parameterBatchHasWork,
   parameterBatchLabel,
   parseDocumentOrNull,
   parseScene,
   parseSceneJson,
+  planDeleteBody,
   prettyDocument,
   workingDocument,
   type ParameterBatch,
@@ -96,7 +98,11 @@ interface CadStore {
   setParameter:    (name: string, value: number) => Promise<void>
   /** Commit every dirty draft + pending delete, then run one kernel rebuild. */
   calculateParameters: (batch: ParameterBatch) => Promise<void>
-  pushTimelineSnapshot: (label: string, source: TimelineSource) => void
+  pushTimelineSnapshot: (
+    label: string,
+    source: TimelineSource,
+    opts?: { allowEmpty?: boolean },
+  ) => void
   restoreTimelineIndex: (index: number) => void
   branchTimeline:  () => void
   atTimelineTip:   () => boolean
@@ -170,9 +176,9 @@ export const useCadStore = create<CadStore>((set, get) => ({
     set({ timeline: timeline.slice(0, timelineIndex + 1) })
   },
 
-  pushTimelineSnapshot: (label, source) => {
+  pushTimelineSnapshot: (label, source, opts) => {
     const s = get()
-    if (!s.irCode.trim()) return
+    if (!s.irCode.trim() && !opts?.allowEmpty) return
     const snap = makeSnapshot(label, source, {
       irCode:   s.irCode,
       bodies:   s.bodies,
@@ -259,19 +265,34 @@ export const useCadStore = create<CadStore>((set, get) => ({
   },
 
   deleteBody: (id) => {
-    const doc = currentDocument(get().irCode)
-    if (!doc) return
-    doc.bodies = doc.bodies.filter((b) => b.bodyId !== id)
-    const bodies = get().bodies.filter((b) => b.bodyId !== id)
-    const nextIr = doc.bodies.length ? prettyDocument(doc) : ''
+    const s = get()
+    const plan = planDeleteBody({
+      irCode: s.irCode,
+      lastGoodIrCode: s.lastGoodIrCode,
+      bodyId: id,
+    })
+    if (!plan) return
+
+    // Unrun / dirty editor: mutate the JSON draft only. Viewport, last-good,
+    // export, and chat stay on the trusted solid (#17 / Cycle 2).
+    if (plan.kind === 'editor-only') {
+      set({ irCode: plan.nextIrCode })
+      return
+    }
+
+    get().branchTimeline()
+    const bodies = s.bodies.filter((b) => b.bodyId !== id)
     set({
-      irCode: nextIr,
-      lastGoodIrCode: get().lastGoodIrCode === get().irCode ? nextIr : get().lastGoodIrCode,
+      irCode: plan.nextIrCode,
+      lastGoodIrCode: plan.nextIrCode,
       bodies,
       meshData: bodies.find((b) => b.visible)?.mesh ?? null,
-      selectedBodyId: get().selectedBodyId === id ? null : get().selectedBodyId,
-      isolatedBodyId: get().isolatedBodyId === id ? null : get().isolatedBodyId,
+      metrics: metricsFromBodies(bodies),
+      selectedBodyId: s.selectedBodyId === id ? null : s.selectedBodyId,
+      isolatedBodyId: s.isolatedBodyId === id ? null : s.isolatedBodyId,
     })
+    // Allow an empty snapshot so deleting the last body is undoable.
+    get().pushTimelineSnapshot(plan.label, 'manual', { allowEmpty: true })
   },
 
   // ── Run geometry ────────────────────────────────────────────────────────────

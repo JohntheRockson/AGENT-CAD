@@ -6,12 +6,15 @@ import {
   collectParameterBatch,
   committedParametersSignature,
   countUncommittedParameters,
+  deleteBodyTimelineLabel,
   documentForAgent,
   documentsAlign,
   editorTrustKind,
   explicitParameterNames,
   inferBoltParameters,
+  irAfterBodyRemoval,
   isExplicitParameter,
+  metricsFromBodies,
   parameterAllowsZero,
   parameterBatchHasWork,
   parameterBatchLabel,
@@ -20,8 +23,10 @@ import {
   parseDocumentOrNull,
   parseParameterDraft,
   parseSceneJson,
+  planDeleteBody,
   prettyDocument,
   reconcileParameterDrafts,
+  removeBodyFromDocument,
   resolvedParameters,
   setDocumentParameter,
   shouldConfirmChatSend,
@@ -31,7 +36,7 @@ import {
   uncommittedParameterExportNote,
   workingDocument,
 } from './document.ts'
-import type { CadDocument, CylinderOp, ExtrudeOp, Feature, ThreadOp } from '../types/cad.ts'
+import type { BodyInstance, CadDocument, CylinderOp, ExtrudeOp, Feature, MetricsData, ThreadOp } from '../types/cad.ts'
 
 /** Golden M8×40 IR with numeric literals and no parameters map. */
 function goldenM8NoParams(overrides?: {
@@ -570,6 +575,127 @@ function almost(a: number, b: number, eps = 1e-9) {
   const rewriteEditor = toolbarRewriteConfirmMessage(0, 'dirty')
   assert.ok(rewriteEditor.includes('Unrun JSON editor edits will not be sent'))
   assert.ok(toolbarRewriteConfirmMessage(1, 'invalid').includes('Invalid editor JSON'))
+}
+
+// 10. Delete-body: History snapshot + metrics; dirty editor does not strip the solid
+{
+  const twoBody = parseSceneJson(JSON.stringify({
+    documentId: 'two',
+    units: 'mm',
+    bodies: [
+      {
+        bodyId: 'body_a',
+        name: 'Bolt',
+        visible: true,
+        features: [{ op: 'box', size: [10, 10, 10] }],
+      },
+      {
+        bodyId: 'body_b',
+        name: 'Nut',
+        visible: true,
+        features: [{ op: 'cylinder', diameter: 8, height: 6 }],
+      },
+    ],
+  }))
+  const aligned = prettyDocument(twoBody)
+  const removed = removeBodyFromDocument(twoBody, 'body_a')
+  assert.ok(removed)
+  assert.equal(removed.bodies.length, 1)
+  assert.equal(removed.bodies[0].bodyId, 'body_b')
+  assert.equal(twoBody.bodies.length, 2, 'source document is not mutated')
+  assert.equal(removeBodyFromDocument(twoBody, 'missing'), null)
+  const lastRemoved = removeBodyFromDocument(removed, 'body_b')
+  assert.ok(lastRemoved)
+  assert.equal(irAfterBodyRemoval(lastRemoved), '')
+  assert.equal(deleteBodyTimelineLabel('Bolt'), 'Delete Bolt')
+  assert.equal(deleteBodyTimelineLabel('  '), 'Delete body')
+
+  const scene = planDeleteBody({
+    irCode: aligned,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+  })
+  assert.ok(scene && scene.kind === 'scene')
+  assert.equal(scene.label, 'Delete Bolt')
+  assert.ok(documentsAlign(parseSceneJson(scene.nextIrCode), removed))
+  // Chat / export last-good after a scene delete is the remaining solid.
+  assert.ok(
+    documentsAlign(documentForAgent(scene.nextIrCode, scene.nextIrCode)!, removed),
+  )
+
+  const last = planDeleteBody({
+    irCode: scene.nextIrCode,
+    lastGoodIrCode: scene.nextIrCode,
+    bodyId: 'body_b',
+  })
+  assert.ok(last && last.kind === 'scene')
+  assert.equal(last.nextIrCode, '')
+
+  const dirtyIr = prettyDocument({
+    ...twoBody,
+    bodies: twoBody.bodies.map((b) =>
+      b.bodyId === 'body_b' ? { ...b, name: 'Nut draft' } : b,
+    ),
+  })
+  assert.notEqual(dirtyIr, aligned)
+  const editorOnly = planDeleteBody({
+    irCode: dirtyIr,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+  })
+  assert.ok(editorOnly && editorOnly.kind === 'editor-only')
+  assert.equal(parseDocumentOrNull(editorOnly.nextIrCode)?.bodies.length, 1)
+  assert.equal(parseDocumentOrNull(editorOnly.nextIrCode)?.bodies[0].bodyId, 'body_b')
+  // Viewport / chat / export stay on last-good (still has both bodies).
+  assert.ok(documentsAlign(documentForAgent(editorOnly.nextIrCode, aligned)!, twoBody))
+  assert.equal(
+    planDeleteBody({
+      irCode: '{ "bodies": [ }',
+      lastGoodIrCode: aligned,
+      bodyId: 'body_a',
+    }),
+    null,
+    'invalid JSON does not silently strip the mesh',
+  )
+  assert.equal(
+    planDeleteBody({ irCode: aligned, lastGoodIrCode: aligned, bodyId: 'nope' }),
+    null,
+  )
+}
+
+{
+  const mesh = { positions: [0], normals: [0], indices: [0] }
+  const metric = (partial: Partial<MetricsData> & { volume: number; bbox: MetricsData['bbox'] }): MetricsData => ({
+    surface_area: partial.surface_area ?? 1,
+    is_solid: partial.is_solid ?? true,
+    units: partial.units ?? 'mm',
+    volume: partial.volume,
+    bbox: partial.bbox,
+  })
+  const inst = (id: string, m: MetricsData): BodyInstance => ({
+    bodyId: id,
+    name: id,
+    visible: true,
+    suppressed: false,
+    mesh,
+    metrics: m,
+  })
+
+  assert.equal(metricsFromBodies([]), null)
+  const one = metricsFromBodies([
+    inst('a', metric({ volume: 10, surface_area: 4, bbox: [0, 0, 0, 2, 2, 2] })),
+  ])
+  almost(one!.volume, 10)
+  assert.deepEqual(one!.bbox, [0, 0, 0, 2, 2, 2])
+
+  const combined = metricsFromBodies([
+    inst('a', metric({ volume: 10, surface_area: 4, bbox: [0, 0, 0, 2, 2, 2] })),
+    inst('b', metric({ volume: 3, surface_area: 5, is_solid: false, bbox: [-1, 1, 0, 1, 4, 3] })),
+  ])
+  almost(combined!.volume, 13)
+  almost(combined!.surface_area, 9)
+  assert.equal(combined!.is_solid, false)
+  assert.deepEqual(combined!.bbox, [-1, 0, 0, 2, 4, 3])
 }
 
 console.log('document.test.ts: all assertions passed')

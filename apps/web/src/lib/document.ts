@@ -1,4 +1,12 @@
-import type { CadBody, CadDocument, CadProgram, Feature, ThreadOp } from '../types/cad'
+import type {
+  BodyInstance,
+  CadBody,
+  CadDocument,
+  CadProgram,
+  Feature,
+  MetricsData,
+  ThreadOp,
+} from '../types/cad'
 
 export const BODY_COLORS = [
   '#4a90e2',
@@ -461,6 +469,128 @@ export function parametersLastGoodNote(opts: {
     return 'JSON is invalid — showing last calculated parameters. Fix or Run to use the editor.'
   }
   return 'JSON editor is empty — showing last calculated parameters.'
+}
+
+/** Drop one body from the document. Missing id is a no-op (`null`). */
+export function removeBodyFromDocument(doc: CadDocument, bodyId: string): CadDocument | null {
+  if (!doc.bodies.some((b) => b.bodyId === bodyId)) return null
+  return {
+    ...doc,
+    bodies: doc.bodies.filter((b) => b.bodyId !== bodyId),
+  }
+}
+
+export function irAfterBodyRemoval(doc: CadDocument): string {
+  return doc.bodies.length ? prettyDocument(doc) : ''
+}
+
+export function deleteBodyTimelineLabel(name: string): string {
+  const cleaned = name.replace(/\s+/g, ' ').trim() || 'body'
+  return `Delete ${cleaned}`
+}
+
+/**
+ * Status-bar / editor metrics for remaining bodies after a local delete.
+ * No kernel run — volume/area add, bbox unions. Empty → null (no leftover solid).
+ */
+export function metricsFromBodies(bodies: BodyInstance[]): MetricsData | null {
+  if (bodies.length === 0) return null
+  if (bodies.length === 1) {
+    const m = bodies[0]!.metrics
+    return {
+      ...m,
+      bbox: [...m.bbox] as MetricsData['bbox'],
+    }
+  }
+  let volume = 0
+  let surface_area = 0
+  let is_solid = true
+  let xmin = Infinity
+  let ymin = Infinity
+  let zmin = Infinity
+  let xmax = -Infinity
+  let ymax = -Infinity
+  let zmax = -Infinity
+  let units: MetricsData['units']
+  for (const body of bodies) {
+    const m = body.metrics
+    volume += m.volume
+    surface_area += m.surface_area
+    is_solid = is_solid && m.is_solid
+    const [x0, y0, z0, x1, y1, z1] = m.bbox
+    xmin = Math.min(xmin, x0)
+    ymin = Math.min(ymin, y0)
+    zmin = Math.min(zmin, z0)
+    xmax = Math.max(xmax, x1)
+    ymax = Math.max(ymax, y1)
+    zmax = Math.max(zmax, z1)
+    if (m.units) units = m.units
+  }
+  return {
+    volume,
+    surface_area,
+    is_solid,
+    bbox: [xmin, ymin, zmin, xmax, ymax, zmax],
+    units,
+  }
+}
+
+export type DeleteBodyPlan =
+  | {
+      kind: 'scene'
+      nextIrCode: string
+      removedName: string
+      label: string
+    }
+  | {
+      kind: 'editor-only'
+      nextIrCode: string
+      removedName: string
+    }
+
+function deletePlanFromDoc(
+  doc: CadDocument,
+  bodyId: string,
+  kind: DeleteBodyPlan['kind'],
+): DeleteBodyPlan | null {
+  const removed = doc.bodies.find((b) => b.bodyId === bodyId)
+  if (!removed) return null
+  const next = removeBodyFromDocument(doc, bodyId)
+  if (!next) return null
+  const removedName = removed.name || removed.bodyId
+  const nextIrCode = irAfterBodyRemoval(next)
+  if (kind === 'scene') {
+    return {
+      kind,
+      nextIrCode,
+      removedName,
+      label: deleteBodyTimelineLabel(removedName),
+    }
+  }
+  return { kind, nextIrCode, removedName }
+}
+
+/**
+ * Aligned last-good: delete the solid you see (IR, mesh, metrics, History).
+ * Dirty parseable editor: JSON draft only — viewport / last-good stay.
+ * Invalid JSON: no-op (cannot parse the editor; do not silently strip the mesh).
+ */
+export function planDeleteBody(opts: {
+  irCode: string
+  lastGoodIrCode: string
+  bodyId: string
+}): DeleteBodyPlan | null {
+  const current = parseDocumentOrNull(opts.irCode)
+  const lastGood = parseDocumentOrNull(opts.lastGoodIrCode)
+  const aligned = opts.irCode === opts.lastGoodIrCode
+
+  if (lastGood && aligned) {
+    return deletePlanFromDoc(lastGood, opts.bodyId, 'scene')
+  }
+  if (current) {
+    return deletePlanFromDoc(current, opts.bodyId, 'editor-only')
+  }
+  return null
 }
 
 /** Scale numbers that match common ratios of the old parameter (hex vertices, halves). */
