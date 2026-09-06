@@ -644,9 +644,34 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
         // (Cycle 11 refused them as Gemini verify fixes; Cycle 14 skipped
         // recipe-breaking leftover). Do not keep a document that failed
         // validate — a later attempt must not overwrite a prior legal parse.
-        if agent::fastener_recipe_violation(&document).is_none() {
-            last_document = Some(document.clone());
+        // Cycle 36: Gemini Ok/Skipped used to emit_success anyway, so a
+        // draft/thicken/blank-shank parse that the kernel built still shipped.
+        if let Some(recipe_err) = reject_chat_success(&document) {
+            last_error = format!("Fastener recipe failed: {recipe_err}");
+            tracing::warn!(attempt, %last_error, "recipe rejected before execute");
+            emit(
+                &tx,
+                ChatSseEvent::Repair {
+                    attempt,
+                    error: last_error.clone(),
+                },
+            )
+            .await;
+            contents.push(GeminiContent {
+                role: "model".to_string(),
+                parts: vec![gemini_text(model_text)],
+            });
+            contents.push(GeminiContent {
+                role: "user".to_string(),
+                parts: vec![gemini_text(format!(
+                    "The document failed the fastener recipe: {recipe_err}.\
+                     {}Return a valid {{ \"say\", \"document\" }} JSON object.",
+                    fastener_repair_hint(&recipe_err),
+                ))],
+            });
+            continue;
         }
+        last_document = Some(document.clone());
 
         emit(&tx, ChatSseEvent::CalculatingStart).await;
         let calc_start = Instant::now();
@@ -911,6 +936,35 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                     }
                     VerifyVerdict::Ok { say: verified_say }
                     | VerifyVerdict::Skipped { say: verified_say } => {
+                        if let Some(recipe_err) = reject_chat_success(&document) {
+                            last_error = format!("Fastener recipe failed: {recipe_err}");
+                            tracing::warn!(
+                                attempt,
+                                %last_error,
+                                "Gemini verify accepted recipe-breaking IR; forcing repair"
+                            );
+                            emit(
+                                &tx,
+                                ChatSseEvent::Repair {
+                                    attempt,
+                                    error: last_error.clone(),
+                                },
+                            )
+                            .await;
+                            contents.push(GeminiContent {
+                                role: "model".to_string(),
+                                parts: vec![gemini_text(model_text)],
+                            });
+                            contents.push(GeminiContent {
+                                role: "user".to_string(),
+                                parts: vec![gemini_text(format!(
+                                    "The solid built, but the fastener recipe failed: {recipe_err}.\
+                                     {}Return a valid {{ \"say\", \"document\" }} JSON object.",
+                                    fastener_repair_hint(&recipe_err),
+                                ))],
+                            });
+                            continue;
+                        }
                         let program_val = serde_json::to_value(&document).unwrap_or_default();
                         let message = verified_say
                             .or(say)
@@ -1367,7 +1421,13 @@ fn kernel_error_for_model(err: &kernel::engine::KernelError) -> String {
 /// deterministic fastener judge would have failed the original — otherwise
 /// a thread-first / AF-10 / past-tip "fix" ships and becomes last_document.
 fn reject_verify_fix(fixed: &CadDocument) -> Option<String> {
-    agent::fastener_recipe_violation(fixed)
+    reject_chat_success(fixed)
+}
+
+/// Chat must not `emit_success` for recipe-breaking IR even if Gemini
+/// verify says ok / skipped. Same gate as leftover `last_document`.
+fn reject_chat_success(doc: &CadDocument) -> Option<String> {
+    agent::fastener_recipe_violation(doc)
 }
 
 fn fastener_repair_hint(err: &str) -> String {
@@ -2553,6 +2613,137 @@ mod tests {
         assert_eq!(
             v["program"]["bodies"][0]["bodyId"], "body_plate",
             "exhaust leftover must not ship a recipe-breaking last_parsed"
+        );
+    }
+
+    /// Gemini Ok/Skipped used to emit_success for IR the judge would refuse.
+    /// Chat success and leftover keep share the same gate.
+    #[test]
+    fn chat_success_must_not_ship_recipe_breaking_ir() {
+        let thread_first = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_bad",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "thread", "kind": "external", "size": "M8", "length": 24 },
+                    { "op": "cylinder", "diameter": 13, "height": 5.3, "at": [0, 0, 24] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&thread_first).is_some(),
+            "thread-first must not ship as chat success"
+        );
+
+        let draft_after = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "draft", "faces": "side", "angle": 2 }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&draft_after).is_some(),
+            "draft after thread must not ship as chat success"
+        );
+
+        let named_m8_blank = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "M8",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&named_m8_blank).is_some(),
+            "named M8 hex+shank with no thread must not ship as chat success"
+        );
+
+        assert!(
+            reject_chat_success(&agent::example_m8_bolt_document()).is_none(),
+            "golden recipe must still ship"
+        );
+
+        let hex_plate_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "hex plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&hex_plate_tap).is_none(),
+            "hex-plate tap must still ship"
+        );
+
+        let cut_after = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "cut",
+                      "profile": { "rect": { "w": 1.2, "h": 8, "centered": true } },
+                      "depth": 2, "at": [0, 0, 5.3] },
+                    { "op": "transform", "translate": [10, 0, 0] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&cut_after).is_none(),
+            "cut/transform after thread must still ship"
         );
     }
 }
