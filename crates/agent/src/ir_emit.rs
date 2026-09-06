@@ -156,6 +156,13 @@ fn body_fastener_violation(
                             .into(),
                     );
                 }
+                Feature::Shell(_) | Feature::Offset(_) => {
+                    return Some(
+                        "shell or offset after thread wrecks the helix; \
+                         chamfer the tip with edges:\"top\" only"
+                            .into(),
+                    );
+                }
                 _ => {}
             }
         }
@@ -257,6 +264,7 @@ fn bolt_params_drive_hex_and_grip(
     };
     let head_from_feat = match &body.features[hex_i] {
         Feature::Fuse(op) => Some(op.depth),
+        Feature::Common(op) => Some(op.depth),
         _ => body.features[hex_i + 1..thread_i]
             .iter()
             .find_map(|f| match f {
@@ -580,6 +588,12 @@ fn hex_across_flats(f: &Feature) -> Option<f64> {
         // Catalog fuse joins a boss. Models sometimes emit the hex head as
         // fuse instead of sketch+extrude; that still has to be ISO AF 13.
         Feature::Fuse(op) => profile_across_flats(&op.profile),
+        Feature::Common(op) => profile_across_flats(&op.profile),
+        Feature::Loft(op) => op
+            .sections
+            .iter()
+            .find_map(|s| profile_across_flats(&s.profile)),
+        Feature::Sweep(op) => op.profile.as_ref().and_then(profile_across_flats),
         _ => None,
     }
 }
@@ -2889,6 +2903,198 @@ mod tests {
         assert!(
             fastener_recipe_violation(&hex_plate_polyline_tap).is_none(),
             "polyline hex-plate tap must stay unjudged"
+        );
+    }
+
+    /// Cycle 27: loft / sweep / common hex skipped is_hex_head (same AF 10
+    /// hide as polyline). Shell / offset after thread wrecks the helix.
+    #[test]
+    fn fastener_rules_reject_loft_sweep_hex_and_shell_after_thread() {
+        let params = serde_json::json!({
+            "bolt_length": 40.0,
+            "head_height": 5.3,
+            "head_width": 13.0,
+            "dead_height": 8.0,
+            "major_diameter": 8.0
+        });
+        let finish = |head: serde_json::Value| {
+            serde_json::json!([
+                head,
+                { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                { "op": "thread", "kind": "external", "size": "M8",
+                  "length": 26.7, "at": [0, 0, 13.3] },
+                { "op": "chamfer", "distance": 0.5, "edges": "top" }
+            ])
+        };
+
+        let loft_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": finish(serde_json::json!({
+                    "op": "loft",
+                    "sections": [
+                        { "profile": { "hex": { "across_flats": 10 } }, "at": [0, 0, 0] },
+                        { "profile": { "hex": { "across_flats": 10 } }, "at": [0, 0, 5.3] }
+                    ]
+                }))
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&loft_af10)
+            .expect("loft hex AF 10 next to size M8 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "reason should name the loft-hex AF lie: {reason}"
+        );
+
+        let loft_af13 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": finish(serde_json::json!({
+                    "op": "loft",
+                    "sections": [
+                        { "profile": { "hex": { "across_flats": 13 } }, "at": [0, 0, 0] },
+                        { "profile": { "hex": { "across_flats": 13 } }, "at": [0, 0, 5.3] }
+                    ]
+                }))
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&loft_af13).is_none(),
+            "loft hex AF 13 with the golden shank/thread must still pass"
+        );
+
+        let sweep_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": finish(serde_json::json!({
+                    "op": "sweep",
+                    "profile": { "hex": { "across_flats": 10 } },
+                    "path": { "polyline": { "points": [[0, 0, 0], [0, 0, 5.3]] } }
+                }))
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&sweep_af10)
+            .expect("sweep hex AF 10 next to size M8 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "reason should name the sweep-hex AF lie: {reason}"
+        );
+
+        let common_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": finish(serde_json::json!({
+                    "op": "common",
+                    "profile": { "hex": { "across_flats": 10 } },
+                    "depth": 5.3
+                }))
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&common_af10)
+            .expect("common hex AF 10 next to size M8 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "reason should name the common-hex AF lie: {reason}"
+        );
+
+        let shell_after = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "shell", "thickness": 1, "faces": "largest" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&shell_after)
+            .expect("shell after thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("shell") && l.contains("after thread"),
+            "reason should name shell after thread: {reason}"
+        );
+
+        let offset_after = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "offset", "distance": 0.2 }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&offset_after)
+            .expect("offset after thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("offset") && l.contains("after thread"),
+            "reason should name offset after thread: {reason}"
+        );
+
+        let hex_plate_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "hex plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&hex_plate_tap).is_none(),
+            "hex-plate tap must still pass"
+        );
+        assert!(
+            fastener_recipe_violation(&example_m8_bolt_document()).is_none(),
+            "golden recipe must still pass"
         );
     }
 
