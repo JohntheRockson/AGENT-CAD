@@ -27,6 +27,8 @@ import {
   planRenameBody,
   planSetBodyVisible,
   prettyDocument,
+  retainBodySelection,
+  targetBodyIdForDocument,
   workingDocument,
   type ParameterBatch,
 } from '../lib/document'
@@ -45,20 +47,19 @@ function applyRunPayload(
 ) {
   const bodies = resp.bodies ?? []
   set((s) => {
-    const keep = extra.selectedBodyId !== undefined
-      ? extra.selectedBodyId
-      : s.selectedBodyId
+    const keepSelected =
+      extra.selectedBodyId !== undefined ? extra.selectedBodyId : s.selectedBodyId
+    const keepIsolated =
+      extra.isolatedBodyId !== undefined ? extra.isolatedBodyId : s.isolatedBodyId
+    const kept = retainBodySelection(bodies, keepSelected, keepIsolated)
     return {
       ...extra,
       bodies,
       meshData: resp.mesh ?? bodies.find((b) => b.visible)?.mesh ?? null,
       metrics:  resp.metrics ?? null,
       runError: extra.runError ?? null,
-      selectedBodyId: keep && bodies.some((b) => b.bodyId === keep) ? keep : null,
-      isolatedBodyId:
-        s.isolatedBodyId && bodies.some((b) => b.bodyId === s.isolatedBodyId)
-          ? s.isolatedBodyId
-          : null,
+      selectedBodyId: kept.selectedBodyId,
+      isolatedBodyId: kept.isolatedBodyId,
     }
   })
 }
@@ -200,6 +201,8 @@ export const useCadStore = create<CadStore>((set, get) => ({
   restoreTimelineIndex: (index) => {
     const snap = get().timeline[index]
     if (!snap) return
+    const s = get()
+    const kept = retainBodySelection(snap.bodies, s.selectedBodyId, s.isolatedBodyId)
     set({
       timelineIndex: index,
       irCode:        snap.irCode,
@@ -208,6 +211,8 @@ export const useCadStore = create<CadStore>((set, get) => ({
       meshData:      snap.meshData,
       metrics:       snap.metrics,
       runError:      null,
+      selectedBodyId: kept.selectedBodyId,
+      isolatedBodyId: kept.isolatedBodyId,
     })
   },
 
@@ -461,6 +466,7 @@ export const useCadStore = create<CadStore>((set, get) => ({
     const { messages, irCode, lastGoodIrCode, selectedBodyId, timeline, timelineIndex } = get()
     get().branchTimeline()
     const document = documentForAgent(irCode, lastGoodIrCode)
+    const targetBodyId = targetBodyIdForDocument(document, selectedBodyId)
 
     const history = messages
       .filter((m) => m.content.trim())
@@ -642,7 +648,7 @@ export const useCadStore = create<CadStore>((set, get) => ({
       const step = timeline[timelineIndex]
       await streamChat(text, history, handleEvent, {
         document: document ?? undefined,
-        targetBodyId: selectedBodyId,
+        targetBodyId,
         timelineStepIndex: step && timelineIndex >= 0 ? timelineIndex : undefined,
         timelineStepLabel: step?.label,
       })

@@ -35,10 +35,12 @@ import {
   renameBodyInDocument,
   renameBodyTimelineLabel,
   resolvedParameters,
+  retainBodySelection,
   setBodyVisibleInDocument,
   setDocumentParameter,
   shouldConfirmChatSend,
   sliderBounds,
+  targetBodyIdForDocument,
   toolbarRewriteConfirmMessage,
   uncommittedParameterChatWarning,
   uncommittedParameterExportNote,
@@ -958,6 +960,52 @@ function almost(a: number, b: number, eps = 1e-9) {
   })
   assert.ok(dirtyHide && dirtyHide.kind === 'editor-only')
   assert.ok(documentsAlign(documentForAgent(dirtyHide.nextIrCode, aligned)!, twoBody))
+}
+
+// 13. History restore must drop isolate/select when the snapshot lacks that body
+{
+  const two = [{ bodyId: 'body_a' }, { bodyId: 'body_b' }]
+  const one = [{ bodyId: 'body_a' }]
+
+  assert.deepEqual(
+    retainBodySelection(two, 'body_b', 'body_b'),
+    { selectedBodyId: 'body_b', isolatedBodyId: 'body_b' },
+    'keep isolate/select when the snapshot still has the body',
+  )
+  assert.deepEqual(
+    retainBodySelection(one, 'body_b', 'body_b'),
+    { selectedBodyId: null, isolatedBodyId: null },
+    'orphan isolate would hide every mesh while chat/export still send the snapshot',
+  )
+  assert.deepEqual(
+    retainBodySelection(one, 'body_a', 'body_b'),
+    { selectedBodyId: 'body_a', isolatedBodyId: null },
+  )
+  assert.deepEqual(
+    retainBodySelection([], 'body_a', 'body_a'),
+    { selectedBodyId: null, isolatedBodyId: null },
+  )
+  assert.deepEqual(
+    retainBodySelection(two, null, null),
+    { selectedBodyId: null, isolatedBodyId: null },
+  )
+
+  const lastGood = parseSceneJson(JSON.stringify({
+    documentId: 'two',
+    units: 'mm',
+    bodies: [
+      { bodyId: 'body_a', name: 'Bolt', features: [{ op: 'box', size: [10, 10, 10] }] },
+      { bodyId: 'body_b', name: 'Nut', features: [{ op: 'cylinder', diameter: 8, height: 6 }] },
+    ],
+  }))
+  assert.equal(targetBodyIdForDocument(lastGood, 'body_b'), 'body_b')
+  assert.equal(
+    targetBodyIdForDocument(lastGood, 'draft_only'),
+    undefined,
+    'do not silently scope chat to a body the agent document does not have',
+  )
+  assert.equal(targetBodyIdForDocument(lastGood, null), undefined)
+  assert.equal(targetBodyIdForDocument(null, 'body_b'), undefined)
 }
 
 console.log('document.test.ts: all assertions passed')

@@ -623,6 +623,31 @@ export function bodyDisplayName(body: { name?: string; bodyId: string }): string
   return cleaned || 'body'
 }
 
+/**
+ * Drop isolate / selection when the body is gone (History restore, new run).
+ * An orphan isolate hides every mesh while chat/export still send the snapshot.
+ */
+export function retainBodySelection(
+  bodies: readonly { bodyId: string }[],
+  selectedBodyId: string | null,
+  isolatedBodyId: string | null,
+): { selectedBodyId: string | null; isolatedBodyId: string | null } {
+  const has = (id: string | null) => !!id && bodies.some((b) => b.bodyId === id)
+  return {
+    selectedBodyId: has(selectedBodyId) ? selectedBodyId : null,
+    isolatedBodyId: has(isolatedBodyId) ? isolatedBodyId : null,
+  }
+}
+
+/** Chat may only scope to a body that exists on the document the agent will see. */
+export function targetBodyIdForDocument(
+  document: CadDocument | null,
+  selectedBodyId: string | null,
+): string | undefined {
+  if (!selectedBodyId || !document) return undefined
+  return document.bodies.some((b) => b.bodyId === selectedBodyId) ? selectedBodyId : undefined
+}
+
 /** No-op when the id is missing or visibility is already the requested value. */
 export function setBodyVisibleInDocument(
   doc: CadDocument,
