@@ -1386,7 +1386,7 @@ fn fastener_repair_hint(err: &str) -> String {
         || l.contains("grip")
         || l.contains("pitch")
     {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then ONE thread (external) to CUT the helix into that shank — do not emit a second thread. A body named bolt must be external CUT, not tap/internal. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. Thread must not run past the tip — length is bolt_length - head_height - dead_height. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted — never the old wrench size of 10. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. pitch param must match the ISO token (M8 is 1.25). Fillet under-head before thread. Never fillet after thread (not only edges:\"all\" / \"longest\"). Chamfer the tip after thread edges:\"top\" — not bottom/all/longest; a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" or edges:\"longest\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then ONE thread (external) to CUT the helix into that shank — do not emit a second thread. A body named bolt or screw must be external CUT, not tap/internal. Do not fake threads with helix or torus. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. Thread must not run past the tip — length is bolt_length - head_height - dead_height. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted or the body is only named M8 — never the old wrench size of 10. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted; Ø8 is still M8 even if pitch is a lie). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. pitch param must match the ISO token (M8 is 1.25). Fillet under-head before thread. Never fillet after thread (not only edges:\"all\" / \"longest\"). Chamfer the tip after thread edges:\"top\" — not bottom/all/longest; a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" or edges:\"longest\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
     } else {
         String::new()
     }
@@ -1694,6 +1694,19 @@ mod tests {
         assert!(
             lower.contains("tap") && lower.contains("external"),
             "verify must catch a named bolt that is a tap"
+        );
+        assert!(
+            lower.contains("screw"),
+            "verify must catch a named screw that is a tap"
+        );
+        assert!(
+            lower.contains("helix") && lower.contains("torus"),
+            "verify must catch helix/torus in place of thread CUT"
+        );
+        assert!(
+            (lower.contains("named m8") || lower.contains("body named m8"))
+                && lower.contains("af 13"),
+            "verify must catch a named-M8 body that keeps AF 10"
         );
     }
 
@@ -2234,6 +2247,30 @@ mod tests {
             !fastener_repair_hint(fillet_after_reason).is_empty(),
             "repair hint must fire on fillet after thread"
         );
+        assert!(
+            l.contains("screw"),
+            "repair must reteach that a named screw is not a tap: {hint}"
+        );
+        assert!(
+            l.contains("helix") && l.contains("torus"),
+            "repair must forbid helix/torus fakes: {hint}"
+        );
+        assert!(
+            l.contains("named m8"),
+            "repair must bind a named-M8 body to AF 13: {hint}"
+        );
+        let fake_reason =
+            "do not fake threads with helix or torus; use thread CUT (kind external, size M8)";
+        assert!(
+            !fastener_repair_hint(fake_reason).is_empty(),
+            "repair hint must fire on helix/torus fakes"
+        );
+        let screw_tap_reason =
+            "hex-head bolt or screw must use external thread CUT, not tap/internal";
+        assert!(
+            !fastener_repair_hint(screw_tap_reason).is_empty(),
+            "repair hint must fire on a named screw that is a tap"
+        );
         assert!(fastener_repair_hint("unrelated box error").is_empty());
     }
 
@@ -2288,6 +2325,34 @@ mod tests {
         assert!(
             reject_verify_fix(&tap).is_none(),
             "internal tap verify fix must not be rejected as a bolt"
+        );
+
+        let screw_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "M8 hex cap screw",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = reject_verify_fix(&screw_tap)
+            .expect("named screw tap verify fix must not ship");
+        assert!(
+            reason.to_ascii_lowercase().contains("screw")
+                && reason.to_ascii_lowercase().contains("external"),
+            "{reason}"
+        );
+        assert!(
+            !fastener_repair_hint(&reason).is_empty(),
+            "repair must reteach after a named-screw tap verify fix"
         );
     }
 

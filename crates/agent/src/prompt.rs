@@ -159,7 +159,9 @@ Reject a thread that runs past the bolt tip.
 Reject a second external thread on a hex-head bolt.
 Reject any fillet after thread (not only edges:"all" / "longest").
 Chamfer after thread must be edges:"top" — not bottom/all/longest.
-A body named bolt must use external thread CUT, not tap/internal.
+A body named bolt or screw must use external thread CUT, not tap/internal.
+Reject helix or torus in place of thread CUT.
+A body named M8 (or an Ø8 shank) is still ISO AF 13 / Ø8 even if size is omitted or pitch is a lie.
 "#;
 
 #[cfg(test)]
@@ -403,6 +405,18 @@ mod tests {
         assert!(
             v.contains("tap") && v.contains("external"),
             "verify must reject a named bolt that is a tap"
+        );
+        assert!(
+            v.contains("screw"),
+            "verify must reject a named screw that is a tap"
+        );
+        assert!(
+            v.contains("helix") && v.contains("torus"),
+            "verify must reject helix/torus in place of thread CUT"
+        );
+        assert!(
+            (v.contains("named m8") || v.contains("body named m8")) && v.contains("af 13"),
+            "verify must bind a named-M8 body to ISO AF 13"
         );
         assert!(
             v.contains("edges:\"top\"") && v.contains("bottom"),
