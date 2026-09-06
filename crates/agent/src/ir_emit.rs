@@ -243,6 +243,7 @@ fn bolt_params_drive_hex_and_grip(
             .iter()
             .find_map(|f| match f {
                 Feature::Extrude(op) => Some(op.depth),
+                Feature::DraftExtrude(op) => Some(op.depth),
                 _ => None,
             }),
     };
@@ -2268,6 +2269,69 @@ mod tests {
         assert!(
             l.contains("chamfer") && (l.contains("top") || l.contains("after thread")),
             "reason should require chamfer edges:top after thread: {reason}"
+        );
+
+        // draft_extrude is in the catalog. Omitting head_height used to skip
+        // the grip check because head_from_feat only read Extrude.
+        let draft_fully_threaded = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "draft_extrude", "depth": 5.3, "angle": 1 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 34.7, "at": [0, 0, 5.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&draft_fully_threaded)
+            .expect("draft_extrude head + thread at the head must fail without head_height");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("unthreaded") || l.contains("dead_height") || l.contains("grip"),
+            "reason should name the missing grip: {reason}"
+        );
+
+        let draft_ok = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "draft_extrude", "depth": 5.3, "angle": 1 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&draft_ok).is_none(),
+            "draft_extrude head with a parameter-driven grip must still pass"
         );
     }
 }
