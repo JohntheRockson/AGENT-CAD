@@ -740,6 +740,29 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                             });
                             continue;
                         }
+                        // Gemini verify may rewrite the IR. Do not accept a
+                        // "fix" the deterministic judge would have rejected,
+                        // and do not keep it as last_document.
+                        if let Some(recipe_err) = reject_verify_fix(&fixed) {
+                            last_error = format!(
+                                "Corrected document failed fastener recipe: {recipe_err}"
+                            );
+                            tracing::warn!(attempt, %last_error, "verify fix broke fastener recipe");
+                            contents.push(GeminiContent {
+                                role: "model".to_string(),
+                                parts: vec![gemini_text(model_text)],
+                            });
+                            contents.push(GeminiContent {
+                                role: "user".to_string(),
+                                parts: vec![gemini_text(format!(
+                                    "The solid did not match the request ({reason}). \
+                                     Your corrected document broke the fastener recipe: {recipe_err}.\
+                                     {}Return a valid {{ \"say\", \"document\" }} JSON object.",
+                                    fastener_repair_hint(&recipe_err),
+                                ))],
+                            });
+                            continue;
+                        }
                         last_document = Some(fixed.clone());
                         emit(&tx, ChatSseEvent::CalculatingStart).await;
                         let calc_start = Instant::now();
@@ -1334,6 +1357,13 @@ fn kernel_error_for_model(err: &kernel::engine::KernelError) -> String {
     } else {
         raw
     }
+}
+
+/// Gemini verify may return a rewritten CadDocument. Reject it when the
+/// deterministic fastener judge would have failed the original — otherwise
+/// a thread-first / AF-10 / past-tip "fix" ships and becomes last_document.
+fn reject_verify_fix(fixed: &CadDocument) -> Option<String> {
+    agent::fastener_recipe_violation(fixed)
 }
 
 fn fastener_repair_hint(err: &str) -> String {
@@ -2092,6 +2122,60 @@ mod tests {
             "repair hint must fire on the pitch param / ISO token reason"
         );
         assert!(fastener_repair_hint("unrelated box error").is_empty());
+    }
+
+    #[test]
+    fn verify_fix_must_not_bypass_fastener_judge() {
+        let golden = agent::example_m8_bolt_document();
+        assert!(
+            reject_verify_fix(&golden).is_none(),
+            "golden recipe must still be an acceptable verify fix"
+        );
+
+        let thread_first = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_bad",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "thread", "kind": "external", "size": "M8", "length": 24 },
+                    { "op": "cylinder", "diameter": 13, "height": 5.3, "at": [0, 0, 24] },
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = reject_verify_fix(&thread_first)
+            .expect("thread-first verify fix must not ship");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("thread-first") || l.contains("hex extrude"),
+            "{reason}"
+        );
+        assert!(
+            !fastener_repair_hint(&reason).is_empty(),
+            "repair must reteach the recipe after a rejected verify fix"
+        );
+
+        let tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "plate",
+                "features": [
+                    { "op": "box", "size": [40, 40, 12], "centered": true },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_verify_fix(&tap).is_none(),
+            "internal tap verify fix must not be rejected as a bolt"
+        );
     }
 
     #[test]
