@@ -24,6 +24,12 @@ on:
   push:
     branches: [main]
 
+# One in-flight run per PR (or per branch on push to main). A new commit
+# cancels the stale run so the 45–60 min OCCT jobs do not stack.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
