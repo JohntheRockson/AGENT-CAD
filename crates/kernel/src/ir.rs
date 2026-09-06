@@ -40,8 +40,8 @@ pub struct CadDocument {
     /// cylinder, and `dead_height` to drive thread start
     /// (`head_height + dead_height`). Explicit `thread.pitch` must match ISO
     /// when the pitch param is omitted (M8 → 1.25). Also require under-head
-    /// fillet before thread and a tip chamfer; never fillet or chamfer
-    /// `edges:"all"` after the helix.
+    /// fillet before thread and a tip chamfer after thread; never fillet or
+    /// chamfer `edges:"all"` after the helix.
     #[serde(default)]
     pub parameters: BTreeMap<String, f64>,
     pub bodies: Vec<CadBody>,

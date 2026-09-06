@@ -152,7 +152,7 @@ Reject a hex-head bolt fully threaded from the head (missing dead_height).
 head_width must drive the hex wrench size; dead_height must drive thread start.
 major_diameter (or the ISO size token when that param is omitted) must drive the shank cylinder.
 Explicit thread.pitch must match ISO when the pitch param is omitted (M8 is 1.25; prefer null).
-Require under-head fillet before thread and a tip chamfer (edges:"top").
+Require under-head fillet before thread and a tip chamfer after thread (edges:"top").
 "#;
 
 #[cfg(test)]
@@ -338,8 +338,8 @@ mod tests {
             "verify must require under-head fillet before thread"
         );
         assert!(
-            v.contains("chamfer") && v.contains("tip"),
-            "verify must require a tip chamfer"
+            v.contains("chamfer") && v.contains("tip") && v.contains("after thread"),
+            "verify must require a tip chamfer after thread"
         );
         assert!(
             !v.contains("draft_extrude") && !v.contains("## feature ops"),

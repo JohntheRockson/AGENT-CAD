@@ -172,7 +172,8 @@ fn body_fastener_violation(
 /// When `pitch` is omitted, an explicit `thread.pitch` must still match
 /// the ISO token (M8 → 1.25).
 /// After those checks, require under-head fillet before thread and a tip
-/// chamfer (still reject fillet-`all` / chamfer-`all` after the helix).
+/// chamfer *after* thread (still reject fillet-`all` / chamfer-`all` after
+/// the helix). A chamfer on the hex before thread does not count as the tip.
 fn bolt_params_drive_hex_and_grip(
     body: &kernel::ir::CadBody,
     params: &std::collections::BTreeMap<String, f64>,
@@ -318,11 +319,10 @@ fn bolt_requires_underhead_fillet_and_tip_chamfer(
                 .into(),
         );
     }
-    let has_chamfer = body
-        .features
+    let has_tip_chamfer = body.features[thread_i + 1..]
         .iter()
         .any(|f| matches!(f, Feature::Chamfer(_)));
-    if !has_chamfer {
+    if !has_tip_chamfer {
         return Some("hex-head bolt must chamfer the tip (edges:\"top\") after the thread".into());
     }
     None
@@ -962,6 +962,41 @@ mod tests {
         assert!(
             l.contains("fillet") && (l.contains("before") || l.contains("under")),
             "fillet after thread must not satisfy under-head: {reason}"
+        );
+
+        // A chamfer on the hex before thread is not a tip chamfer.
+        let chamfer_before = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 1.25
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&chamfer_before)
+            .expect("chamfer before thread is not a tip chamfer");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("chamfer") && (l.contains("tip") || l.contains("after")),
+            "reason should require tip chamfer after thread: {reason}"
         );
 
         assert!(
