@@ -1387,6 +1387,8 @@ fn golden_m8_x40_step_export_is_nonempty_solid() {
         mesh_out.metrics.mesh_provenance,
         MeshProvenance::InstancedThread
     );
+    let (ok, detail) = step_shank_looks_helical(&step, 12.0, 28.0);
+    assert!(ok, "program STEP honesty: {detail}");
 }
 
 /// Inspector PR #13: hex-only and hex+shank probes crashed the same way as
@@ -1974,6 +1976,63 @@ fn golden_m8_document_step_has_helix_not_uncut_host() {
     assert_step_is_solid_in_mesh_bbox_family(&step, mesh_out.metrics.bbox, "golden document");
     let (ok, detail) = step_shank_looks_helical(&step, 12.0, 28.0);
     assert!(ok, "STEP honesty: {detail}");
+    let report = kernel::verify::verify_structure(&doc, &engine.execute_document(&doc).expect("verify execute"));
+    assert!(report.passed, "{}", report.summary());
+    let honesty = report
+        .checks
+        .iter()
+        .find(|c| c.name == "mesh_provenance_honesty")
+        .expect("long golden must name instanced-vs-uncut");
+    assert!(honesty.passed, "{}", honesty.message);
+    assert!(honesty.message.contains("uncut"), "{}", honesty.message);
+    let vol = report
+        .checks
+        .iter()
+        .find(|c| c.name == "positive_volume")
+        .expect("volume");
+    assert!(
+        vol.message.contains("uncut"),
+        "verify volume must not look like the grooved solid: {}",
+        vol.message
+    );
+}
+
+/// A many-face faceted Ø8 host in the M8 shank band must not pass helix honesty
+/// (Inspector #25: few-point / smooth-host STEP must not slip through).
+#[test]
+fn faceted_smooth_host_step_fails_helix_honesty() {
+    let mut positions = Vec::new();
+    let mut indices = Vec::new();
+    let nz = 40u32;
+    let ntheta = 24u32;
+    for iz in 0..=nz {
+        let z = 4.3 + 35.7 * (iz as f32 / nz as f32);
+        for it in 0..ntheta {
+            let a = 2.0 * std::f32::consts::PI * (it as f32 / ntheta as f32);
+            positions.extend_from_slice(&[4.0 * a.cos(), 4.0 * a.sin(), z]);
+        }
+    }
+    for iz in 0..nz {
+        for it in 0..ntheta {
+            let a = iz * ntheta + it;
+            let b = iz * ntheta + (it + 1) % ntheta;
+            let c = a + ntheta;
+            let d = b + ntheta;
+            indices.extend_from_slice(&[a, b, c, b, d, c]);
+        }
+    }
+    let smooth = MeshData {
+        positions,
+        normals: vec![],
+        indices,
+    };
+    let step = kernel::export::step_export_bytes(&smooth).expect("smooth host STEP");
+    assert!(step.len() > 512, "many-face host is a nonempty solid");
+    let (ok, detail) = step_shank_looks_helical(&step, 12.0, 28.0);
+    assert!(
+        !ok,
+        "smooth Ø8 faceted host must fail helix honesty, got PASS ({detail})"
+    );
 }
 
 /// Under-head fillet on the instanced golden must show R in the viewport mesh.
