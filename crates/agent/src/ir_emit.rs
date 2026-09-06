@@ -338,6 +338,7 @@ fn bolt_params_drive_hex_and_grip(
         thread,
         params,
         &[&body.name, &body.body_id, doc_id],
+        cyl_d,
     );
     // Cycle 1 only compared head_width to hex when the param was present.
     // size:"M8" + head_width 10 + AF 10 (the old table) still passed — a
@@ -484,10 +485,15 @@ fn thread_runs_past_tip(
             }
         })?;
 
+    let shank_d = match &body.features[cyl_i] {
+        Feature::Cylinder(op) => Some(op.diameter),
+        _ => None,
+    };
     let iso_spec = thread_iso_spec(
         thread,
         params,
         &[&body.name, &body.body_id, doc_id],
+        shank_d,
     );
     let major = first_param(
         params,
@@ -555,13 +561,15 @@ fn iso_hex_across_flats_for_spec(spec: Option<&kernel::thread::ThreadSpec>) -> O
 }
 
 /// `size:"M8"` / `size:"M8x1.25"` parse to the same ISO 261 coarse spec.
-/// When the token is omitted, numeric Ø8 (on the op or in the table) is
-/// still M8 — a pitch lie must not unlock the old AF 10 table.
+/// When the token is omitted, numeric Ø8 (on the op, in the table, or
+/// on the shank cylinder) is still M8 — a pitch lie must not unlock
+/// the old AF 10 table.
 /// A body named / id'd M8, or documentId M8 (not M80), is the same bind.
 fn thread_iso_spec(
     thread: &ThreadOp,
     params: &std::collections::BTreeMap<String, f64>,
     name_hints: &[&str],
+    shank_d: Option<f64>,
 ) -> Option<kernel::thread::ThreadSpec> {
     if let Some(spec) = thread
         .size
@@ -573,12 +581,15 @@ fn thread_iso_spec(
     if name_hints.iter().any(|s| text_implies_m8(s)) {
         return kernel::thread::parse_size("M8").ok();
     }
-    let major = thread.diameter.or_else(|| {
-        first_param(
-            params,
-            &["major_diameter", "shank_diameter", "thread_diameter"],
-        )
-    });
+    let major = thread
+        .diameter
+        .or_else(|| {
+            first_param(
+                params,
+                &["major_diameter", "shank_diameter", "thread_diameter"],
+            )
+        })
+        .or(shank_d);
     match major {
         Some(d) if (d - M8_MAJOR_DIAMETER).abs() < 0.2 => kernel::thread::parse_size("M8").ok(),
         _ => None,
@@ -2117,6 +2128,93 @@ mod tests {
         assert!(
             fastener_recipe_violation(&hex_plate_tap).is_none(),
             "internal tap on a hex plate (M8x1.25) must not be judged as a bolt"
+        );
+    }
+
+    /// Cycle 25 VERIFY already said an Ø8 shank is M8 AF 13. The judge only
+    /// read thread.diameter / major_diameter / the name — a Body-named hex
+    /// with a Ø8 cylinder, omitted size, and AF 10 still shipped.
+    #[test]
+    fn fastener_rules_shank_cylinder_o8_still_drives_m8_af13() {
+        let shank_only_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "dead_height": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 10 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&shank_only_af10)
+            .expect("Ø8 shank + AF 10 with size/name omitted must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "reason should name the Ø8-shank / AF 10 lie: {reason}"
+        );
+
+        // Size omitted + diameter/pitch on the op so it is a real M8 CUT.
+        let shank_ok = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "dead_height": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&shank_ok).is_none(),
+            "Ø8 shank + AF 13 with size omitted must still pass"
+        );
+
+        let hex_plate_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "hex plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "cylinder", "diameter": 8, "height": 4, "at": [0, 0, 12] },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&hex_plate_tap).is_none(),
+            "hex-plate tap with an Ø8 boss must stay unjudged"
         );
     }
 
