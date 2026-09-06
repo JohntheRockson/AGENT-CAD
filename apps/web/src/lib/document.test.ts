@@ -17,6 +17,8 @@ import {
   irAfterBodyRemoval,
   isExplicitParameter,
   metricsFromBodies,
+  nextIsolatedBodyId,
+  nextSelectedBodyId,
   parameterAllowsZero,
   parameterBatchHasWork,
   parameterBatchLabel,
@@ -36,6 +38,7 @@ import {
   renameBodyTimelineLabel,
   resolvedParameters,
   retainBodySelection,
+  sceneBodyId,
   setBodyVisibleInDocument,
   setDocumentParameter,
   shouldConfirmChatSend,
@@ -1006,6 +1009,61 @@ function almost(a: number, b: number, eps = 1e-9) {
   )
   assert.equal(targetBodyIdForDocument(lastGood, null), undefined)
   assert.equal(targetBodyIdForDocument(null, 'body_b'), undefined)
+}
+
+// 14. Outliner isolate/select must not adopt a draft-only id missing from the viewport
+{
+  const scene = [{ bodyId: 'body_a' }, { bodyId: 'body_b' }]
+
+  assert.equal(sceneBodyId(scene, 'body_b'), 'body_b')
+  assert.equal(sceneBodyId(scene, 'draft_only'), null)
+  assert.equal(sceneBodyId(scene, null), null)
+  assert.equal(sceneBodyId([], 'body_a'), null)
+
+  assert.equal(
+    nextIsolatedBodyId(scene, null, 'body_b'),
+    'body_b',
+    'isolate a body the viewport still has',
+  )
+  assert.equal(
+    nextIsolatedBodyId(scene, 'body_b', 'body_b'),
+    null,
+    'toggle isolate off',
+  )
+  assert.equal(
+    nextIsolatedBodyId(scene, 'body_a', 'body_b'),
+    'body_b',
+  )
+  assert.equal(
+    nextIsolatedBodyId(scene, null, 'draft_only'),
+    null,
+    'draft-only isolate would hide every last-good mesh',
+  )
+  assert.equal(
+    nextIsolatedBodyId(scene, 'body_a', 'draft_only'),
+    'body_a',
+    'refuse draft-only isolate; keep a still-valid isolate',
+  )
+  assert.equal(
+    nextIsolatedBodyId(scene, 'ghost', 'draft_only'),
+    null,
+    'drop an already-orphan isolate if the new id is also missing',
+  )
+  assert.equal(nextIsolatedBodyId(scene, 'body_a', null), null)
+
+  assert.equal(nextSelectedBodyId(scene, null, 'body_b'), 'body_b')
+  assert.equal(nextSelectedBodyId(scene, 'body_b', null), null)
+  assert.equal(
+    nextSelectedBodyId(scene, null, 'draft_only'),
+    null,
+    'do not select a body the viewport does not have',
+  )
+  assert.equal(
+    nextSelectedBodyId(scene, 'body_a', 'draft_only'),
+    'body_a',
+    'draft-only Outliner click must not steal a valid selection',
+  )
+  assert.equal(nextSelectedBodyId(scene, 'ghost', 'draft_only'), null)
 }
 
 console.log('document.test.ts: all assertions passed')

@@ -27,6 +27,8 @@ import {
   planRenameBody,
   planSetBodyVisible,
   prettyDocument,
+  nextIsolatedBodyId,
+  nextSelectedBodyId,
   retainBodySelection,
   targetBodyIdForDocument,
   workingDocument,
@@ -239,7 +241,10 @@ export const useCadStore = create<CadStore>((set, get) => ({
 
   clearError: () => set({ runError: null }),
 
-  selectBody: (id) => set({ selectedBodyId: id }),
+  selectBody: (id) => {
+    const s = get()
+    set({ selectedBodyId: nextSelectedBodyId(s.bodies, s.selectedBodyId, id) })
+  },
   hoverBody: (id) => set({ hoveredBodyId: id }),
   setOutlinerOpen: (open) => set({ outlinerOpen: open }),
 
@@ -272,7 +277,8 @@ export const useCadStore = create<CadStore>((set, get) => ({
   },
 
   isolateBody: (id) => {
-    set({ isolatedBodyId: get().isolatedBodyId === id ? null : id })
+    const s = get()
+    set({ isolatedBodyId: nextIsolatedBodyId(s.bodies, s.isolatedBodyId, id) })
   },
 
   renameBody: (id, name) => {

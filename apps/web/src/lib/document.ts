@@ -623,6 +623,15 @@ export function bodyDisplayName(body: { name?: string; bodyId: string }): string
   return cleaned || 'body'
 }
 
+/** Viewport scene id only — Outliner may list dirty-editor bodies that are not meshed. */
+export function sceneBodyId(
+  bodies: readonly { bodyId: string }[],
+  id: string | null,
+): string | null {
+  if (!id) return null
+  return bodies.some((b) => b.bodyId === id) ? id : null
+}
+
 /**
  * Drop isolate / selection when the body is gone (History restore, new run).
  * An orphan isolate hides every mesh while chat/export still send the snapshot.
@@ -632,11 +641,37 @@ export function retainBodySelection(
   selectedBodyId: string | null,
   isolatedBodyId: string | null,
 ): { selectedBodyId: string | null; isolatedBodyId: string | null } {
-  const has = (id: string | null) => !!id && bodies.some((b) => b.bodyId === id)
   return {
-    selectedBodyId: has(selectedBodyId) ? selectedBodyId : null,
-    isolatedBodyId: has(isolatedBodyId) ? isolatedBodyId : null,
+    selectedBodyId: sceneBodyId(bodies, selectedBodyId),
+    isolatedBodyId: sceneBodyId(bodies, isolatedBodyId),
   }
+}
+
+/**
+ * Isolate toggle against the viewport scene, not the Outliner draft list.
+ * A draft-only id would hide every last-good mesh (orphan isolate).
+ */
+export function nextIsolatedBodyId(
+  bodies: readonly { bodyId: string }[],
+  currentIsolated: string | null,
+  requested: string | null,
+): string | null {
+  if (requested == null) return null
+  if (!sceneBodyId(bodies, requested)) return sceneBodyId(bodies, currentIsolated)
+  return currentIsolated === requested ? null : requested
+}
+
+/**
+ * Select against the viewport scene. Draft-only Outliner rows must not
+ * become `selectedBodyId` (no chip, no mesh highlight, easy to isolate next).
+ */
+export function nextSelectedBodyId(
+  bodies: readonly { bodyId: string }[],
+  currentSelected: string | null,
+  requested: string | null,
+): string | null {
+  if (requested == null) return null
+  return sceneBodyId(bodies, requested) ?? sceneBodyId(bodies, currentSelected)
 }
 
 /** Chat may only scope to a body that exists on the document the agent will see. */
