@@ -228,11 +228,14 @@ fn body_fastener_violation(
         );
     }
     // Named bolt + hex + shank with no Thread op used to fall through
-    // (Cycle 22 only caught tap). Gemini skip then shipped a blank shank.
+    // (Cycle 22 only caught tap). Cycle 32 required bolt/screw in the
+    // name; a body named only "M8" / "M8x40" still shipped a blank shank.
+    // Hex-plate taps stay unjudged (plate in the name, or an internal tap).
     if thread_i.is_none()
-        && body_name_is_bolt(&body.name)
+        && body_name_needs_thread_cut(&body.name)
         && hex_i.is_some()
         && cyl_i.is_some()
+        && !body.features.iter().any(is_internal_thread)
     {
         return Some("hex-head bolt or screw must use external thread CUT".into());
     }
@@ -742,6 +745,19 @@ fn body_name_is_bolt(name: &str) -> bool {
         || n.contains("hex head")
         || n.contains("hex-head")
         || n.contains("screw")
+}
+
+/// Cycle 32 required bolt/screw. A body named only M8 / M8x40 with hex+shank
+/// is the same blank-shank skip. Do not treat "M8 hex plate" as a bolt.
+fn body_name_needs_thread_cut(name: &str) -> bool {
+    if body_name_is_bolt(name) {
+        return true;
+    }
+    let n = name.to_ascii_lowercase();
+    if n.contains("plate") || n.contains("sheet") || n.contains("bracket") {
+        return false;
+    }
+    text_implies_m8(name)
 }
 
 fn is_fake_thread_feature(f: &Feature) -> bool {
@@ -3441,6 +3457,58 @@ mod tests {
         assert!(
             fastener_recipe_violation(&hex_post).is_none(),
             "a hex post named Body is not a named bolt"
+        );
+
+        let named_m8 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "M8",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&named_m8)
+            .expect("named M8 + hex + shank with no thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("external") && l.contains("thread"),
+            "reason should require external CUT on named M8: {reason}"
+        );
+
+        let m8_hex_plate_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "M8 hex plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "cylinder", "diameter": 16, "height": 4, "at": [0, 0, 12] },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&m8_hex_plate_tap).is_none(),
+            "M8 hex plate + boss + tap must stay unjudged"
         );
 
         let hex_plate = CadDocument::from_json_value(serde_json::json!({

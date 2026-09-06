@@ -160,6 +160,7 @@ Chamfer after thread must be edges:"top" — not bottom/all/longest.
 A body named bolt or screw must use external thread CUT, not tap/internal.
 Reject helix, torus, or revolve in place of or after thread CUT.
 A body named M8 (or documentId / an Ø8 shank) is still ISO AF 13 / Ø8 even if size is omitted or pitch is a lie.
+Named M8 hex+shank still needs thread CUT (not a blank shank).
 Reject shell, offset, draft, thicken, or common after thread (that wrecks the helix).
 "#;
 
@@ -420,6 +421,10 @@ mod tests {
         assert!(
             (v.contains("named m8") || v.contains("body named m8")) && v.contains("af 13"),
             "verify must bind a named-M8 body to ISO AF 13"
+        );
+        assert!(
+            v.contains("blank shank") || (v.contains("hex+shank") && v.contains("thread")),
+            "verify must reject a named-M8 hex+shank with no thread CUT"
         );
         assert!(
             v.contains("documentid") || v.contains("document id"),
