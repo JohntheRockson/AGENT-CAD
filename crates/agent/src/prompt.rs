@@ -158,6 +158,8 @@ Require under-head fillet before thread and a tip chamfer after thread (edges:"t
 Reject a thread that runs past the bolt tip.
 Reject a second external thread on a hex-head bolt.
 Reject any fillet after thread (not only edges:"all" / "longest").
+Chamfer after thread must be edges:"top" — not bottom/all/longest.
+A body named bolt must use external thread CUT, not tap/internal.
 "#;
 
 #[cfg(test)]
@@ -381,6 +383,14 @@ mod tests {
         assert!(
             v.contains("any fillet after thread") || v.contains("fillet after thread"),
             "verify must reject any fillet after thread, not only all/longest"
+        );
+        assert!(
+            v.contains("tap") && v.contains("external"),
+            "verify must reject a named bolt that is a tap"
+        );
+        assert!(
+            v.contains("edges:\"top\"") && v.contains("bottom"),
+            "verify must require chamfer edges:top after thread"
         );
         assert!(
             !v.contains("draft_extrude") && !v.contains("## feature ops"),
