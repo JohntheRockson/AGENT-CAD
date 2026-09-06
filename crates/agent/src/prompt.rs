@@ -91,8 +91,8 @@ hole { "op":"hole", "diameter":<d>, "depth":<h>, "center":[x,y], "plane":"XY", "
 cut { "op":"cut", "profile":<P>, "depth":<h>, "at":[x,y,z], "plane":"XY", "face":"largest"|<i>, "through": true }
 fuse { "op":"fuse", "profile":<P>, "depth":<h>, "at":[x,y,z], "plane":"XY", "face":"largest"|<i> }
 common { "op":"common", "profile":<P>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
-fillet { "op":"fillet", "radius":<r>, "edges":"all"|"top"|"longest"|[i] }  r < half wall. Never edges:"all" or "longest" after thread.
-chamfer { "op":"chamfer", "distance":<d>, "angle":<deg>, "edges":"all"|"top"|[i] }
+fillet { "op":"fillet", "radius":<r>, "edges":"all"|"top"|"longest"|[i] } Never all/longest after thread
+chamfer { "op":"chamfer", "distance":<d>, "angle":<deg>, "edges":"all"|"top"|[i] } Never all/longest after thread
 transform { "op":"transform", "translate":[x,y,z], "rotate":{"axis":[x,y,z],"angle":<deg>,"origin":[x,y,z]}, "scale":<s> }
 mirror { "op":"mirror", "plane":"YZ"|"XZ"|"XY", "origin":[x,y,z], "fuse": true }
 pattern { "op":"pattern", "kind":"linear"|"circular", "count":<n≥2>, "spacing":<d>, "direction":[x,y,z], "axis":"Z", "angle":<deg>, "center":[x,y,z], "scope":"body"|"feature" }
@@ -266,8 +266,24 @@ mod tests {
             "must forbid chamfer/fillet edges:longest after thread, not only fillet-all"
         );
         assert!(
-            SYSTEM_PROMPT.contains(r#"Never edges:"all" or "longest" after thread"#),
-            "op catalog fillet line must forbid longest after thread, not only all"
+            SYSTEM_PROMPT.contains(r#"Never all/longest after thread"#),
+            "op catalog must forbid all/longest after thread"
+        );
+        let fillet_line = SYSTEM_PROMPT
+            .lines()
+            .find(|l| l.contains(r#""op":"fillet""#))
+            .expect("fillet catalog line");
+        let chamfer_line = SYSTEM_PROMPT
+            .lines()
+            .find(|l| l.contains(r#""op":"chamfer""#))
+            .expect("chamfer catalog line");
+        assert!(
+            fillet_line.contains("longest") && fillet_line.contains("after thread"),
+            "op catalog fillet line must forbid longest after thread: {fillet_line}"
+        );
+        assert!(
+            chamfer_line.contains("longest") && chamfer_line.contains("after thread"),
+            "op catalog chamfer line must forbid longest after thread, not only list all|top: {chamfer_line}"
         );
     }
 
