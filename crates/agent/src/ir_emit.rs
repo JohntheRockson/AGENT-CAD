@@ -92,8 +92,9 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 /// `edges:"all"` after the thread (that wrecks the helix), when the
 /// ISO size table does not actually drive the hex / unthreaded grip
 /// (fully-threaded from the head, `head_width` ≠ hex AF, ISO M8 ≠ AF 13,
-/// or `major_diameter` / ISO size token ≠ shank cylinder), or when the bolt
-/// is missing an under-head fillet before thread or a tip chamfer.
+/// or `major_diameter` / ISO size token ≠ shank cylinder), when the helix
+/// runs past the tip, or when the bolt is missing an under-head fillet
+/// before thread or a tip chamfer.
 ///
 /// Internal taps (plate + tap) are not bolts and are left alone.
 pub fn fastener_recipe_violation(doc: &CadDocument) -> Option<String> {
@@ -171,9 +172,11 @@ fn body_fastener_violation(
 /// shank (M8 → Ø8) — omitting the param is not a license to hard-code Ø10.
 /// When `pitch` is omitted, an explicit `thread.pitch` must still match
 /// the ISO token (M8 → 1.25).
-/// After those checks, require under-head fillet before thread and a tip
-/// chamfer *after* thread (still reject fillet-`all` / chamfer-`all` after
-/// the helix). A chamfer on the hex before thread does not count as the tip.
+/// After those checks, the helix must not run past the tip (`bolt_length`,
+/// or the cylinder end when that param is omitted). Then require under-head
+/// fillet before thread and a tip chamfer *after* thread (still reject
+/// fillet-`all` / chamfer-`all` after the helix). A chamfer on the hex
+/// before thread does not count as the tip.
 fn bolt_params_drive_hex_and_grip(
     body: &kernel::ir::CadBody,
     params: &std::collections::BTreeMap<String, f64>,
@@ -329,7 +332,65 @@ fn bolt_params_drive_hex_and_grip(
         }
     }
 
+    // Start can be legal (head + dead) while length still overshoots the tip.
+    // Kernel auto-length (0) is 2×D — that can run past a short remaining shank.
+    if let Some(reason) = thread_runs_past_tip(body, params, cyl_i, thread, thread_z) {
+        return Some(reason);
+    }
+
     bolt_requires_underhead_fillet_and_tip_chamfer(body, thread_i)
+}
+
+/// Size-table overall length (or the shank cylinder end when `bolt_length`
+/// is omitted) is the tip. Do not let the helix continue past it.
+fn thread_runs_past_tip(
+    body: &kernel::ir::CadBody,
+    params: &std::collections::BTreeMap<String, f64>,
+    cyl_i: usize,
+    thread: &ThreadOp,
+    thread_z: f64,
+) -> Option<String> {
+    let tip = first_param(
+        params,
+        &["bolt_length", "overall_length", "total_length"],
+    )
+    .or_else(|| match &body.features[cyl_i] {
+        Feature::Cylinder(op) => {
+            let tip_z = op.at[2] + op.height;
+            (tip_z.is_finite() && tip_z > 0.0).then_some(tip_z)
+        }
+        _ => None,
+    })?;
+
+    let iso_spec = thread
+        .size
+        .as_deref()
+        .and_then(|s| kernel::thread::parse_size(s).ok());
+    let major = first_param(
+        params,
+        &["major_diameter", "shank_diameter", "thread_diameter"],
+    )
+    .or_else(|| iso_spec.as_ref().map(|spec| spec.major_diameter));
+    let pitch = first_param(params, &["pitch", "thread_pitch"])
+        .or(thread.pitch)
+        .or_else(|| iso_spec.as_ref().map(|spec| spec.pitch));
+
+    // Kernel `external_thread_length`: explicit length, else max(2×D, 4×pitch).
+    let effective_len = if thread.length > 0.0 {
+        thread.length
+    } else {
+        let d = major.unwrap_or(0.0);
+        let p = pitch.unwrap_or(0.0);
+        (d * 2.0).max(p * 4.0)
+    };
+    if effective_len > 0.0 && thread_z + effective_len > tip + 0.51 {
+        return Some(
+            "thread must not run past the tip; \
+             length is bolt_length - head_height - dead_height"
+                .into(),
+        );
+    }
+    None
 }
 
 /// Golden recipe finishing: fillet the under-head junction *before* the
@@ -1334,6 +1395,149 @@ mod tests {
         assert!(
             fastener_recipe_violation(&omitted_af13).is_none(),
             "size M8 with omitted head_width and AF 13 must still pass"
+        );
+    }
+
+    /// Cycle 1–9 check thread *start*. Kernel bind clamps length when
+    /// `bolt_length` is present — omit it (same trick as undriven grip)
+    /// and a legal start with length 50 still ran past the cylinder tip.
+    #[test]
+    fn fastener_rules_reject_thread_past_tip() {
+        let hex_cyl_finish = |thread_len: f64| {
+            CadDocument::from_json_value(serde_json::json!({
+                "units": "mm",
+                "parameters": {
+                    "head_height": 5.3,
+                    "head_width": 13.0,
+                    "dead_height": 8.0,
+                    "major_diameter": 8.0,
+                    "pitch": 1.25
+                },
+                "bodies": [{
+                    "bodyId": "body_m8_bolt",
+                    "name": "M8 Bolt",
+                    "features": [
+                        { "op": "sketch", "plane": "XY",
+                          "profile": { "hex": { "across_flats": 13 } } },
+                        { "op": "extrude", "depth": 5.3 },
+                        { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                        { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                        { "op": "thread", "kind": "external", "size": "M8",
+                          "length": thread_len, "at": [0, 0, 13.3] },
+                        { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                    ]
+                }]
+            }))
+            .unwrap()
+        };
+
+        let past = hex_cyl_finish(50.0);
+        let reason = fastener_recipe_violation(&past)
+            .expect("omitted bolt_length + length 50 past the cylinder tip must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("tip") && (l.contains("past") || l.contains("length")),
+            "reason should name thread past the tip: {reason}"
+        );
+
+        let ok = hex_cyl_finish(26.7);
+        assert!(
+            fastener_recipe_violation(&ok).is_none(),
+            "omitted bolt_length with thread ending at the cylinder tip must still pass"
+        );
+
+        // bind no-ops without head_height, so bolt_length 40 cannot clamp length 50.
+        let no_head_param = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 50.0, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&no_head_param)
+            .expect("omitted head_height + length 50 past bolt_length must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("tip") || l.contains("length"),
+            "reason should name the overshoot when bind cannot clamp: {reason}"
+        );
+
+        // Kernel auto-length (0) is 2×D = 16. Omit bolt_length so bind
+        // cannot rewrite; short cylinder tip is 14.3.
+        let auto_overshoot = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 1.25
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 10.0, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 0, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&auto_overshoot)
+            .expect("auto thread length 2×D must not run past a short cylinder tip");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("tip") || l.contains("length"),
+            "reason should name auto-length past the tip: {reason}"
+        );
+
+        assert!(
+            fastener_recipe_violation(&example_m8_bolt_document()).is_none(),
+            "golden thread ending at the tip must still pass"
+        );
+
+        // Hexagonal plate + internal tap is not a bolt (no past-tip / recipe judge).
+        let hex_plate_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "hex plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&hex_plate_tap).is_none(),
+            "internal tap on a hex plate must not be judged as a hex-head bolt"
         );
     }
 }

@@ -155,6 +155,7 @@ major_diameter (or the ISO size token when that param is omitted) must drive the
 Explicit thread.pitch must match ISO when the pitch param is omitted (M8 is 1.25; prefer null).
 pitch param must match the ISO token (M8 is 1.25) — no size-table lie.
 Require under-head fillet before thread and a tip chamfer after thread (edges:"top").
+Reject a thread that runs past the bolt tip.
 "#;
 
 #[cfg(test)]
@@ -350,6 +351,10 @@ mod tests {
         assert!(
             v.contains("chamfer") && v.contains("tip") && v.contains("after thread"),
             "verify must require a tip chamfer after thread"
+        );
+        assert!(
+            v.contains("past") && v.contains("tip"),
+            "verify must reject a thread that runs past the tip"
         );
         assert!(
             !v.contains("draft_extrude") && !v.contains("## feature ops"),
