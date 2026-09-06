@@ -163,6 +163,13 @@ fn body_fastener_violation(
                             .into(),
                     );
                 }
+                other if is_fake_thread_feature(other) => {
+                    return Some(
+                        "do not fake threads with helix or torus after a thread CUT; \
+                         one external thread only"
+                            .into(),
+                    );
+                }
                 _ => {}
             }
         }
@@ -3088,6 +3095,35 @@ mod tests {
             }]
         }))
         .unwrap();
+        let helix_after_cut = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "helix", "pitch": 1.25, "height": 26.7, "radius": 4,
+                      "diameter": 0.8, "center": [0, 0, 13.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&helix_after_cut)
+            .expect("helix after a legal thread CUT must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("helix") || l.contains("torus") || l.contains("fake"),
+            "reason should name helix/torus after thread: {reason}"
+        );
+
         assert!(
             fastener_recipe_violation(&hex_plate_tap).is_none(),
             "hex-plate tap must still pass"

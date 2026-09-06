@@ -160,7 +160,7 @@ Reject a second external thread on a hex-head bolt.
 Reject any fillet after thread (not only edges:"all" / "longest").
 Chamfer after thread must be edges:"top" — not bottom/all/longest.
 A body named bolt or screw must use external thread CUT, not tap/internal.
-Reject helix or torus in place of thread CUT.
+Reject helix or torus in place of or after thread CUT.
 A body named M8 (or documentId / an Ø8 shank) is still ISO AF 13 / Ø8 even if size is omitted or pitch is a lie.
 Reject shell or offset after thread (that wrecks the helix).
 "#;
