@@ -277,6 +277,15 @@ fn bolt_params_drive_hex_and_grip(
         }
     }
     let pitch_param = first_param(params, &["pitch", "thread_pitch"]);
+    if let (Some(p), Some(iso)) = (pitch_param, iso_pitch) {
+        if (p - iso).abs() > 0.05 {
+            return Some(
+                "pitch must match the ISO size token; \
+                 M8 is 1.25 — do not keep a size-table lie next to size:\"M8\""
+                    .into(),
+            );
+        }
+    }
     // When the pitch param is omitted, an explicit thread.pitch still has to
     // match the ISO token (M8 → 1.25). Both-set stays the existing check.
     if let (Some(p), Some(tp)) = (pitch_param.or(iso_pitch), thread.pitch) {
@@ -1212,6 +1221,32 @@ mod tests {
         assert!(
             fastener_recipe_violation(&omitted_matches).is_none(),
             "explicit thread.pitch 1.25 next to M8 with omitted pitch param must pass"
+        );
+
+        // Cycle 4 analog: pitch param 2.0 next to size M8 with null thread.pitch.
+        let table_lie = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 2.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(None)
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&table_lie)
+            .expect("size M8 with pitch param 2.0 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("pitch") && (l.contains("iso") || l.contains("1.25") || l.contains("m8")),
+            "reason should name the token/table pitch lie: {reason}"
         );
     }
 

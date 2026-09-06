@@ -153,6 +153,7 @@ head_width must drive the hex wrench size; ISO M8 is AF 13 even if head_width is
 dead_height must drive thread start.
 major_diameter (or the ISO size token when that param is omitted) must drive the shank cylinder.
 Explicit thread.pitch must match ISO when the pitch param is omitted (M8 is 1.25; prefer null).
+pitch param must match the ISO token (M8 is 1.25) — no size-table lie.
 Require under-head fillet before thread and a tip chamfer after thread (edges:"top").
 "#;
 
@@ -337,6 +338,10 @@ mod tests {
         assert!(
             v.contains("thread.pitch") || (v.contains("pitch") && v.contains("1.25")),
             "verify must bind explicit thread.pitch to ISO when pitch is omitted"
+        );
+        assert!(
+            v.contains("pitch param") || (v.contains("pitch") && v.contains("size-table")),
+            "verify must reject a pitch param that fights the ISO token"
         );
         assert!(
             v.contains("fillet") && v.contains("before thread"),

@@ -40,7 +40,8 @@ pub struct CadDocument {
     /// (or the ISO size token when that param is omitted) to match the shank
     /// cylinder, and `dead_height` to drive thread start
     /// (`head_height + dead_height`). Explicit `thread.pitch` must match ISO
-    /// when the pitch param is omitted (M8 → 1.25). Also require under-head
+    /// when the pitch param is omitted (M8 → 1.25); the pitch param must
+    /// also match the ISO token. Also require under-head
     /// fillet before thread and a tip chamfer after thread; never fillet or
     /// chamfer `edges:"all"` after the helix.
     #[serde(default)]
