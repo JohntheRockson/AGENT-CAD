@@ -1385,7 +1385,7 @@ fn fastener_repair_hint(err: &str) -> String {
         || l.contains("grip")
         || l.contains("pitch")
     {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then ONE thread (external) to CUT the helix into that shank — do not emit a second thread or pattern after thread. A body named bolt or screw must be external CUT, not tap/internal. Do not fake threads with helix or torus (not in place of thread CUT, and not after it). Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. Thread must not run past the tip — length is bolt_length - head_height - dead_height. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted or the body is only named M8 / documentId M8 — never the old wrench size of 10. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted; Ø8 is still M8 even if pitch is a lie). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. pitch param must match the ISO token (M8 is 1.25). Fillet under-head before thread. Never fillet after thread (not only edges:\"all\" / \"longest\"). Chamfer the tip after thread edges:\"top\" — not bottom/all/longest; a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" or edges:\"longest\" after thread. Never shell or offset after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then ONE thread (external) to CUT the helix into that shank — do not emit a second thread or pattern after thread. A body named bolt or screw must be external CUT, not tap/internal. Do not fake threads with helix or torus (not in place of thread CUT, and not after it). Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. Thread must not run past the tip — length is bolt_length - head_height - dead_height. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted or the body is only named M8 / documentId M8 — never the old wrench size of 10. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted; Ø8 is still M8 even if pitch is a lie). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. pitch param must match the ISO token (M8 is 1.25). Fillet under-head before thread. Never fillet after thread (not only edges:\"all\" / \"longest\"). Chamfer the tip after thread edges:\"top\" — not bottom/all/longest; a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" or edges:\"longest\" after thread. Never shell, offset, draft, or thicken after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
     } else {
         String::new()
     }
@@ -1718,6 +1718,10 @@ mod tests {
         assert!(
             lower.contains("shell") && lower.contains("offset"),
             "verify must catch shell/offset after thread"
+        );
+        assert!(
+            lower.contains("draft") && lower.contains("thicken"),
+            "verify must catch draft/thicken after thread"
         );
     }
 
@@ -2294,11 +2298,21 @@ mod tests {
             l.contains("shell") && l.contains("offset"),
             "repair must forbid shell/offset after thread: {hint}"
         );
+        assert!(
+            l.contains("draft") && l.contains("thicken"),
+            "repair must forbid draft/thicken after thread: {hint}"
+        );
         let shell_reason =
             "shell or offset after thread wrecks the helix; chamfer the tip with edges:\"top\" only";
         assert!(
             !fastener_repair_hint(shell_reason).is_empty(),
             "repair hint must fire on shell/offset after thread"
+        );
+        let draft_reason =
+            "draft or thicken after thread wrecks the helix; chamfer the tip with edges:\"top\" only";
+        assert!(
+            !fastener_repair_hint(draft_reason).is_empty(),
+            "repair hint must fire on draft/thicken after thread"
         );
         assert!(fastener_repair_hint("unrelated box error").is_empty());
     }

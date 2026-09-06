@@ -104,7 +104,8 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 /// (fully-threaded from the head, `head_width` ≠ hex AF, ISO M8 ≠ AF 13,
 /// or `major_diameter` / ISO size token ≠ shank cylinder), when a body
 /// named M8 (or an Ø8 shank) keeps the old AF 10 / Ø10 table with size
-/// omitted, when helix/torus fakes a thread, when the helix
+/// omitted, when helix/torus fakes a thread, when draft/thicken (like
+/// shell/offset) follows the helix, when the helix
 /// runs past the tip, or when the bolt is missing an under-head fillet
 /// before thread or a tip chamfer.
 ///
@@ -160,6 +161,13 @@ fn body_fastener_violation(
                 Feature::Shell(_) | Feature::Offset(_) => {
                     return Some(
                         "shell or offset after thread wrecks the helix; \
+                         chamfer the tip with edges:\"top\" only"
+                            .into(),
+                    );
+                }
+                Feature::Draft(_) | Feature::Thicken(_) => {
+                    return Some(
+                        "draft or thicken after thread wrecks the helix; \
                          chamfer the tip with edges:\"top\" only"
                             .into(),
                     );
@@ -3374,6 +3382,153 @@ mod tests {
         assert!(
             fastener_recipe_violation(&hex_plate).is_none(),
             "hex plate without a tap must stay unjudged"
+        );
+    }
+
+    /// Shell/offset after thread already fail. Catalog draft / thicken still
+    /// silently wrecked the helix. Cut / transform after thread stay legal
+    /// (drive slot, place the bolt). Hex-plate+tap stays unjudged.
+    #[test]
+    fn fastener_rules_reject_draft_and_thicken_after_thread() {
+        let params = serde_json::json!({
+            "bolt_length": 40.0,
+            "head_height": 5.3,
+            "head_width": 13.0,
+            "dead_height": 8.0,
+            "major_diameter": 8.0
+        });
+        let draft_after = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "draft", "faces": "side", "angle": 2 }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&draft_after)
+            .expect("draft after thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("draft") && l.contains("after thread"),
+            "reason should name draft after thread: {reason}"
+        );
+
+        let thicken_after = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "thicken", "thickness": 0.4, "face": "largest" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&thicken_after)
+            .expect("thicken after thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("thicken") && l.contains("after thread"),
+            "reason should name thicken after thread: {reason}"
+        );
+
+        let cut_after = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "cut",
+                      "profile": { "rect": { "w": 1.2, "h": 8, "centered": true } },
+                      "depth": 2, "at": [0, 0, 5.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&cut_after).is_none(),
+            "cut after thread (drive slot) must still pass"
+        );
+
+        let transform_after = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "transform", "translate": [10, 0, 0] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&transform_after).is_none(),
+            "transform after thread (place the bolt) must still pass"
+        );
+
+        let hex_plate_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "hex plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true },
+                    { "op": "draft", "faces": "side", "angle": 2 },
+                    { "op": "thicken", "thickness": 0.4, "face": "largest" }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&hex_plate_tap).is_none(),
+            "hex-plate tap with draft/thicken after tap must stay unjudged"
+        );
+        assert!(
+            fastener_recipe_violation(&example_m8_bolt_document()).is_none(),
+            "golden recipe must still pass"
         );
     }
 

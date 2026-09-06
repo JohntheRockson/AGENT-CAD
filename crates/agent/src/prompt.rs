@@ -100,8 +100,6 @@ shell { "op":"shell", "thickness":<t>, "faces":"all"|[i]|"largest" }
 offset { "op":"offset", "distance":<d> }
 draft { "op":"draft", "faces":"side"|[i], "angle":<deg>, "direction":[0,0,1] }
 
-Face: "largest"|"top"|"bottom"|index. Edges: "all"|"top"|"longest"|[i].
-
 ## Example — M8 bolt (hex → overlapping cylinder → thread CUT)
 {
   "units": "mm",
@@ -162,7 +160,7 @@ Chamfer after thread must be edges:"top" — not bottom/all/longest.
 A body named bolt or screw must use external thread CUT, not tap/internal.
 Reject helix or torus in place of or after thread CUT.
 A body named M8 (or documentId / an Ø8 shank) is still ISO AF 13 / Ø8 even if size is omitted or pitch is a lie.
-Reject shell or offset after thread (that wrecks the helix).
+Reject shell, offset, draft, or thicken after thread (that wrecks the helix).
 "#;
 
 #[cfg(test)]
@@ -430,6 +428,10 @@ mod tests {
         assert!(
             v.contains("shell") && v.contains("offset") && v.contains("after thread"),
             "verify must reject shell/offset after thread"
+        );
+        assert!(
+            v.contains("draft") && v.contains("thicken") && v.contains("after thread"),
+            "verify must reject draft/thicken after thread"
         );
         assert!(
             v.contains("edges:\"top\"") && v.contains("bottom"),
