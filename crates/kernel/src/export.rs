@@ -538,6 +538,11 @@ mod tests {
             text.contains("MANIFOLD_SOLID_BREP") && text.contains("CLOSED_SHELL"),
             "STEP must parse as a solid"
         );
+        let pts = cartesian_points_from_step(&step);
+        assert!(
+            pts.len() >= 8,
+            "faceted STEP must expose CARTESIAN_POINT samples"
+        );
         let bb = cartesian_bbox_from_step(&step).expect("CARTESIAN_POINT bbox");
         assert!((bb[0] + 5.7735).abs() < 1e-4 && (bb[3] - 5.7735).abs() < 1e-4);
         assert!((bb[1] + 5.0).abs() < 1e-4 && (bb[4] - 5.0).abs() < 1e-4);
