@@ -3,7 +3,7 @@
 //!
 //! Kernel owns STEP implementation (#15-style faceted export). Inspector must
 //! not fake PASS if STEP is essentially the uncut hex+shank (smooth Ø8, no
-//! groove signature, volume ≈ uncut).
+//! groove signature, many faceted faces without a helix, volume ≈ uncut).
 
 use kernel::engine::{MeshData, MetricsData};
 
@@ -145,6 +145,8 @@ fn step_is_uncut_host(
                 ),
             );
         }
+        // Groove in the points wins even when B-Rep volume ≈ uncut
+        // (instanced-thread path keeps hex+shank volume).
         return (false, "STEP points have a groove signature".into());
     }
 
@@ -182,16 +184,17 @@ fn step_is_uncut_host(
     }
 
     if faceted && shank.len() < 40 && !helical_token {
-        // Faceted export with no parseable groove points and no helix tokens:
-        // treat as uncut unless there are clearly more faces than a hex+shank.
-        if faces > 0 && faces <= 80 {
-            return (
-                true,
-                format!(
-                    "faceted STEP has {faces} faces and no groove points — Ø8 host, not a helix"
-                ),
-            );
-        }
+        // Many TRIANGULATED_FACE on a smooth host used to slip through when
+        // faces > 80. No groove points + no helix token = uncut, any face count.
+        let vol_note = uncut
+            .map(|m| format!("; volume≈uncut host {:.1} mm³", m.volume))
+            .unwrap_or_default();
+        return (
+            true,
+            format!(
+                "faceted STEP has {faces} faces and no groove points — Ø8 host, not a helix{vol_note}"
+            ),
+        );
     }
 
     (false, "STEP not classified as uncut host".into())
@@ -315,6 +318,22 @@ pub fn synthetic_step_solid(points: &[[f64; 3]], faceted: bool, extra_cylinder: 
     s.into_bytes()
 }
 
+/// Faceted solid with many faces and no shank CARTESIAN_POINTs — a dense
+/// tessellation of a smooth host must not PASS when the viewport is threaded.
+pub fn synthetic_faceted_many_faces_no_groove(n_faces: usize) -> Vec<u8> {
+    let mut s = String::from("ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\nENDSEC;\nDATA;\n");
+    s.push_str("#1=MANIFOLD_SOLID_BREP('bolt',#2);\n#2=CLOSED_SHELL('',());\n");
+    s.push_str("#3=FACETED_BREP('',#2);\n");
+    for i in 0..n_faces {
+        s.push_str(&format!("#{}=TRIANGULATED_FACE('',());\n", 20 + i));
+    }
+    while s.len() < 600 {
+        s.push_str("/* pad */\n");
+    }
+    s.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
+    s.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +381,53 @@ mod tests {
         let step = synthetic_step_solid(&pts, true, true);
         let c = check_step_honest(&step, None, Some(&helix), None, None);
         assert!(c.ok, "{}", c.detail);
+    }
+
+    #[test]
+    fn many_face_faceted_smooth_host_fails_when_viewport_is_threaded() {
+        let helix = synthetic_iso_helix_mesh(SHANK_R_MM, PITCH_MM, 8.0, 32.0);
+        assert!(viewport_is_threaded(Some(&helix)));
+        let step = synthetic_faceted_many_faces_no_groove(200);
+        assert!(
+            String::from_utf8_lossy(&step)
+                .matches("TRIANGULATED_FACE")
+                .count()
+                > 80,
+            "fixture must be the old faces>80 escape"
+        );
+        let uncut_metrics = MetricsData {
+            volume: 2519.9,
+            bbox: [-7.5, -6.5, 0.0, 7.5, 6.5, 40.0],
+            surface_area: 1.0,
+            is_solid: true,
+            mesh_provenance: Default::default(),
+        };
+        let c = check_step_honest(&step, None, Some(&helix), Some(&uncut_metrics), None);
+        assert!(!c.ok, "many-face uncut host must FAIL: {}", c.detail);
+        assert!(c.step_looks_uncut);
+        assert!(
+            c.detail.contains("no groove") || c.detail.contains("uncut") || c.detail.contains("Ø8"),
+            "{}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn grooved_faceted_step_passes_even_when_volume_matches_uncut() {
+        // Instanced-thread B-Rep volume stays hex+shank; that must not FAIL
+        // a real grooved faceted STEP (the 84 MB viewport-mesh case).
+        let helix = synthetic_iso_helix_mesh(SHANK_R_MM, PITCH_MM, 8.0, 32.0);
+        let pts = mesh_points(&helix);
+        let step = synthetic_step_solid(&pts, true, true);
+        let uncut_metrics = MetricsData {
+            volume: 2519.9,
+            bbox: [-7.5, -6.5, 0.0, 7.5, 6.5, 40.0],
+            surface_area: 1.0,
+            is_solid: true,
+            mesh_provenance: Default::default(),
+        };
+        let c = check_step_honest(&step, None, Some(&helix), Some(&uncut_metrics), None);
+        assert!(c.ok, "groove + volume≈uncut must still PASS: {}", c.detail);
+        assert!(!c.step_looks_uncut);
     }
 }

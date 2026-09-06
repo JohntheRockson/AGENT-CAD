@@ -58,10 +58,12 @@ Exit code 0 only if **all** checks pass.
 2. **STL look-right** — non-empty **and** same bbox as the viewport mesh **and**
    the same helix/ISO-V/sliver **and** continuity/entry asserts. A smooth Ø8 rod
    or a seamed-slab helix with the same AABB must **FAIL** (AABB-only is not enough).
-3. **STEP honesty** — empty or crash = **FAIL** (honest on current main).
-   When STEP exists: if the viewport is threaded but STEP is essentially the
-   uncut hex+shank (smooth Ø8 / no groove / volume≈uncut), **FAIL**.
-   Inspector does not implement STEP.
+3. **STEP honesty** — empty or crash = **FAIL**. When STEP exists: if the
+   viewport is threaded but STEP is essentially the uncut hex+shank (smooth Ø8
+   / no groove / many faceted faces without a groove signature / volume≈uncut),
+   **FAIL**. A real faceted STEP with groove points still **PASS**es even when
+   B-Rep volume matches the uncut host (instanced threads). Inspector does not
+   implement STEP.
 4. **Fillet R** — measurable **under-head junction** R≈0.8 mm at head ~5.3 / Ø8.
    Named `"all"` / junction-edge indices still have to show that torus.
    Silent no-op = **FAIL**. Δvolume alone is **not** sufficient. Hex-corner

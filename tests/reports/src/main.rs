@@ -11,7 +11,7 @@ use inspect_m8::fillet_r::{
     check_fillet, insert_fillet_after_cylinder, under_head_edge_indices, FilletEdges,
 };
 use inspect_m8::golden::{
-    check_golden_ir, load_golden_document, FILLET_RADIUS_MM, SHANK_R_MM,
+    check_golden_ir, load_golden_document, FILLET_RADIUS_MM, LENGTH_MM, SHANK_R_MM,
 };
 use inspect_m8::look_right::{bbox_tol_mm, check_stl_look_right, check_viewport_look_right};
 use inspect_m8::mesh_util::{bbox_from_mesh, fmt_bb, hex_head_metrics, HexHead};
@@ -132,6 +132,15 @@ fn run() -> Result<bool, String> {
         .as_ref()
         .map(|o| bbox_from_mesh(&o.mesh))
         .unwrap_or([0.0; 6]);
+    {
+        let tip = mesh_bbox[5];
+        let dz = (tip - LENGTH_MM).abs();
+        if dz > 0.05 {
+            log.push(format!(
+                "soft tip note: mesh zmax={tip:.4} vs L={LENGTH_MM} (Δ={dz:.4} mm) — not a fail"
+            ));
+        }
+    }
     let head_base = baseline
         .as_ref()
         .map(|o| hex_head_metrics(&o.mesh, SHANK_R_MM));
@@ -585,6 +594,15 @@ fn render_markdown(r: &ReportData) -> String {
         "Look-right numbers: variation={:.4} spread={:.4} distinct_yaws={}\n\n",
         r.look_variation, r.look_spread, r.look_yaws
     ));
+    {
+        let tip = r.mesh_bbox[5];
+        let dz = (tip - LENGTH_MM).abs();
+        if dz > 0.05 {
+            s.push_str(&format!(
+                "Soft tip note (not a fail): mesh zmax={tip:.4} vs locked L={LENGTH_MM} (Δ={dz:.4} mm).\n\n"
+            ));
+        }
+    }
     if let Some(bb) = r.stl_bbox {
         s.push_str(&format!("STL parsed bbox: `{}`\n\n", fmt_bb(bb)));
     }
