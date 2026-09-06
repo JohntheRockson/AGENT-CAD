@@ -156,7 +156,7 @@ Explicit thread.pitch must match ISO when the pitch param is omitted (M8 is 1.25
 pitch param must match the ISO token (M8 is 1.25) — no size-table lie.
 Require under-head fillet before thread and a tip chamfer after thread (edges:"top").
 Reject a thread that runs past the bolt tip.
-Reject a second external thread on a hex-head bolt.
+Reject a second external thread on a hex-head bolt, or a pattern after thread.
 Reject any fillet after thread (not only edges:"all" / "longest").
 Chamfer after thread must be edges:"top" — not bottom/all/longest.
 A body named bolt or screw must use external thread CUT, not tap/internal.
@@ -398,6 +398,10 @@ mod tests {
         assert!(
             v.contains("second") && v.contains("thread"),
             "verify must reject a second external thread"
+        );
+        assert!(
+            v.contains("pattern") && v.contains("after thread"),
+            "verify must reject a pattern after thread"
         );
         assert!(
             v.contains("any fillet after thread") || v.contains("fillet after thread"),

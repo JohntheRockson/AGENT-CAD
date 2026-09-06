@@ -170,6 +170,13 @@ fn body_fastener_violation(
                             .into(),
                     );
                 }
+                Feature::Pattern(_) => {
+                    return Some(
+                        "hex-head bolt must have one thread CUT; \
+                         do not pattern after thread"
+                            .into(),
+                    );
+                }
                 _ => {}
             }
         }
@@ -3122,6 +3129,34 @@ mod tests {
         assert!(
             l.contains("helix") || l.contains("torus") || l.contains("fake"),
             "reason should name helix/torus after thread: {reason}"
+        );
+
+        let pattern_after = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "pattern", "kind": "linear", "count": 2,
+                      "spacing": 10, "direction": [0, 0, 1], "scope": "feature" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&pattern_after)
+            .expect("pattern after thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("pattern") && l.contains("thread"),
+            "reason should name pattern after thread: {reason}"
         );
 
         assert!(
