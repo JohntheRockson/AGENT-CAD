@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use kernel::{BodyOutput, DocumentOutput, MeshData};
+use kernel::{
+    ir::{CadBody, CadDocument, Feature},
+    BodyOutput, DocumentOutput, MeshData,
+};
 
 const SIZE: usize = 320;
 const PALETTE: [[u8; 3]; 8] = [
@@ -25,14 +28,28 @@ pub struct QualityNote {
 }
 
 pub fn quality_notes(output: &DocumentOutput) -> Vec<QualityNote> {
+    quality_notes_for(output, None)
+}
+
+/// Same as [`quality_notes`], but a Thread feature (tap / die / bolt) is a
+/// fastener even when the body is named "Body" or "hex plate". Cycle 18 only
+/// matched tap/bolt *names*; the prompt examples and hex-plate taps still
+/// looked like many faces and force-repaired.
+pub fn quality_notes_for(
+    output: &DocumentOutput,
+    document: Option<&CadDocument>,
+) -> Vec<QualityNote> {
     output
         .bodies
         .iter()
         .filter(|b| b.visible && !b.suppressed)
         .map(|b| {
             let components = mesh_component_count(&b.mesh);
+            let threaded = document
+                .and_then(|d| d.bodies.iter().find(|body| body.body_id == b.body_id))
+                .is_some_and(body_has_thread);
             QualityNote {
-                fragmented: is_fragmented(&b.name, components),
+                fragmented: is_fragmented(&b.name, components) && !threaded,
                 body_id: b.body_id.clone(),
                 name: b.name.clone(),
                 components,
@@ -143,7 +160,7 @@ pub fn assembly_failures(_document: &kernel::CadDocument, output: &DocumentOutpu
 }
 
 pub fn reject_reason(document: &kernel::CadDocument, output: &DocumentOutput) -> Option<String> {
-    let quality = quality_notes(output);
+    let quality = quality_notes_for(output, Some(document));
     let mut reasons = Vec::new();
     if any_fragmented(&quality) {
         reasons.push(quality_report(&quality));
@@ -154,6 +171,10 @@ pub fn reject_reason(document: &kernel::CadDocument, output: &DocumentOutput) ->
     } else {
         Some(reasons.join("\n"))
     }
+}
+
+fn body_has_thread(body: &CadBody) -> bool {
+    body.features.iter().any(|f| matches!(f, Feature::Thread(_)))
 }
 
 fn is_fastener(name: &str) -> bool {
@@ -609,5 +630,125 @@ mod tests {
             is_fragmented("knuckle taper", count),
             "\"tap\" must not match taper on a knuckle"
         );
+    }
+
+    fn island_mesh(n: usize) -> MeshData {
+        let mut positions = Vec::new();
+        let mut indices = Vec::new();
+        for i in 0..n {
+            let o = (i as f32) * 50.0;
+            let base = (positions.len() / 3) as u32;
+            positions.extend_from_slice(&[
+                o, 0.0, 0.0, o + 5.0, 0.0, 0.0, o, 5.0, 0.0, o + 5.0, 5.0, 0.0,
+            ]);
+            indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+        }
+        mesh(positions, indices)
+    }
+
+    fn fake_output(body_id: &str, name: &str, mesh: MeshData) -> DocumentOutput {
+        let metrics = kernel::MetricsData {
+            volume: 1.0,
+            bbox: [0.0, 0.0, 0.0, 10.0, 10.0, 10.0],
+            surface_area: 1.0,
+            is_solid: true,
+            mesh_provenance: Default::default(),
+        };
+        DocumentOutput {
+            bodies: vec![BodyOutput {
+                body_id: body_id.into(),
+                name: name.into(),
+                visible: true,
+                suppressed: false,
+                mesh,
+                metrics: metrics.clone(),
+            }],
+            metrics,
+        }
+    }
+
+    /// Cycle 18 exempted "M8 tap" / "tapped plate" by name. The prompt plate
+    /// example and a hex plate named "hex plate" still force-repaired.
+    #[test]
+    fn thread_feature_is_not_fragmented_even_when_name_is_plain() {
+        let islands = island_mesh(20);
+        let count = mesh_component_count(&islands);
+        assert!(count > 3, "fixture must look multi-shell, got {count}");
+
+        let hex_plate = kernel::CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "hex plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        let out = fake_output("body_plate", "hex plate", islands.clone());
+        let notes = quality_notes_for(&out, Some(&hex_plate));
+        assert!(
+            !notes[0].fragmented,
+            "hex-plate tap must not be force-repaired as fragmented"
+        );
+        assert!(
+            reject_reason(&hex_plate, &out).is_none(),
+            "preview must not reject a named hex plate with a tap"
+        );
+
+        let prompt_example = kernel::CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_width": 13.0,
+                "head_height": 5.3,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let bolt_out = fake_output("body_main", "Body", islands.clone());
+        assert!(
+            !quality_notes_for(&bolt_out, Some(&prompt_example))[0].fragmented,
+            "legacy prompt-example bolt named Body must not be fragmented"
+        );
+        assert!(reject_reason(&prompt_example, &bolt_out).is_none());
+
+        let knuckle = kernel::CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_knuckle",
+                "name": "knuckle taper",
+                "features": [
+                    { "op": "box", "size": [40, 40, 20], "centered": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        let k_out = fake_output("body_knuckle", "knuckle taper", islands);
+        assert!(
+            quality_notes_for(&k_out, Some(&knuckle))[0].fragmented,
+            "knuckle taper without a thread op must still be judged"
+        );
+        assert!(reject_reason(&knuckle, &k_out).is_some());
     }
 }

@@ -672,7 +672,7 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
             Ok(output) => {
                 tracing::info!(attempt, "Chat: geometry generated successfully");
 
-                let quality = preview::quality_notes(&output);
+                let quality = preview::quality_notes_for(&output, Some(&document));
                 let preview_png = preview::render_png(&output);
                 let quality_text = preview::quality_report(&quality);
 
@@ -1386,7 +1386,7 @@ fn fastener_repair_hint(err: &str) -> String {
         || l.contains("grip")
         || l.contains("pitch")
     {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. Thread must not run past the tip — length is bolt_length - head_height - dead_height. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted — never the old wrench size of 10. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. pitch param must match the ISO token (M8 is 1.25). Fillet under-head before thread. Chamfer the tip after thread edges:\"top\" — a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" or edges:\"longest\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then ONE thread (external) to CUT the helix into that shank — do not emit a second thread. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. Thread must not run past the tip — length is bolt_length - head_height - dead_height. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted — never the old wrench size of 10. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. pitch param must match the ISO token (M8 is 1.25). Fillet under-head before thread. Never fillet after thread (not only edges:\"all\" / \"longest\"). Chamfer the tip after thread edges:\"top\" — a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" or edges:\"longest\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
     } else {
         String::new()
     }
@@ -1686,6 +1686,10 @@ mod tests {
         assert!(
             lower.contains("longest"),
             "verify must catch chamfer-longest after thread"
+        );
+        assert!(
+            lower.contains("second") && lower.contains("thread"),
+            "verify must catch a second external thread"
         );
     }
 
@@ -2209,6 +2213,22 @@ mod tests {
         assert!(
             !fastener_repair_hint(pitch_table_reason).is_empty(),
             "repair hint must fire on the pitch param / ISO token reason"
+        );
+        let second_thread_reason =
+            "hex-head bolt must have one thread CUT; do not emit a second external thread";
+        assert!(
+            !fastener_repair_hint(second_thread_reason).is_empty(),
+            "repair hint must fire on the second-thread reason"
+        );
+        assert!(
+            l.contains("second thread") || l.contains("one thread"),
+            "repair must say one thread CUT only: {hint}"
+        );
+        let fillet_after_reason =
+            "fillet after thread is not an under-head fillet; fillet before thread, chamfer the tip with edges:\"top\"";
+        assert!(
+            !fastener_repair_hint(fillet_after_reason).is_empty(),
+            "repair hint must fire on fillet after thread"
         );
         assert!(fastener_repair_hint("unrelated box error").is_empty());
     }
