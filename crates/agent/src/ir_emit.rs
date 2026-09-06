@@ -89,10 +89,11 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 ///
 /// Returns `Some(reason)` when a hex-head / external-thread body is not
 /// hex → overlapping cylinder → thread CUT, when a fillet uses
-/// `edges:"all"` after the thread (that rounds the helix), or when the
+/// `edges:"all"` after the thread (that rounds the helix), when the
 /// ISO size table does not actually drive the hex / unthreaded grip
 /// (fully-threaded from the head, `head_width` ≠ hex AF, or
-/// `major_diameter` ≠ shank cylinder).
+/// `major_diameter` ≠ shank cylinder), or when the bolt is missing an
+/// under-head fillet before thread or a tip chamfer.
 ///
 /// Internal taps (plate + tap) are not bolts and are left alone.
 pub fn fastener_recipe_violation(doc: &CadDocument) -> Option<String> {
@@ -158,6 +159,8 @@ fn body_fastener_violation(
 /// `head_width` must match hex AF; `major_diameter` must match the shank;
 /// thread start must leave `dead_height`. Explicit thread Ø/pitch must
 /// match the size table when both are set (ISO `size:"M8"` may stay null).
+/// After those checks, require under-head fillet before thread and a tip
+/// chamfer (still reject fillet-`all` after the helix).
 fn bolt_params_drive_hex_and_grip(
     body: &kernel::ir::CadBody,
     params: &std::collections::BTreeMap<String, f64>,
@@ -222,7 +225,10 @@ fn bolt_params_drive_hex_and_grip(
             );
         }
     }
-    if let (Some(p), Some(tp)) = (first_param(params, &["pitch", "thread_pitch"]), thread.pitch) {
+    if let (Some(p), Some(tp)) = (
+        first_param(params, &["pitch", "thread_pitch"]),
+        thread.pitch,
+    ) {
         if (p - tp).abs() > 0.05 {
             return Some(
                 "thread pitch must match the size-table pitch when both are set; \
@@ -262,6 +268,33 @@ fn bolt_params_drive_hex_and_grip(
         }
     }
 
+    bolt_requires_underhead_fillet_and_tip_chamfer(body, thread_i)
+}
+
+/// Golden recipe finishing: fillet the under-head junction *before* the
+/// helix, then chamfer the tip. Fillet-`all` after thread is rejected
+/// earlier (it rounds the groove).
+fn bolt_requires_underhead_fillet_and_tip_chamfer(
+    body: &kernel::ir::CadBody,
+    thread_i: usize,
+) -> Option<String> {
+    let fillet_before = body.features[..thread_i]
+        .iter()
+        .any(|f| matches!(f, Feature::Fillet(_)));
+    if !fillet_before {
+        return Some(
+            "hex-head bolt must fillet under the head before thread; \
+             never fillet edges:\"all\" after the helix"
+                .into(),
+        );
+    }
+    let has_chamfer = body
+        .features
+        .iter()
+        .any(|f| matches!(f, Feature::Chamfer(_)));
+    if !has_chamfer {
+        return Some("hex-head bolt must chamfer the tip (edges:\"top\") after the thread".into());
+    }
     None
 }
 
@@ -723,6 +756,152 @@ mod tests {
         assert!(
             l.contains("pitch"),
             "reason should name the undriven pitch: {reason}"
+        );
+    }
+
+    /// Order + size table can be legal and still omit the golden finishing
+    /// ops. Verify must require under-head fillet before thread and a tip
+    /// chamfer (fillet-all after thread stays rejected above).
+    #[test]
+    fn fastener_rules_require_underhead_fillet_and_tip_chamfer() {
+        let legal_params = serde_json::json!({
+            "bolt_length": 40.0,
+            "head_height": 5.3,
+            "head_width": 13.0,
+            "dead_height": 8.0,
+            "major_diameter": 8.0,
+            "pitch": 1.25
+        });
+        let hex_cyl_thread = serde_json::json!([
+            { "op": "sketch", "plane": "XY",
+              "profile": { "hex": { "across_flats": 13 } } },
+            { "op": "extrude", "depth": 5.3 },
+            { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+            { "op": "thread", "kind": "external", "size": "M8",
+              "length": 26.7, "at": [0, 0, 13.3] }
+        ]);
+
+        let missing_both = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": legal_params,
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_thread
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&missing_both)
+            .expect("legal order without fillet/chamfer must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("fillet") && (l.contains("before") || l.contains("under")),
+            "reason should require under-head fillet: {reason}"
+        );
+
+        let fillet_only = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 1.25
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason =
+            fastener_recipe_violation(&fillet_only).expect("fillet without tip chamfer must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("chamfer") && l.contains("tip"),
+            "reason should require tip chamfer: {reason}"
+        );
+
+        let chamfer_only = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 1.25
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&chamfer_only)
+            .expect("chamfer without under-head fillet must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("fillet") && (l.contains("before") || l.contains("under")),
+            "reason should require under-head fillet: {reason}"
+        );
+
+        let fillet_after_not_all = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 1.25
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&fillet_after_not_all)
+            .expect("fillet after thread is not an under-head fillet");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("fillet") && (l.contains("before") || l.contains("under")),
+            "fillet after thread must not satisfy under-head: {reason}"
+        );
+
+        assert!(
+            fastener_recipe_violation(&example_m8_bolt_document()).is_none(),
+            "golden hex→fillet→thread→chamfer must still pass"
         );
     }
 }
