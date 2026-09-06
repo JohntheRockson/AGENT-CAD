@@ -1345,7 +1345,7 @@ fn fastener_repair_hint(err: &str) -> String {
         || l.contains("hex")
         || l.contains("fillet")
     {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head. Never thread first and fuse a hex head on. Never fillet edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13. ".into()
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. hex AF must match head_width. Never thread first and fuse a hex head on. Never fillet edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
     } else {
         String::new()
     }
@@ -1634,6 +1634,10 @@ mod tests {
             lower.contains("hex extrude") && lower.contains("overlapping cylinder"),
             "verify fastener-order rules must restate the golden recipe"
         );
+        assert!(
+            lower.contains("dead_height"),
+            "verify must catch a fully-threaded bolt (missing unthreaded grip)"
+        );
     }
 
     #[test]
@@ -1663,6 +1667,54 @@ mod tests {
             agent::fastener_recipe_violation(&golden).is_none(),
             "golden hex→cylinder→thread must pass"
         );
+
+        // Inspector-golden shape: order is legal, but no dead_height / grip.
+        let fully_threaded = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": { "bolt_length": 40.0, "head_height": 5.3, "head_width": 13.0 },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8", "length": 34.7,
+                      "at": [0, 0, 5.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&fully_threaded)
+            .expect("fully-threaded hex bolt must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("unthreaded") || l.contains("dead_height") || l.contains("grip"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn fastener_repair_hint_teaches_af13_and_param_driven_grip() {
+        let hint = fastener_repair_hint("thread fuse fillet hex");
+        let l = hint.to_ascii_lowercase();
+        assert!(l.contains("dead_height"), "repair must reteach the grip");
+        assert!(
+            l.contains("head_width") && (l.contains("13") || l.contains("af")),
+            "repair must reteach AF 13, not 10: {hint}"
+        );
+        assert!(
+            !hint.contains("head_width 10")
+                && !hint.contains("AF 10")
+                && !hint.contains("AF/head_width 10"),
+            "repair must not teach the old AF 10 table: {hint}"
+        );
+        assert!(
+            l.contains("head_height") && l.contains("dead_height"),
+            "repair must say thread at is head_height + dead_height"
+        );
+        assert!(fastener_repair_hint("unrelated box error").is_empty());
     }
 
     #[test]

@@ -88,20 +88,25 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 /// Deterministic fastener-order judge used by verify/repair.
 ///
 /// Returns `Some(reason)` when a hex-head / external-thread body is not
-/// hex → overlapping cylinder → thread CUT, or when a fillet uses
-/// `edges:"all"` after the thread (that rounds the helix).
+/// hex → overlapping cylinder → thread CUT, when a fillet uses
+/// `edges:"all"` after the thread (that rounds the helix), or when the
+/// ISO size table does not actually drive the hex / unthreaded grip
+/// (fully-threaded from the head, or `head_width` ≠ hex AF).
 ///
 /// Internal taps (plate + tap) are not bolts and are left alone.
 pub fn fastener_recipe_violation(doc: &CadDocument) -> Option<String> {
     for body in &doc.bodies {
-        if let Some(reason) = body_fastener_violation(body) {
+        if let Some(reason) = body_fastener_violation(body, &doc.parameters) {
             return Some(reason);
         }
     }
     None
 }
 
-fn body_fastener_violation(body: &kernel::ir::CadBody) -> Option<String> {
+fn body_fastener_violation(
+    body: &kernel::ir::CadBody,
+    params: &std::collections::BTreeMap<String, f64>,
+) -> Option<String> {
     let hex_i = body.features.iter().position(is_hex_head);
     let cyl_i = body
         .features
@@ -132,7 +137,7 @@ fn body_fastener_violation(body: &kernel::ir::CadBody) -> Option<String> {
     }
 
     match (hex_i, cyl_i) {
-        (Some(h), Some(c)) if h < c && c < t => None,
+        (Some(h), Some(c)) if h < c && c < t => bolt_params_drive_hex_and_grip(body, params, h, t),
         (Some(h), Some(c)) if t < h || t < c => Some(
             "thread-first then fuse a head is rejected; \
              hex extrude → overlapping cylinder → thread CUT"
@@ -144,6 +149,87 @@ fn body_fastener_violation(body: &kernel::ir::CadBody) -> Option<String> {
                 .into(),
         ),
     }
+}
+
+/// SW/Fusion mental model: the size table drives the feature tree.
+/// `head_width` must match hex AF; thread start must leave `dead_height`.
+fn bolt_params_drive_hex_and_grip(
+    body: &kernel::ir::CadBody,
+    params: &std::collections::BTreeMap<String, f64>,
+    hex_i: usize,
+    thread_i: usize,
+) -> Option<String> {
+    let hex_af = match &body.features[hex_i] {
+        Feature::Sketch(op) => match &op.profile {
+            Profile::Hex(h) => Some(h.across_flats),
+            _ => None,
+        },
+        _ => None,
+    };
+    let head_from_feat = body.features[hex_i + 1..thread_i]
+        .iter()
+        .find_map(|f| match f {
+            Feature::Extrude(op) => Some(op.depth),
+            _ => None,
+        });
+    let thread = match &body.features[thread_i] {
+        Feature::Thread(op) => op,
+        _ => return None,
+    };
+
+    if let (Some(hw), Some(af)) = (
+        first_param(params, &["head_width", "hex_width", "across_flats"]),
+        hex_af,
+    ) {
+        if (hw - af).abs() > 0.2 {
+            return Some(
+                "hex across_flats must be driven by head_width; \
+                 do not hard-code a different wrench size than the size table"
+                    .into(),
+            );
+        }
+    }
+
+    let head = first_param(params, &["head_height", "hex_height"]).or(head_from_feat);
+    let dead = first_param(
+        params,
+        &[
+            "dead_height",
+            "dead_length",
+            "unthreaded_length",
+            "unthreaded_height",
+        ],
+    );
+    let thread_z = thread.at[2];
+
+    if let Some(h) = head {
+        if let Some(d) = dead {
+            if (thread_z - (h + d)).abs() > 0.51 {
+                return Some(
+                    "thread must start at head_height + dead_height \
+                     so the unthreaded grip is parameter-driven"
+                        .into(),
+                );
+            }
+        } else if thread_z <= h + 0.51 {
+            return Some(
+                "hex-head bolt must leave an unthreaded grip (dead_height) under the head; \
+                 do not fully-thread from the head"
+                    .into(),
+            );
+        }
+    }
+
+    None
+}
+
+fn first_param(params: &std::collections::BTreeMap<String, f64>, names: &[&str]) -> Option<f64> {
+    names.iter().find_map(|n| {
+        params
+            .get(*n)
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+    })
 }
 
 fn is_hex_head(f: &Feature) -> bool {
@@ -434,6 +520,100 @@ mod tests {
         assert!(
             fastener_recipe_violation(&tap).is_none(),
             "internal tap must not be judged as a hex-head bolt"
+        );
+    }
+
+    /// Inspector golden / pre-#18 emit: hex→cyl→thread with no dead_height.
+    /// Order is legal; the size table does not drive an unthreaded grip.
+    #[test]
+    fn fastener_rules_reject_fully_threaded_and_undriven_params() {
+        let fully_threaded = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8", "length": 34.7,
+                      "at": [0, 0, 5.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&fully_threaded)
+            .expect("fully-threaded inspector-golden bolt must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("unthreaded") || l.contains("dead_height") || l.contains("grip"),
+            "reason should name the missing grip: {reason}"
+        );
+
+        let undriven_hex = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 10 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&undriven_hex)
+            .expect("head_width 13 with hex AF 10 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("head_width") || l.contains("across_flats") || l.contains("wrench"),
+            "reason should name the undriven hex: {reason}"
+        );
+
+        let undriven_grip = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 34.7, "at": [0, 0, 5.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&undriven_grip)
+            .expect("dead_height 8 with thread at the head must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("dead_height") || l.contains("parameter"),
+            "reason should name the undriven grip: {reason}"
         );
     }
 }

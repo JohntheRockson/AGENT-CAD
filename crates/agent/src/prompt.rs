@@ -148,6 +148,8 @@ Fastener order (judge only):
 A hex-head bolt must be hex extrude → overlapping cylinder → thread CUT.
 Reject thread-first then fuse a head.
 Reject fillet edges:"all" after thread (that rounds the helix).
+Reject a hex-head bolt fully threaded from the head (missing dead_height).
+head_width must drive the hex wrench size; dead_height must drive thread start.
 "#;
 
 #[cfg(test)]
@@ -307,6 +309,14 @@ mod tests {
         assert!(
             v.contains("edges:\"all\"") && v.contains("after thread"),
             "verify must reject fillet-all after thread"
+        );
+        assert!(
+            v.contains("dead_height") && (v.contains("fully threaded") || v.contains("unthreaded")),
+            "verify must reject a fully-threaded hex bolt (missing grip)"
+        );
+        assert!(
+            v.contains("head_width") && v.contains("drive"),
+            "verify must require head_width to drive the hex"
         );
         assert!(
             !v.contains("draft_extrude") && !v.contains("## feature ops"),
