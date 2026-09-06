@@ -111,6 +111,8 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 ///
 /// Internal taps (plate + tap) are not bolts and are left alone.
 /// A body named bolt *or* screw with tap/internal is rejected.
+/// A body named stud with hex+shank and no Thread op is rejected
+/// (`stud plate` stays unjudged).
 pub fn fastener_recipe_violation(doc: &CadDocument) -> Option<String> {
     for body in &doc.bodies {
         if let Some(reason) =
@@ -230,14 +232,16 @@ fn body_fastener_violation(
     // Named bolt + hex + shank with no Thread op used to fall through
     // (Cycle 22 only caught tap). Cycle 32 required bolt/screw in the
     // name; a body named only "M8" / "M8x40" still shipped a blank shank.
-    // Hex-plate taps stay unjudged (plate in the name, or an internal tap).
+    // Cycle 39: named stud (token, not student) is the same skip.
+    // Hex-plate / stud-plate taps stay unjudged (plate in the name, or an
+    // internal tap).
     if thread_i.is_none()
         && body_name_needs_thread_cut(&body.name)
         && hex_i.is_some()
         && cyl_i.is_some()
         && !body.features.iter().any(is_internal_thread)
     {
-        return Some("hex-head bolt or screw must use external thread CUT".into());
+        return Some("hex-head bolt, screw, or stud must use external thread CUT".into());
     }
     let Some(t) = thread_i else {
         return None;
@@ -759,7 +763,9 @@ fn body_name_is_bolt(name: &str) -> bool {
 }
 
 /// Cycle 32 required bolt/screw. A body named only M8 / M8x40 with hex+shank
-/// is the same blank-shank skip. Do not treat "M8 hex plate" as a bolt.
+/// is the same blank-shank skip. Named `stud` / `studs` (not `student`) is
+/// the same skip. Do not treat "M8 hex plate" or "stud plate" as a bolt —
+/// plate/sheet/bracket wins before the M8 / stud token.
 fn body_name_needs_thread_cut(name: &str) -> bool {
     if body_name_is_bolt(name) {
         return true;
@@ -768,7 +774,40 @@ fn body_name_needs_thread_cut(name: &str) -> bool {
     if n.contains("plate") || n.contains("sheet") || n.contains("bracket") {
         return false;
     }
-    text_implies_m8(name)
+    text_implies_m8(name) || text_implies_stud(name)
+}
+
+/// `stud` / `studs` as a token — not `student`, `studio`, or `study`.
+fn text_implies_stud(s: &str) -> bool {
+    let n = s.to_ascii_lowercase();
+    let bytes = n.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if &bytes[i..i + 4] == b"stud" {
+            let prev_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let after = n.get(i + 4..).unwrap_or("");
+            let after_ok = after.is_empty()
+                || (after.starts_with('s')
+                    && after
+                        .get(1..)
+                        .is_some_and(|rest| {
+                            rest.is_empty()
+                                || rest
+                                    .chars()
+                                    .next()
+                                    .is_some_and(|c| !c.is_ascii_alphanumeric())
+                        }))
+                || after
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_ascii_alphanumeric());
+            if prev_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn is_fake_thread_feature(f: &Feature) -> bool {
@@ -3625,6 +3664,84 @@ mod tests {
         assert!(
             fastener_recipe_violation(&hex_plate).is_none(),
             "hex plate without a tap must stay unjudged"
+        );
+
+        assert!(text_implies_stud("Stud"));
+        assert!(text_implies_stud("Hex Stud"));
+        assert!(text_implies_stud("wheel-studs"));
+        assert!(!text_implies_stud("student"));
+        assert!(!text_implies_stud("studio"));
+        assert!(!text_implies_stud("study"));
+
+        let named_stud = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Hex Stud",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&named_stud)
+            .expect("named stud + hex + shank with no thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("external") && l.contains("thread"),
+            "reason should require external CUT on named stud: {reason}"
+        );
+
+        let student_post = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Student",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&student_post).is_none(),
+            "student must not match the stud token"
+        );
+
+        let stud_plate_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "stud plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "cylinder", "diameter": 16, "height": 4, "at": [0, 0, 12] },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&stud_plate_tap).is_none(),
+            "stud plate + boss + tap must stay unjudged"
         );
     }
 

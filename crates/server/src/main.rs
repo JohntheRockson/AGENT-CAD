@@ -1445,7 +1445,7 @@ fn fastener_repair_hint(err: &str) -> String {
         || l.contains("grip")
         || l.contains("pitch")
     {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then ONE thread (external) to CUT the helix into that shank — do not emit a second thread or pattern after thread. A body named bolt, screw, or M8 (hex+shank) must be external CUT, not a blank shank or tap/internal. Do not fake threads with helix, torus, or revolve (not in place of thread CUT, and not after it). Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. Thread must not run past the tip — length is bolt_length - head_height - dead_height. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted or the body is only named M8 / documentId M8 — never the old wrench size of 10. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted; Ø8 is still M8 even if pitch is a lie). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. pitch param must match the ISO token (M8 is 1.25). Fillet under-head before thread. Never fillet after thread (not only edges:\"all\" / \"longest\"). Chamfer the tip after thread edges:\"top\" — not bottom/all/longest; a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" or edges:\"longest\" after thread. Never shell, offset, draft, thicken, or common after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then ONE thread (external) to CUT the helix into that shank — do not emit a second thread or pattern after thread. A body named bolt, screw, M8, or stud (hex+shank) must be external CUT, not a blank shank or tap/internal. Do not fake threads with helix, torus, or revolve (not in place of thread CUT, and not after it). Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. Thread must not run past the tip — length is bolt_length - head_height - dead_height. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted or the body is only named M8 / documentId M8 — never the old wrench size of 10. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted; Ø8 is still M8 even if pitch is a lie). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. pitch param must match the ISO token (M8 is 1.25). Fillet under-head before thread. Never fillet after thread (not only edges:\"all\" / \"longest\"). Chamfer the tip after thread edges:\"top\" — not bottom/all/longest; a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" or edges:\"longest\" after thread. Never shell, offset, draft, thicken, or common after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
     } else {
         String::new()
     }
@@ -1774,6 +1774,10 @@ mod tests {
         assert!(
             lower.contains("blank shank") || (lower.contains("hex+shank") && lower.contains("thread")),
             "verify must catch a named-M8 hex+shank with no thread CUT"
+        );
+        assert!(
+            lower.contains("stud"),
+            "verify must catch a named-stud hex+shank with no thread CUT"
         );
         assert!(
             lower.contains("documentid") || lower.contains("document id"),
@@ -2348,6 +2352,10 @@ mod tests {
             l.contains("blank shank") || l.contains("hex+shank"),
             "repair must reteach named M8 hex+shank needs thread CUT: {hint}"
         );
+        assert!(
+            l.contains("stud"),
+            "repair must reteach named stud hex+shank needs thread CUT: {hint}"
+        );
         let fake_reason =
             "do not fake threads with helix, torus, or revolve; use thread CUT (kind external, size M8)";
         assert!(
@@ -2687,6 +2695,25 @@ mod tests {
             "named M8 hex+shank with no thread must not ship as chat success"
         );
 
+        let named_stud_blank = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Hex Stud",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&named_stud_blank).is_some(),
+            "named stud hex+shank with no thread must not ship as chat success"
+        );
+
         assert!(
             reject_chat_success(&agent::example_m8_bolt_document()).is_none(),
             "golden recipe must still ship"
@@ -2710,6 +2737,27 @@ mod tests {
         assert!(
             reject_chat_success(&hex_plate_tap).is_none(),
             "hex-plate tap must still ship"
+        );
+
+        let stud_plate_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "stud plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "cylinder", "diameter": 16, "height": 4, "at": [0, 0, 12] },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&stud_plate_tap).is_none(),
+            "stud-plate tap must still ship"
         );
 
         let cut_after = CadDocument::from_json_value(serde_json::json!({
