@@ -93,6 +93,12 @@ jobs:
       - name: cargo build -p server --release (links occt)
         run: cargo build -p server --release
 
+      # Same default occt features as the release binary above. Unit tests live
+      # in src/main.rs and src/preview.rs (verify prompt, fastener recipe, SSE
+      # keep-document, mesh-component count). No GEMINI_KEY / network.
+      - name: cargo test -p server --release
+        run: cargo test -p server --release
+
   occt-golden:
     name: OCCT golden M8 STEP/STL
     runs-on: ubuntu-latest
