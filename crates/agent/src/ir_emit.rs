@@ -70,16 +70,21 @@ pub fn example_m8_bolt_document() -> CadDocument {
     doc
 }
 
-/// Last document to keep in chat/UI after a kernel failure.
+/// Last document to keep in chat/UI after a kernel / repair-loop failure.
 ///
-/// Prefer the last IR that parsed this turn; otherwise keep the document the
-/// client already had. Never replace a parsed document with `None` just
-/// because the kernel rejected it.
+/// Prefer the last IR that parsed this turn **and** passes
+/// [`fastener_recipe_violation`]; otherwise keep the document the client
+/// already had. Never replace a parsed document with `None` just because the
+/// kernel rejected it. A recipe-breaking parse (thread-first, AF 10, …) must
+/// not become leftover — Cycle 11 already refused those as verify fixes.
 pub fn keep_document_on_kernel_failure<'a>(
     last_parsed: Option<&'a CadDocument>,
     incoming: Option<&'a CadDocument>,
 ) -> Option<&'a CadDocument> {
-    last_parsed.or(incoming)
+    match last_parsed {
+        Some(d) if fastener_recipe_violation(d).is_none() => Some(d),
+        _ => incoming,
+    }
 }
 
 /// Serialize a kept document for a chat `Result` event (`program` field).
@@ -679,6 +684,58 @@ mod tests {
         assert!(keep_document_on_kernel_failure(None, None).is_none());
         assert!(program_json_for_chat(Some(&parsed)).is_some());
         assert!(program_json_for_chat(None).is_none());
+
+        // Cycle 11 stopped a recipe-breaking verify *fix* from replacing
+        // last_document. The main parse path still overwrote leftover with
+        // thread-first / AF-10 IR; exhaust then shipped that as success-shaped
+        // program JSON. Fall back to the incoming document instead.
+        let thread_first = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_bad",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "thread", "kind": "external", "size": "M8", "length": 24 },
+                    { "op": "cylinder", "diameter": 13, "height": 5.3, "at": [0, 0, 24] },
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&thread_first).is_some(),
+            "fixture must be a recipe violation"
+        );
+        let kept = keep_document_on_kernel_failure(Some(&thread_first), Some(&incoming)).unwrap();
+        assert_eq!(
+            kept.bodies[0].body_id, "body_old",
+            "recipe-breaking last_parsed must not become leftover"
+        );
+        assert!(
+            keep_document_on_kernel_failure(Some(&thread_first), None).is_none(),
+            "recipe-breaking last_parsed with no incoming must not be kept"
+        );
+
+        let tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "plate",
+                "features": [
+                    { "op": "box", "size": [40, 40, 12], "centered": true },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        let kept = keep_document_on_kernel_failure(Some(&tap), Some(&incoming)).unwrap();
+        assert_eq!(
+            kept.bodies[0].body_id, "body_plate",
+            "internal tap must still be a keepable last_parsed"
+        );
     }
 
     #[test]

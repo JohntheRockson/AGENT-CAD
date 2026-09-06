@@ -615,7 +615,12 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
             }
         };
 
-        last_document = Some(document.clone());
+        // Recipe-breaking parses must not become leftover on exhaust (Cycle 11
+        // already refused them as Gemini verify fixes). A later thread-first
+        // attempt must not overwrite a prior legal parse.
+        if agent::fastener_recipe_violation(&document).is_none() {
+            last_document = Some(document.clone());
+        }
 
         if let Err(val_err) = document.validate() {
             last_error = format!("Validation error: {val_err}");
@@ -2274,5 +2279,49 @@ mod tests {
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["program"]["bodies"][0]["bodyId"], "body_plate");
+    }
+
+    /// Exhaust leftover used to prefer any last parse, including a thread-first
+    /// "bolt" that verify had already rejected. Keep the incoming document.
+    #[test]
+    fn failed_chat_result_does_not_keep_recipe_breaking_parse() {
+        let incoming = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "features": [{ "op": "box", "size": [20, 20, 4], "centered": true }]
+            }]
+        }))
+        .unwrap();
+        let thread_first = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_bad",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "thread", "kind": "external", "size": "M8", "length": 24 },
+                    { "op": "cylinder", "diameter": 13, "height": 5.3, "at": [0, 0, 24] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(agent::fastener_recipe_violation(&thread_first).is_some());
+        let kept = agent::keep_document_on_kernel_failure(Some(&thread_first), Some(&incoming));
+        let ev = ChatSseEvent::Result {
+            success: false,
+            message: "Could not generate a valid model after 6 attempts.".into(),
+            program: agent::program_json_for_chat(kept),
+            mesh: None,
+            metrics: None,
+            bodies: vec![],
+            error: Some("Result did not match the request: thread-first".into()),
+            attempts: 6,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["success"], false);
+        assert_eq!(
+            v["program"]["bodies"][0]["bodyId"], "body_plate",
+            "exhaust leftover must not ship a recipe-breaking last_parsed"
+        );
     }
 }
