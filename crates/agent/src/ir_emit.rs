@@ -181,7 +181,7 @@ fn body_fastener_violation(
                 }
                 other if is_fake_thread_feature(other) => {
                     return Some(
-                        "do not fake threads with helix or torus after a thread CUT; \
+                        "do not fake threads with helix, torus, or revolve after a thread CUT; \
                          one external thread only"
                             .into(),
                     );
@@ -222,7 +222,7 @@ fn body_fastener_violation(
         && (body_name_is_bolt(&body.name) || (hex_i.is_some() && cyl_i.is_some()))
     {
         return Some(
-            "do not fake threads with helix or torus; use thread CUT \
+            "do not fake threads with helix, torus, or revolve; use thread CUT \
              (kind external, size M8)"
                 .into(),
         );
@@ -746,7 +746,7 @@ fn body_name_is_bolt(name: &str) -> bool {
 
 fn is_fake_thread_feature(f: &Feature) -> bool {
     match f {
-        Feature::Helix(_) | Feature::Torus(_) => true,
+        Feature::Helix(_) | Feature::Torus(_) | Feature::Revolve(_) => true,
         Feature::Pipe(op) => matches!(op.path, kernel::ir::SweepPath::Helix { .. }),
         Feature::Sweep(op) => matches!(op.path, kernel::ir::SweepPath::Helix { .. }),
         _ => false,
@@ -2672,6 +2672,29 @@ mod tests {
             "reason should name the torus fake: {reason}"
         );
 
+        let revolve_fake = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "revolve", "axis": "Z", "angle": 360 }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&revolve_fake)
+            .expect("hex→cyl→revolve with no Thread op must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("revolve") || l.contains("fake") || l.contains("helix"),
+            "reason should name the revolve fake: {reason}"
+        );
+
         let hex_plate_tap = CadDocument::from_json_value(serde_json::json!({
             "units": "mm",
             "bodies": [{
@@ -2707,6 +2730,25 @@ mod tests {
         assert!(
             fastener_recipe_violation(&spring).is_none(),
             "a helix spring that is not a hex-head bolt must stay unjudged"
+        );
+
+        let lathe = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_tube",
+                "name": "Body",
+                "features": [
+                    { "op": "sketch", "plane": "XZ",
+                      "profile": { "polyline": { "points": [[8,0],[12,0],[12,20],[8,20]],
+                                                 "closed": true } } },
+                    { "op": "revolve", "axis": "Z", "angle": 360 }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&lathe).is_none(),
+            "a lathe/revolve tube that is not a hex-head bolt must stay unjudged"
         );
 
         assert!(
@@ -3179,6 +3221,34 @@ mod tests {
             "reason should name helix/torus after thread: {reason}"
         );
 
+        let revolve_after_cut = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "revolve", "axis": "Z", "angle": 360 }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&revolve_after_cut)
+            .expect("revolve after a legal thread CUT must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("revolve") || l.contains("fake") || l.contains("helix"),
+            "reason should name revolve after thread: {reason}"
+        );
+
         let pattern_after = CadDocument::from_json_value(serde_json::json!({
             "units": "mm",
             "parameters": params,
@@ -3557,14 +3627,15 @@ mod tests {
                     { "op": "thicken", "thickness": 0.4, "face": "largest" },
                     { "op": "common",
                       "profile": { "circle": { "d": 30 } },
-                      "depth": 12 }
+                      "depth": 12 },
+                    { "op": "revolve", "axis": "Z", "angle": 360 }
                 ]
             }]
         }))
         .unwrap();
         assert!(
             fastener_recipe_violation(&hex_plate_tap).is_none(),
-            "hex-plate tap with draft/thicken/common after tap must stay unjudged"
+            "hex-plate tap with draft/thicken/common/revolve after tap must stay unjudged"
         );
         assert!(
             fastener_recipe_violation(&example_m8_bolt_document()).is_none(),
