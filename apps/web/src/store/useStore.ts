@@ -363,7 +363,7 @@ export const useCadStore = create<CadStore>((set, get) => ({
     set({
       isExporting: true,
       exportStatus: 'Choose where to save…',
-      runError: null,
+      // Keep a rebuild error visible when exporting last-good after a failed run.
     })
 
     try {
