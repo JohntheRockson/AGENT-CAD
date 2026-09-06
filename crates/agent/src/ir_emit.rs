@@ -227,10 +227,13 @@ fn bolt_params_drive_hex_and_grip(
             );
         }
     }
+    let iso_spec = thread_iso_spec(thread, params);
     // Cycle 1 only compared head_width to hex when the param was present.
     // size:"M8" + head_width 10 + AF 10 (the old table) still passed — a
     // consistent wrench-size lie. ISO 4014/4017 M8 is AF 13.
-    if let Some(iso_af) = iso_hex_across_flats(thread.size.as_deref()) {
+    // Cycle 15: omitting size and writing Ø8 × 1.25 is still M8 — not a
+    // license to keep the old AF 10 table.
+    if let Some(iso_af) = iso_hex_across_flats_for_spec(iso_spec.as_ref()) {
         if let Some(af) = hex_af {
             if (af - iso_af).abs() > 0.2 {
                 return Some(
@@ -255,10 +258,6 @@ fn bolt_params_drive_hex_and_grip(
         params,
         &["major_diameter", "shank_diameter", "thread_diameter"],
     );
-    let iso_spec = thread
-        .size
-        .as_deref()
-        .and_then(|s| kernel::thread::parse_size(s).ok());
     let iso_major = iso_spec.as_ref().map(|spec| spec.major_diameter);
     let iso_pitch = iso_spec.as_ref().map(|spec| spec.pitch);
     if let (Some(md), Some(iso)) = (major, iso_major) {
@@ -435,12 +434,48 @@ fn bolt_requires_underhead_fillet_and_tip_chamfer(
 
 /// ISO 4014/4017 hex across-flats for sizes the recipe already teaches.
 /// M8 only — do not invent a full hex catalog here.
-fn iso_hex_across_flats(size: Option<&str>) -> Option<f64> {
-    let spec = kernel::thread::parse_size(size?).ok()?;
+fn iso_hex_across_flats_for_spec(spec: Option<&kernel::thread::ThreadSpec>) -> Option<f64> {
+    let spec = spec?;
     if (spec.major_diameter - M8_MAJOR_DIAMETER).abs() < 0.2 {
         Some(M8_ACROSS_FLATS)
     } else {
         None
+    }
+}
+
+/// `size:"M8"` / `size:"M8x1.25"` parse to the same ISO 261 coarse spec.
+/// When the token is omitted, numeric Ø8 × 1.25 (on the op or in the table)
+/// is still M8 — do not treat that as a license to keep AF 10.
+fn thread_iso_spec(
+    thread: &ThreadOp,
+    params: &std::collections::BTreeMap<String, f64>,
+) -> Option<kernel::thread::ThreadSpec> {
+    if let Some(spec) = thread
+        .size
+        .as_deref()
+        .and_then(|s| kernel::thread::parse_size(s).ok())
+    {
+        return Some(spec);
+    }
+    let major = thread.diameter.or_else(|| {
+        first_param(
+            params,
+            &["major_diameter", "shank_diameter", "thread_diameter"],
+        )
+    });
+    let pitch = thread
+        .pitch
+        .or_else(|| first_param(params, &["pitch", "thread_pitch"]));
+    match (major, pitch) {
+        (Some(d), Some(p))
+            if (d - M8_MAJOR_DIAMETER).abs() < 0.2 && (p - M8_PITCH).abs() < 0.05 =>
+        {
+            kernel::thread::parse_size("M8").ok()
+        }
+        (Some(d), None) if (d - M8_MAJOR_DIAMETER).abs() < 0.2 => {
+            kernel::thread::parse_size("M8").ok()
+        }
+        _ => None,
     }
 }
 
@@ -1644,6 +1679,124 @@ mod tests {
         assert!(
             fastener_recipe_violation(&hex_plate_tap).is_none(),
             "internal tap on a hex plate must not be judged as a hex-head bolt"
+        );
+    }
+
+    /// Cycle 8 bound AF 13 to size:"M8". size:"M8x1.25" is the same ISO 261
+    /// coarse token and already failed AF 10. Omitting size and writing
+    /// diameter 8 / pitch 1.25 still skipped the ISO AF bind — the old
+    /// AF 10 table shipped. Numeric Ø8×1.25 is still M8.
+    #[test]
+    fn fastener_rules_omitted_size_token_still_drives_m8_af13() {
+        let hex_cyl_finish = |size: Option<&str>, af: f64| {
+            let mut thread = serde_json::json!({
+                "op": "thread", "kind": "external",
+                "length": 26.7, "at": [0, 0, 13.3]
+            });
+            if let Some(s) = size {
+                thread["size"] = serde_json::json!(s);
+            } else {
+                thread["diameter"] = serde_json::json!(8.0);
+                thread["pitch"] = serde_json::json!(1.25);
+            }
+            serde_json::json!([
+                { "op": "sketch", "plane": "XY",
+                  "profile": { "hex": { "across_flats": af } } },
+                { "op": "extrude", "depth": 5.3 },
+                { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                thread,
+                { "op": "chamfer", "distance": 0.5, "edges": "top" }
+            ])
+        };
+
+        let omitted_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 10.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 1.25
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(None, 10.0)
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&omitted_af10)
+            .expect("omitted size + Ø8×1.25 + AF 10 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "reason should name the omitted-token / AF 10 lie: {reason}"
+        );
+
+        let omitted_af13 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 1.25
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(None, 13.0)
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&omitted_af13).is_none(),
+            "omitted size + Ø8×1.25 + AF 13 must still pass"
+        );
+
+        let m8x125_ok = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 1.25
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(Some("M8x1.25"), 13.0)
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&m8x125_ok).is_none(),
+            "size M8x1.25 is the same ISO coarse token as M8"
+        );
+
+        let hex_plate_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "hex plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "thread", "kind": "tap", "size": "M8x1.25",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&hex_plate_tap).is_none(),
+            "internal tap on a hex plate (M8x1.25) must not be judged as a bolt"
         );
     }
 }
