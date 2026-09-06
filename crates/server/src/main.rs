@@ -615,13 +615,6 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
             }
         };
 
-        // Recipe-breaking parses must not become leftover on exhaust (Cycle 11
-        // already refused them as Gemini verify fixes). A later thread-first
-        // attempt must not overwrite a prior legal parse.
-        if agent::fastener_recipe_violation(&document).is_none() {
-            last_document = Some(document.clone());
-        }
-
         if let Err(val_err) = document.validate() {
             last_error = format!("Validation error: {val_err}");
             tracing::warn!(attempt, %last_error, "repair loop");
@@ -646,6 +639,13 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                 parts: vec![gemini_text(repair)],
             });
             continue;
+        }
+        // Recipe-breaking or invalid parses must not become leftover on exhaust
+        // (Cycle 11 refused them as Gemini verify fixes; Cycle 14 skipped
+        // recipe-breaking leftover). Do not keep a document that failed
+        // validate — a later attempt must not overwrite a prior legal parse.
+        if agent::fastener_recipe_violation(&document).is_none() {
+            last_document = Some(document.clone());
         }
 
         emit(&tx, ChatSseEvent::CalculatingStart).await;

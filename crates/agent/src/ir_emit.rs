@@ -82,7 +82,11 @@ pub fn keep_document_on_kernel_failure<'a>(
     incoming: Option<&'a CadDocument>,
 ) -> Option<&'a CadDocument> {
     match last_parsed {
-        Some(d) if fastener_recipe_violation(d).is_none() => Some(d),
+        Some(d)
+            if fastener_recipe_violation(d).is_none() && d.validate().is_ok() =>
+        {
+            Some(d)
+        }
         _ => incoming,
     }
 }
@@ -776,6 +780,33 @@ mod tests {
         assert_eq!(
             kept.bodies[0].body_id, "body_plate",
             "internal tap must still be a keepable last_parsed"
+        );
+
+        // Recipe-ok but invalid (tap missing size) must not become leftover.
+        let invalid_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_invalid",
+                "name": "plate",
+                "features": [
+                    { "op": "box", "size": [40, 40, 12], "centered": true },
+                    { "op": "thread", "kind": "tap", "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&invalid_tap).is_none(),
+            "unsized tap is not a bolt recipe violation"
+        );
+        assert!(
+            invalid_tap.validate().is_err(),
+            "unsized tap must fail document.validate"
+        );
+        let kept = keep_document_on_kernel_failure(Some(&invalid_tap), Some(&incoming)).unwrap();
+        assert_eq!(
+            kept.bodies[0].body_id, "body_old",
+            "invalid last_parsed must not become leftover"
         );
     }
 
