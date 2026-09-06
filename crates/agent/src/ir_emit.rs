@@ -586,10 +586,11 @@ mod tests {
             "reason should name the undriven hex: {reason}"
         );
 
+        // Omit bolt_length so kernel bind_independent_bolt_dims cannot rewrite
+        // thread start; the judge must still see the undriven grip.
         let undriven_grip = CadDocument::from_json_value(serde_json::json!({
             "units": "mm",
             "parameters": {
-                "bolt_length": 40.0,
                 "head_height": 5.3,
                 "head_width": 13.0,
                 "dead_height": 8.0
