@@ -248,13 +248,15 @@ export const useCadStore = create<CadStore>((set, get) => ({
     })
     if (!plan) return
 
-    // Unrun / dirty editor: mutate the JSON draft only. Viewport, last-good,
-    // export, and chat stay on the trusted solid (#17 / Cycle 2 / Cycle 4).
+    // Unrun / dirty parseable editor: mutate the JSON draft only. Viewport,
+    // last-good, export, and chat stay on the trusted solid (#17 / Cycle 2 / Cycle 4).
     if (plan.kind === 'editor-only') {
       set({ irCode: plan.nextIrCode })
       return
     }
 
+    // Aligned, or unparseable editor with last-good Outliner fallback: mutate
+    // the visible solid and replace the unusable draft so History matches (Cycle 6).
     get().branchTimeline()
     set({
       irCode: plan.nextIrCode,
@@ -283,6 +285,7 @@ export const useCadStore = create<CadStore>((set, get) => ({
       return
     }
 
+    // Same last-good scene path as hide (Cycle 6 invalid-editor fallback).
     get().branchTimeline()
     const cleaned = name.replace(/\s+/g, ' ').trim()
     set({
@@ -302,12 +305,15 @@ export const useCadStore = create<CadStore>((set, get) => ({
     })
     if (!plan) return
 
-    // Unrun / dirty editor: mutate the JSON draft only. Viewport, last-good,
-    // export, and chat stay on the trusted solid (#17 / Cycle 2).
+    // Unrun / dirty parseable editor: mutate the JSON draft only. Viewport,
+    // last-good, export, and chat stay on the trusted solid (#17 / Cycle 2).
     if (plan.kind === 'editor-only') {
       set({ irCode: plan.nextIrCode })
       return
     }
+
+    // Aligned or unparseable editor + last-good: delete the visible solid and
+    // replace the unusable draft (Cycle 6). Do not leave last-good buttons no-op.
 
     get().branchTimeline()
     const bodies = s.bodies.filter((b) => b.bodyId !== id)

@@ -471,6 +471,18 @@ export function parametersLastGoodNote(opts: {
   return 'JSON editor is empty — showing last calculated parameters.'
 }
 
+/** Outliner lists last-good when the editor cannot parse. Actions apply there. */
+export function outlinerLastGoodNote(opts: {
+  editorKind: EditorTrustKind
+  showingLastGood: boolean
+}): string | null {
+  if (!opts.showingLastGood) return null
+  if (opts.editorKind === 'invalid') {
+    return 'JSON is invalid — showing last calculated bodies. Hide, rename, and delete apply to that model and replace the broken editor.'
+  }
+  return 'JSON editor is empty — showing last calculated bodies. Hide, rename, and delete apply to that model.'
+}
+
 /** Drop one body from the document. Missing id is a no-op (`null`). */
 export function removeBodyFromDocument(doc: CadDocument, bodyId: string): CadDocument | null {
   if (!doc.bodies.some((b) => b.bodyId === bodyId)) return null
@@ -571,26 +583,39 @@ function deletePlanFromDoc(
 }
 
 /**
+ * Which document an Outliner mutate should edit, and whether that is the
+ * visible last-good scene or a parseable editor draft.
+ * Dirty parseable editor stays editor-only (do not loosen Cycles 4–5).
+ * Unparseable editor (invalid / empty) + last-good: apply to the solid the
+ * Outliner already listed, then replace the unusable draft.
+ */
+function planTargetDocument(
+  irCode: string,
+  lastGoodIrCode: string,
+): { doc: CadDocument; kind: 'scene' | 'editor-only' } | null {
+  const current = parseDocumentOrNull(irCode)
+  const lastGood = parseDocumentOrNull(lastGoodIrCode)
+  const aligned = irCode === lastGoodIrCode
+  if (lastGood && aligned) return { doc: lastGood, kind: 'scene' }
+  if (current) return { doc: current, kind: 'editor-only' }
+  if (lastGood) return { doc: lastGood, kind: 'scene' }
+  return null
+}
+
+/**
  * Aligned last-good: delete the solid you see (IR, mesh, metrics, History).
  * Dirty parseable editor: JSON draft only — viewport / last-good stay.
- * Invalid JSON: no-op (cannot parse the editor; do not silently strip the mesh).
+ * Invalid / empty editor: apply to last-good and replace the unusable draft
+ * (Outliner already listed that solid; do not no-op the buttons).
  */
 export function planDeleteBody(opts: {
   irCode: string
   lastGoodIrCode: string
   bodyId: string
 }): DeleteBodyPlan | null {
-  const current = parseDocumentOrNull(opts.irCode)
-  const lastGood = parseDocumentOrNull(opts.lastGoodIrCode)
-  const aligned = opts.irCode === opts.lastGoodIrCode
-
-  if (lastGood && aligned) {
-    return deletePlanFromDoc(lastGood, opts.bodyId, 'scene')
-  }
-  if (current) {
-    return deletePlanFromDoc(current, opts.bodyId, 'editor-only')
-  }
-  return null
+  const target = planTargetDocument(opts.irCode, opts.lastGoodIrCode)
+  if (!target) return null
+  return deletePlanFromDoc(target.doc, opts.bodyId, target.kind)
 }
 
 export function bodyDisplayName(body: { name?: string; bodyId: string }): string {
@@ -657,27 +682,20 @@ function planBodyMetaEdit(
   opts: { irCode: string; lastGoodIrCode: string },
   apply: (doc: CadDocument) => { next: CadDocument; label: string } | null,
 ): BodyMetaPlan | null {
-  const current = parseDocumentOrNull(opts.irCode)
-  const lastGood = parseDocumentOrNull(opts.lastGoodIrCode)
-  const aligned = opts.irCode === opts.lastGoodIrCode
-
-  if (lastGood && aligned) {
-    const result = apply(lastGood)
-    if (!result) return null
+  const target = planTargetDocument(opts.irCode, opts.lastGoodIrCode)
+  if (!target) return null
+  const result = apply(target.doc)
+  if (!result) return null
+  if (target.kind === 'scene') {
     return { kind: 'scene', nextIrCode: prettyDocument(result.next), label: result.label }
   }
-  if (current) {
-    const result = apply(current)
-    if (!result) return null
-    return { kind: 'editor-only', nextIrCode: prettyDocument(result.next) }
-  }
-  return null
+  return { kind: 'editor-only', nextIrCode: prettyDocument(result.next) }
 }
 
 /**
  * Hide/show follow the same last-good vs draft rules as delete.
- * Aligned: viewport + last-good + History. Dirty editor: JSON only.
- * Invalid JSON: no-op (do not hide the last-good mesh while chat still has it).
+ * Aligned: viewport + last-good + History. Dirty parseable editor: JSON only.
+ * Invalid / empty editor: last-good scene (replace the unusable draft).
  */
 export function planSetBodyVisible(opts: {
   irCode: string
@@ -696,8 +714,8 @@ export function planSetBodyVisible(opts: {
 
 /**
  * Rename follows the same last-good vs draft rules as delete.
- * Aligned: viewport + last-good + History. Dirty editor: JSON only.
- * Invalid JSON: no-op.
+ * Aligned: viewport + last-good + History. Dirty parseable editor: JSON only.
+ * Invalid / empty editor: last-good scene (replace the unusable draft).
  */
 export function planRenameBody(opts: {
   irCode: string

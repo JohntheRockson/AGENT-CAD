@@ -25,6 +25,7 @@ import {
   parseDocumentOrNull,
   parseParameterDraft,
   parseSceneJson,
+  outlinerLastGoodNote,
   planDeleteBody,
   planRenameBody,
   planSetBodyVisible,
@@ -578,6 +579,13 @@ function almost(a: number, b: number, eps = 1e-9) {
     parametersLastGoodNote({ editorKind: 'invalid', showingLastGood: true })?.includes('JSON is invalid'),
   )
   assert.equal(parametersLastGoodNote({ editorKind: 'dirty', showingLastGood: false }), null)
+  assert.ok(
+    outlinerLastGoodNote({ editorKind: 'invalid', showingLastGood: true })?.includes('replace the broken editor'),
+  )
+  assert.ok(
+    outlinerLastGoodNote({ editorKind: 'dirty', showingLastGood: true })?.includes('JSON editor is empty'),
+  )
+  assert.equal(outlinerLastGoodNote({ editorKind: 'invalid', showingLastGood: false }), null)
 
   const rewriteEditor = toolbarRewriteConfirmMessage(0, 'dirty')
   assert.ok(rewriteEditor.includes('Unrun JSON editor edits will not be sent'))
@@ -655,15 +663,6 @@ function almost(a: number, b: number, eps = 1e-9) {
   assert.equal(parseDocumentOrNull(editorOnly.nextIrCode)?.bodies[0].bodyId, 'body_b')
   // Viewport / chat / export stay on last-good (still has both bodies).
   assert.ok(documentsAlign(documentForAgent(editorOnly.nextIrCode, aligned)!, twoBody))
-  assert.equal(
-    planDeleteBody({
-      irCode: '{ "bodies": [ }',
-      lastGoodIrCode: aligned,
-      bodyId: 'body_a',
-    }),
-    null,
-    'invalid JSON does not silently strip the mesh',
-  )
   assert.equal(
     planDeleteBody({ irCode: aligned, lastGoodIrCode: aligned, bodyId: 'nope' }),
     null,
@@ -815,46 +814,150 @@ function almost(a: number, b: number, eps = 1e-9) {
   assert.ok(documentsAlign(documentForAgent(renameDraft.nextIrCode, aligned)!, twoBody))
 
   assert.equal(
-    planSetBodyVisible({
-      irCode: '{ "bodies": [ }',
-      lastGoodIrCode: aligned,
-      bodyId: 'body_a',
-      visible: false,
-    }),
-    null,
-    'invalid JSON does not hide the last-good mesh',
-  )
-  assert.equal(
-    planRenameBody({
-      irCode: '{ "bodies": [ }',
-      lastGoodIrCode: aligned,
-      bodyId: 'body_a',
-      name: 'Hex bolt',
-    }),
-    null,
-    'invalid JSON does not rename the last-good solid',
-  )
-  assert.equal(
     planSetBodyVisible({ irCode: aligned, lastGoodIrCode: aligned, bodyId: 'nope', visible: false }),
     null,
   )
 
-  // Cycle 4 delete invariants still hold next to hide/rename.
-  assert.equal(
-    planDeleteBody({
-      irCode: '{ "bodies": [ }',
-      lastGoodIrCode: aligned,
-      bodyId: 'body_a',
-    }),
-    null,
-    'invalid JSON still cannot strip the last-good mesh',
-  )
+  // Cycle 4 dirty-editor delete still stays editor-only (do not loosen).
   const dirtyDelete = planDeleteBody({
     irCode: dirtyIr,
     lastGoodIrCode: aligned,
     bodyId: 'body_a',
   })
   assert.ok(dirtyDelete && dirtyDelete.kind === 'editor-only')
+}
+
+// 12. Invalid / empty editor: Outliner last-good mutate applies to the scene
+{
+  const twoBody = parseSceneJson(JSON.stringify({
+    documentId: 'two',
+    units: 'mm',
+    bodies: [
+      {
+        bodyId: 'body_a',
+        name: 'Bolt',
+        visible: true,
+        features: [{ op: 'box', size: [10, 10, 10] }],
+      },
+      {
+        bodyId: 'body_b',
+        name: 'Nut',
+        visible: true,
+        features: [{ op: 'cylinder', diameter: 8, height: 6 }],
+      },
+    ],
+  }))
+  const aligned = prettyDocument(twoBody)
+  const invalid = '{ "bodies": [ }'
+  const removed = removeBodyFromDocument(twoBody, 'body_a')
+  assert.ok(removed)
+  const hiddenDoc = setBodyVisibleInDocument(twoBody, 'body_a', false)
+  assert.ok(hiddenDoc)
+  const renamedDoc = renameBodyInDocument(twoBody, 'body_a', 'Hex bolt')
+  assert.ok(renamedDoc)
+
+  const invalidDelete = planDeleteBody({
+    irCode: invalid,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+  })
+  assert.ok(invalidDelete && invalidDelete.kind === 'scene', 'invalid JSON applies to last-good')
+  assert.equal(invalidDelete.label, 'Delete Bolt')
+  assert.ok(documentsAlign(parseSceneJson(invalidDelete.nextIrCode), removed))
+  // After the store replaces the unusable draft, chat / export last-good match.
+  assert.ok(
+    documentsAlign(documentForAgent(invalidDelete.nextIrCode, invalidDelete.nextIrCode)!, removed),
+  )
+
+  const emptyDelete = planDeleteBody({
+    irCode: '',
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+  })
+  assert.ok(emptyDelete && emptyDelete.kind === 'scene', 'empty editor applies to last-good')
+  assert.ok(documentsAlign(parseSceneJson(emptyDelete.nextIrCode), removed))
+
+  const invalidHide = planSetBodyVisible({
+    irCode: invalid,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    visible: false,
+  })
+  assert.ok(invalidHide && invalidHide.kind === 'scene')
+  assert.equal(invalidHide.label, 'Hide Bolt')
+  assert.ok(documentsAlign(parseSceneJson(invalidHide.nextIrCode), hiddenDoc))
+  assert.ok(
+    documentsAlign(documentForAgent(invalidHide.nextIrCode, invalidHide.nextIrCode)!, hiddenDoc),
+  )
+
+  const emptyHide = planSetBodyVisible({
+    irCode: '',
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    visible: false,
+  })
+  assert.ok(emptyHide && emptyHide.kind === 'scene')
+  assert.ok(documentsAlign(parseSceneJson(emptyHide.nextIrCode), hiddenDoc))
+
+  const invalidRename = planRenameBody({
+    irCode: invalid,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    name: 'Hex bolt',
+  })
+  assert.ok(invalidRename && invalidRename.kind === 'scene')
+  assert.equal(invalidRename.label, 'Rename Bolt → Hex bolt')
+  assert.ok(documentsAlign(parseSceneJson(invalidRename.nextIrCode), renamedDoc))
+
+  const emptyRename = planRenameBody({
+    irCode: '',
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    name: 'Hex bolt',
+  })
+  assert.ok(emptyRename && emptyRename.kind === 'scene')
+  assert.ok(documentsAlign(parseSceneJson(emptyRename.nextIrCode), renamedDoc))
+
+  assert.equal(
+    planDeleteBody({ irCode: invalid, lastGoodIrCode: '', bodyId: 'body_a' }),
+    null,
+    'invalid JSON with no last-good still no-ops',
+  )
+  assert.equal(
+    planSetBodyVisible({ irCode: invalid, lastGoodIrCode: '', bodyId: 'body_a', visible: false }),
+    null,
+  )
+  assert.equal(
+    planRenameBody({ irCode: invalid, lastGoodIrCode: '', bodyId: 'body_a', name: 'Hex bolt' }),
+    null,
+  )
+  assert.equal(
+    planDeleteBody({ irCode: invalid, lastGoodIrCode: aligned, bodyId: 'nope' }),
+    null,
+  )
+
+  // Dirty parseable editor still cannot touch last-good (Cycles 4–5).
+  const dirtyIr = prettyDocument({
+    ...twoBody,
+    bodies: twoBody.bodies.map((b) =>
+      b.bodyId === 'body_b' ? { ...b, name: 'Nut draft' } : b,
+    ),
+  })
+  const dirtyDelete = planDeleteBody({
+    irCode: dirtyIr,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+  })
+  assert.ok(dirtyDelete && dirtyDelete.kind === 'editor-only')
+  assert.ok(documentsAlign(documentForAgent(dirtyDelete.nextIrCode, aligned)!, twoBody))
+  const dirtyHide = planSetBodyVisible({
+    irCode: dirtyIr,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    visible: false,
+  })
+  assert.ok(dirtyHide && dirtyHide.kind === 'editor-only')
+  assert.ok(documentsAlign(documentForAgent(dirtyHide.nextIrCode, aligned)!, twoBody))
 }
 
 console.log('document.test.ts: all assertions passed')

@@ -72,6 +72,15 @@ assert.equal(
   false,
   'cleared / dirty editor cannot export last-good without a rebuild',
 )
+assert.equal(
+  canDownloadExport({
+    runError: null,
+    irCode: '{ "bodies": [ }',
+    lastGoodIrCode: LAST_GOOD,
+  }).ok,
+  false,
+  'invalid editor still cannot export last-good without a rebuild',
+)
 
 assert.deepEqual(
   canDownloadExport({
