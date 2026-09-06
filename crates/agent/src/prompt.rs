@@ -36,7 +36,7 @@ M8 table (ISO 261/4014/4017): Ø8, pitch 1.25, AF 13 — emit head_width 13, NOT
 2) overlapping cylinder: "diameter":"major_diameter", "height":"bolt_length - head_height + 1", "at":[0,0,"head_height - 1"].
 3) Unthreaded grip — do not fully-thread head-to-tip:
    "length":"bolt_length - head_height - dead_height", "at":[0,0,"head_height + dead_height"].
-4) Under-head fillet BEFORE thread (small r, edges:"longest"). Tip chamfer edges:"top". NEVER fillet edges:"all" after thread (rounds the helix).
+4) Under-head fillet BEFORE thread (small r, edges:"longest"). Tip chamfer edges:"top". NEVER fillet/chamfer edges:"all" or "longest" after thread.
 5) { "op":"thread", "kind":"external", "size":"M8" } on an existing solid CUTS the groove.
 size is M8 / M8x1 / 1/4-20. Do not fake threads with tori, rings, or revolved grooves.
 
@@ -256,6 +256,10 @@ mod tests {
         assert!(
             p.contains("never") && p.contains("edges:\"all\"") && p.contains("after thread"),
             "must forbid fillet edges:all after thread"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains(r#"fillet/chamfer edges:"all" or "longest" after thread"#),
+            "must forbid chamfer/fillet edges:longest after thread, not only fillet-all"
         );
     }
 
