@@ -2284,6 +2284,10 @@ mod tests {
             l.contains("named m8"),
             "repair must bind a named-M8 body to AF 13: {hint}"
         );
+        assert!(
+            l.contains("blank shank") || l.contains("hex+shank"),
+            "repair must reteach named M8 hex+shank needs thread CUT: {hint}"
+        );
         let fake_reason =
             "do not fake threads with helix, torus, or revolve; use thread CUT (kind external, size M8)";
         assert!(
