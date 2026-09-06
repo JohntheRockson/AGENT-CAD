@@ -112,7 +112,8 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 /// Internal taps (plate + tap) are not bolts and are left alone.
 /// A body named bolt *or* screw with tap/internal is rejected.
 /// A body named stud with hex+shank and no Thread op is rejected
-/// (`stud plate` stays unjudged).
+/// (`stud plate` stays unjudged). A box-head named bolt/screw with no
+/// Thread op is rejected (`bolt circle` / `bolt-on` stay unjudged).
 pub fn fastener_recipe_violation(doc: &CadDocument) -> Option<String> {
     for body in &doc.bodies {
         if let Some(reason) =
@@ -242,6 +243,18 @@ fn body_fastener_violation(
         && !body.features.iter().any(is_internal_thread)
     {
         return Some("hex-head bolt, screw, or stud must use external thread CUT".into());
+    }
+    // Box-head named bolt + shank with no Thread op used to fall through
+    // (hex_i is none). Do not treat bolt circle / bolt-on / bolt plate as
+    // fasteners, and do not treat a mere "M8" box+boss as a bolt.
+    if thread_i.is_none()
+        && body_name_is_box_head_bolt(&body.name)
+        && hex_i.is_none()
+        && body.features.iter().any(|f| matches!(f, Feature::Box(_)))
+        && cyl_i.is_some()
+        && !body.features.iter().any(is_internal_thread)
+    {
+        return Some("box-head named bolt or screw must use external thread CUT".into());
     }
     let Some(t) = thread_i else {
         return None;
@@ -760,6 +773,24 @@ fn body_name_is_bolt(name: &str) -> bool {
         || n.contains("hex head")
         || n.contains("hex-head")
         || n.contains("screw")
+}
+
+/// Square/box head + shank named bolt/screw. Exclude bolt circle, bolt-on
+/// mounts, and plate/sheet/bracket so a fixture is not judged as a fastener.
+fn body_name_is_box_head_bolt(name: &str) -> bool {
+    if !body_name_is_bolt(name) {
+        return false;
+    }
+    let n = name.to_ascii_lowercase();
+    for blocked in [
+        "circle", "pattern", "plate", "sheet", "bracket", "bolt-on", "bolton", "jig",
+        "fixture",
+    ] {
+        if n.contains(blocked) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Cycle 32 required bolt/screw. A body named only M8 / M8x40 with hex+shank
@@ -3923,6 +3954,92 @@ mod tests {
         assert!(
             fastener_recipe_violation(&example_m8_bolt_document()).is_none(),
             "golden recipe must still pass"
+        );
+    }
+
+    /// Named bolt + box head + shank with no Thread op used to skip every
+    /// recipe check (hex_i is none). Bolt circle / bolt-on / mere M8 box+boss
+    /// stay unjudged.
+    #[test]
+    fn fastener_rules_named_box_head_bolt_without_thread_fails() {
+        let box_blank = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "box", "size": [13, 13, 5.3], "centered": true },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&box_blank)
+            .expect("named bolt + box + shank with no thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("external") && l.contains("thread"),
+            "reason should require external CUT on box-head named bolt: {reason}"
+        );
+
+        let m8_box_boss = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "M8",
+                "features": [
+                    { "op": "box", "size": [40, 40, 12], "centered": true },
+                    { "op": "cylinder", "diameter": 16, "height": 4, "at": [0, 0, 12] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&m8_box_boss).is_none(),
+            "a mere M8 box + boss is not a named bolt"
+        );
+
+        let bolt_circle = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_jig",
+                "name": "bolt circle",
+                "features": [
+                    { "op": "box", "size": [80, 80, 10], "centered": true },
+                    { "op": "cylinder", "diameter": 20, "height": 8, "at": [0, 0, 10] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&bolt_circle).is_none(),
+            "bolt circle box + boss must stay unjudged"
+        );
+
+        let bolt_on = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_mount",
+                "name": "bolt-on mount",
+                "features": [
+                    { "op": "box", "size": [50, 40, 8], "centered": true },
+                    { "op": "cylinder", "diameter": 12, "height": 16, "at": [0, 0, 8] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&bolt_on).is_none(),
+            "bolt-on mount box + boss must stay unjudged"
         );
     }
 
