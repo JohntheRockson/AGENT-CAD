@@ -1864,3 +1864,149 @@ fn hex_head_z_extent(mesh: &kernel::engine::MeshData, shank_r: f64) -> (f64, f64
         (z0, z1, z1 - z0)
     }
 }
+
+/// Inspector STEP honesty: CARTESIAN_POINTs on the shank must look helical,
+/// not a smooth Ø8 host. Kernel tests previously only checked nonempty + bbox.
+fn step_shank_looks_helical(step: &[u8], z0: f64, z1: f64) -> (bool, String) {
+    let pts = kernel::export::cartesian_points_from_step(step);
+    let shank: Vec<[f64; 3]> = pts
+        .into_iter()
+        .filter(|p| p[2] >= z0 && p[2] <= z1)
+        .filter(|p| {
+            let r = p[0].hypot(p[1]);
+            r > 2.2 && r < 5.25
+        })
+        .collect();
+    if shank.len() < 80 {
+        return (false, format!("too few shank CARTESIAN_POINTs ({})", shank.len()));
+    }
+    let mesh = kernel::engine::MeshData {
+        positions: shank
+            .iter()
+            .flat_map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+            .collect(),
+        normals: vec![],
+        indices: vec![],
+    };
+    let mid = 0.5 * (z0 + z1);
+    let variation = radius_variation_at_z(&mesh, mid, 0.35);
+    let spread = angular_radius_spread_at_z(&mesh, mid, 0.12);
+    let n_yaws = distinct_groove_yaws(&mesh, z0, z1, 12);
+    let ok = variation > 0.08 && spread > 0.25 && n_yaws >= 5;
+    (
+        ok,
+        format!(
+            "STEP shank helix variation={variation:.3} spread={spread:.3} yaws={n_yaws} n={}",
+            mesh.positions.len() / 3
+        ),
+    )
+}
+
+/// Under-head quarter-torus samples: r > Ø8 and z just below the bearing face.
+fn under_head_fillet_r_median_err(
+    mesh: &kernel::engine::MeshData,
+    head_z: f64,
+    r_shank: f64,
+    expected_r: f64,
+) -> Option<(usize, f64)> {
+    let c_r = r_shank + expected_r;
+    let c_z = head_z + expected_r;
+    let mut errs = Vec::new();
+    for chunk in mesh.positions.chunks(3) {
+        if chunk.len() < 3 {
+            continue;
+        }
+        let x = chunk[0] as f64;
+        let y = chunk[1] as f64;
+        let z = chunk[2] as f64;
+        let r = x.hypot(y);
+        if r < r_shank - 0.15 || r > r_shank + expected_r + 0.40 {
+            continue;
+        }
+        if z < head_z - 0.15 || z > head_z + expected_r + 0.40 {
+            continue;
+        }
+        if r <= r_shank + 0.06 || z <= head_z + 0.06 {
+            continue;
+        }
+        let d = (r - c_r).hypot(z - c_z);
+        errs.push((d - expected_r).abs());
+    }
+    if errs.len() < 12 {
+        return None;
+    }
+    errs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some((errs.len(), errs[errs.len() / 2]))
+}
+
+/// Inspector STEP honesty: faceted document STEP must carry the viewport helix,
+/// not merely a nonempty solid in the same AABB as the uncut hex+shank.
+#[test]
+fn golden_m8_document_step_has_helix_not_uncut_host() {
+    let doc = iso_m8_x40_golden_document();
+    let engine = Engine::new();
+    let mesh_out = engine
+        .execute_document(&doc)
+        .expect("golden execute")
+        .into_model_output()
+        .expect("mesh");
+    let step = engine
+        .export_document(&doc, &ExportFormat::Step)
+        .expect("golden document STEP must not WASM-trap");
+    assert_step_is_solid_in_mesh_bbox_family(&step, mesh_out.metrics.bbox, "golden document");
+    let (ok, detail) = step_shank_looks_helical(&step, 12.0, 28.0);
+    assert!(ok, "STEP honesty: {detail}");
+}
+
+/// Under-head fillet on the instanced golden must show R in the viewport mesh.
+/// B-Rep ΔV alone is not look-right: host-cap clip at thread_z0 used to drop
+/// the torus while volume still grew.
+#[test]
+fn m8_instanced_underhead_fillet_is_visible_in_mesh() {
+    let filleted: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": { "hex": { "across_flats": 13 } } },
+            { "op": "extrude", "depth": 5.3 },
+            { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+            { "op": "fillet", "radius": 0.4, "edges": "all" },
+            { "op": "thread", "kind": "external", "size": "M8", "length": 34.7, "at": [0, 0, 5.3] }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let unfilleted = Engine::new()
+        .execute(&golden_m8_x40_program())
+        .expect("unfilleted golden");
+    let out = Engine::new()
+        .execute(&filleted)
+        .expect("fillet + long thread must build");
+    assert_eq!(
+        out.metrics.mesh_provenance,
+        MeshProvenance::InstancedThread,
+        "34.7 mm thread must still instance"
+    );
+    let dv = out.metrics.volume - unfilleted.metrics.volume;
+    assert!(
+        dv > 0.3,
+        "fillet did not add under-head blend in B-Rep: ΔV={dv}"
+    );
+    let (n, err) = under_head_fillet_r_median_err(&out.mesh, 5.3, 4.0, 0.4).unwrap_or_else(|| {
+        panic!(
+            "under-head fillet missing from instanced viewport (ΔV={dv:.3}) — \
+             host-cap clip / strip_thread_envelope ate the blend"
+        )
+    });
+    assert!(
+        err <= 0.35,
+        "under-head R visible but poorly fit: n={n} err={err:.3}"
+    );
+    // Do not regress #22 / sliver / ISO while keeping the blend.
+    let [_, _, zmin, _, _, _] = out.metrics.bbox;
+    assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    assert_iso_v_thread_profile(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    assert_helix_continuous_across_instance_windows(&out.mesh, 1.25, zmin + 8.0, zmin + 36.0);
+    assert_clean_thread_entry(&out.mesh, 4.0, 1.25, zmin + 5.3);
+}

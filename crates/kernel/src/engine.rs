@@ -1668,7 +1668,11 @@ pub(crate) mod occt_backend {
             let thread_z1 = tp.at[2] + tp.length;
             let mut ranges: Vec<(f64, f64)> = Vec::new();
             if thread_z0 - zmin > tp.pitch * 0.15 {
-                ranges.push((zmin - 0.05, thread_z0.min(zmax)));
+                // Under-head fillet is a torus just past the bearing face
+                // (z = thread_z0 + R). Clipping the cap at thread_z0 left
+                // ΔV in B-Rep but no R in the instanced viewport.
+                let keep = underhead_fillet_keep_band(tp.pitch);
+                ranges.push((zmin - 0.05, (thread_z0 + keep).min(zmax)));
             }
             if zmax - thread_z1 > tp.pitch * 0.15 {
                 ranges.push((thread_z1.max(zmin), zmax + 0.05));
@@ -1766,19 +1770,36 @@ pub(crate) mod occt_backend {
         }
     }
 
+    /// A few mm past the bearing face — enough for an under-head R, never a
+    /// long uncut shank (must stay inside the 8-turn cap budget).
+    fn underhead_fillet_keep_band(pitch: f64) -> f64 {
+        (pitch * 1.25).clamp(0.55, 2.0)
+    }
+
     fn strip_thread_envelope(mesh: &MeshData, tp: &ThreadPreview) -> MeshData {
-        let r_max = tp.major * 0.5 + tp.pitch * 0.15;
-        let r2 = (r_max * r_max) as f32;
+        let r_major = tp.major * 0.5;
+        let r_wall = r_major + tp.pitch * 0.15;
+        let r_wall2 = (r_wall * r_wall) as f32;
+        let r_fillet = (r_major + 0.03) as f32;
         let z0 = tp.at[2] as f32;
         let z1 = (tp.at[2] + tp.length) as f32;
+        let z_fillet = z0 + underhead_fillet_keep_band(tp.pitch) as f32;
         let cx = tp.at[0] as f32;
         let cy = tp.at[1] as f32;
-        let in_env = |x: f32, y: f32, z: f32| {
-            z >= z0 - 0.04 && z <= z1 + 0.04 && {
-                let dx = x - cx;
-                let dy = y - cy;
-                dx * dx + dy * dy <= r2
+        // Drop the uncut Ø major wall so instanced rods replace it. Keep
+        // triangles outboard of the cylinder in the under-head band — that
+        // is the fillet torus, not leftover shank.
+        let in_uncut_wall = |x: f32, y: f32, z: f32| {
+            if z < z0 - 0.04 || z > z1 + 0.04 {
+                return false;
             }
+            let dx = x - cx;
+            let dy = y - cy;
+            let r2 = dx * dx + dy * dy;
+            if z <= z_fillet && r2.sqrt() > r_fillet {
+                return false;
+            }
+            r2 <= r_wall2
         };
         filter_triangles(mesh, |mesh, a, b, c| {
             let ax = mesh.positions[a * 3];
@@ -1790,7 +1811,7 @@ pub(crate) mod occt_backend {
             let cx_ = mesh.positions[c * 3];
             let cy_ = mesh.positions[c * 3 + 1];
             let cz = mesh.positions[c * 3 + 2];
-            !in_env((ax + bx + cx_) / 3.0, (ay + by + cy_) / 3.0, (az + bz + cz) / 3.0)
+            !in_uncut_wall((ax + bx + cx_) / 3.0, (ay + by + cy_) / 3.0, (az + bz + cz) / 3.0)
         })
     }
 
