@@ -111,7 +111,9 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 /// A body named bolt *or* screw with tap/internal is rejected.
 pub fn fastener_recipe_violation(doc: &CadDocument) -> Option<String> {
     for body in &doc.bodies {
-        if let Some(reason) = body_fastener_violation(body, &doc.parameters) {
+        if let Some(reason) =
+            body_fastener_violation(body, &doc.parameters, &doc.document_id)
+        {
             return Some(reason);
         }
     }
@@ -121,6 +123,7 @@ pub fn fastener_recipe_violation(doc: &CadDocument) -> Option<String> {
 fn body_fastener_violation(
     body: &kernel::ir::CadBody,
     params: &std::collections::BTreeMap<String, f64>,
+    doc_id: &str,
 ) -> Option<String> {
     let hex_i = body.features.iter().position(is_hex_head);
     let cyl_i = body
@@ -211,7 +214,7 @@ fn body_fastener_violation(
 
     match (hex_i, cyl_i) {
         (Some(h), Some(c)) if h < c && c < t => {
-            bolt_params_drive_hex_and_grip(body, params, h, c, t)
+            bolt_params_drive_hex_and_grip(body, params, h, c, t, doc_id)
         }
         (Some(h), Some(c)) if t < h || t < c => Some(
             "thread-first then fuse a head is rejected; \
@@ -245,6 +248,7 @@ fn bolt_params_drive_hex_and_grip(
     hex_i: usize,
     cyl_i: usize,
     thread_i: usize,
+    doc_id: &str,
 ) -> Option<String> {
     let hex_af = hex_across_flats(&body.features[hex_i]);
     let cyl_d = match &body.features[cyl_i] {
@@ -276,7 +280,11 @@ fn bolt_params_drive_hex_and_grip(
             );
         }
     }
-    let iso_spec = thread_iso_spec(thread, params, &[&body.name, &body.body_id]);
+    let iso_spec = thread_iso_spec(
+        thread,
+        params,
+        &[&body.name, &body.body_id, doc_id],
+    );
     // Cycle 1 only compared head_width to hex when the param was present.
     // size:"M8" + head_width 10 + AF 10 (the old table) still passed — a
     // consistent wrench-size lie. ISO 4014/4017 M8 is AF 13.
@@ -393,7 +401,8 @@ fn bolt_params_drive_hex_and_grip(
 
     // Start can be legal (head + dead) while length still overshoots the tip.
     // Kernel auto-length (0) is 2×D — that can run past a short remaining shank.
-    if let Some(reason) = thread_runs_past_tip(body, params, cyl_i, thread, thread_z) {
+    if let Some(reason) = thread_runs_past_tip(body, params, cyl_i, thread, thread_z, doc_id)
+    {
         return Some(reason);
     }
 
@@ -408,6 +417,7 @@ fn thread_runs_past_tip(
     cyl_i: usize,
     thread: &ThreadOp,
     thread_z: f64,
+    doc_id: &str,
 ) -> Option<String> {
     let tip =
         first_param(params, &["bolt_length", "overall_length", "total_length"]).or_else(|| {
@@ -420,7 +430,11 @@ fn thread_runs_past_tip(
             }
         })?;
 
-    let iso_spec = thread_iso_spec(thread, params, &[&body.name, &body.body_id]);
+    let iso_spec = thread_iso_spec(
+        thread,
+        params,
+        &[&body.name, &body.body_id, doc_id],
+    );
     let major = first_param(
         params,
         &["major_diameter", "shank_diameter", "thread_diameter"],
@@ -489,7 +503,7 @@ fn iso_hex_across_flats_for_spec(spec: Option<&kernel::thread::ThreadSpec>) -> O
 /// `size:"M8"` / `size:"M8x1.25"` parse to the same ISO 261 coarse spec.
 /// When the token is omitted, numeric Ø8 (on the op or in the table) is
 /// still M8 — a pitch lie must not unlock the old AF 10 table.
-/// A body named / id'd M8 (not M80) is the same bind.
+/// A body named / id'd M8, or documentId M8 (not M80), is the same bind.
 fn thread_iso_spec(
     thread: &ThreadOp,
     params: &std::collections::BTreeMap<String, f64>,
@@ -2622,6 +2636,94 @@ mod tests {
         assert!(
             fastener_recipe_violation(&example_m8_bolt_document()).is_none(),
             "golden recipe must still pass"
+        );
+
+        // Cycle 26: leftover IR often keeps documentId m8_bolt while the
+        // body is named Body / body_main — that used to skip the ISO bind.
+        let docid_m8_af10 = CadDocument::from_json_value(serde_json::json!({
+            "documentId": "m8_bolt",
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "dead_height": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 10 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 10, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&docid_m8_af10)
+            .expect("documentId m8_bolt + Body + AF 10 + Ø10 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("8"),
+            "reason should name the documentId-M8 / AF 10 lie: {reason}"
+        );
+
+        let named_screw_ok = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "M8 hex cap screw",
+                "features": hex_cyl_finish(serde_json::json!({
+                    "op": "thread", "kind": "external", "size": "M8",
+                    "length": 26.7, "at": [0, 0, 13.3]
+                }))
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&named_screw_ok).is_none(),
+            "a named screw with the golden external recipe must still pass"
+        );
+
+        let pipe_helix_fake = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "pipe", "diameter": 0.8,
+                      "path": { "helix": { "pitch": 1.25, "height": 26.7,
+                        "radius": 4, "center": [0, 0, 13.3] } } }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&pipe_helix_fake)
+            .expect("hex→cyl→pipe-helix with no Thread op must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("helix") || l.contains("torus") || l.contains("fake"),
+            "reason should name the pipe-helix fake: {reason}"
+        );
+
+        assert!(
+            fastener_recipe_violation(&hex_plate_tap).is_none(),
+            "hex-plate tap must still pass after documentId / pipe-helix checks"
         );
     }
 

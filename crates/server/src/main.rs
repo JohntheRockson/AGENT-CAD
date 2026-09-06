@@ -1385,7 +1385,7 @@ fn fastener_repair_hint(err: &str) -> String {
         || l.contains("grip")
         || l.contains("pitch")
     {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then ONE thread (external) to CUT the helix into that shank — do not emit a second thread. A body named bolt or screw must be external CUT, not tap/internal. Do not fake threads with helix or torus. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. Thread must not run past the tip — length is bolt_length - head_height - dead_height. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted or the body is only named M8 — never the old wrench size of 10. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted; Ø8 is still M8 even if pitch is a lie). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. pitch param must match the ISO token (M8 is 1.25). Fillet under-head before thread. Never fillet after thread (not only edges:\"all\" / \"longest\"). Chamfer the tip after thread edges:\"top\" — not bottom/all/longest; a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" or edges:\"longest\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then ONE thread (external) to CUT the helix into that shank — do not emit a second thread. A body named bolt or screw must be external CUT, not tap/internal. Do not fake threads with helix or torus. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. Thread must not run past the tip — length is bolt_length - head_height - dead_height. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted or the body is only named M8 / documentId M8 — never the old wrench size of 10. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted; Ø8 is still M8 even if pitch is a lie). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. pitch param must match the ISO token (M8 is 1.25). Fillet under-head before thread. Never fillet after thread (not only edges:\"all\" / \"longest\"). Chamfer the tip after thread edges:\"top\" — not bottom/all/longest; a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" or edges:\"longest\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
     } else {
         String::new()
     }
@@ -1706,6 +1706,10 @@ mod tests {
             (lower.contains("named m8") || lower.contains("body named m8"))
                 && lower.contains("af 13"),
             "verify must catch a named-M8 body that keeps AF 10"
+        );
+        assert!(
+            lower.contains("documentid") || lower.contains("document id"),
+            "verify must catch documentId M8 that keeps AF 10"
         );
     }
 
