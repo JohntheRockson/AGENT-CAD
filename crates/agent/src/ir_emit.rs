@@ -128,7 +128,7 @@ fn body_fastener_violation(
         for f in &body.features[t + 1..] {
             match f {
                 Feature::Fillet(FilletOp { edges, .. })
-                    if edges.is_all() || edges_named(edges, "longest") =>
+                    if edges_all_or_longest(edges) =>
                 {
                     return Some(
                         "fillet edges:\"all\" or \"longest\" after thread rounds the helix; \
@@ -137,7 +137,7 @@ fn body_fastener_violation(
                     );
                 }
                 Feature::Chamfer(ChamferOp { edges, .. })
-                    if edges.is_all() || edges_named(edges, "longest") =>
+                    if edges_all_or_longest(edges) =>
                 {
                     return Some(
                         "chamfer edges:\"all\" or \"longest\" after thread wrecks the helix; \
@@ -490,6 +490,12 @@ fn first_param(params: &std::collections::BTreeMap<String, f64>, names: &[&str])
 
 fn edges_named(edges: &EdgeSelection, name: &str) -> bool {
     matches!(edges, EdgeSelection::Named(s) if s.eq_ignore_ascii_case(name))
+}
+
+/// Kernel `is_all` is case-sensitive (`"all"` only). Gemini often emits
+/// `"ALL"` / `"All"`; those still wreck the helix after thread.
+fn edges_all_or_longest(edges: &EdgeSelection) -> bool {
+    edges_named(edges, "all") || edges_named(edges, "longest")
 }
 
 fn is_hex_head(f: &Feature) -> bool {
@@ -846,6 +852,40 @@ mod tests {
         .unwrap();
         let reason = fastener_recipe_violation(&chamfer_all)
             .expect("chamfer-all after thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("chamfer") && l.contains("all"),
+            "reason should name chamfer-all after thread: {reason}"
+        );
+
+        // Kernel is_all() is `"all"` only. edges:"ALL" still cuts the helix.
+        let chamfer_all_caps = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "ALL" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&chamfer_all_caps)
+            .expect("chamfer edges:ALL after thread must fail");
         let l = reason.to_ascii_lowercase();
         assert!(
             l.contains("chamfer") && l.contains("all"),
