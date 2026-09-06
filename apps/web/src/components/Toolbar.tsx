@@ -9,7 +9,7 @@ import {
 } from 'lucide-react'
 import { ExportMenu } from './ExportMenu'
 import { useCadStore } from '../store/useStore'
-import { toolbarRewriteConfirmMessage } from '../lib/document'
+import { editorTrustKind, toolbarRewriteConfirmMessage } from '../lib/document'
 
 // ── Tool definitions ───────────────────────────────────────────────────
 
@@ -91,6 +91,8 @@ export function Toolbar({ showJson, onToggleJson, chatOpen, onToggleChat }: Tool
   const outlinerOpen    = useCadStore((s) => s.outlinerOpen)
   const setOutlinerOpen = useCadStore((s) => s.setOutlinerOpen)
   const uncommittedParameterCount = useCadStore((s) => s.uncommittedParameterCount)
+  const lastGoodIrCode  = useCadStore((s) => s.lastGoodIrCode)
+  const editorKind      = editorTrustKind(irCode, lastGoodIrCode)
 
   const busy = isChatLoading || isRunning
 
@@ -194,9 +196,9 @@ export function Toolbar({ showJson, onToggleJson, chatOpen, onToggleChat }: Tool
               group={group}
               disabled={busy}
               onTool={(prompt) => {
-                if (irCode.trim() || uncommittedParameterCount > 0) {
+                if (irCode.trim() || lastGoodIrCode.trim() || uncommittedParameterCount > 0) {
                   const ok = window.confirm(
-                    toolbarRewriteConfirmMessage(uncommittedParameterCount),
+                    toolbarRewriteConfirmMessage(uncommittedParameterCount, editorKind),
                   )
                   if (!ok) return
                 }

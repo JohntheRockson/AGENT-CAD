@@ -16,11 +16,14 @@ import { runProgram, exportModel, streamChat } from '../lib/api'
 import { EXPORT_KINDS, canDownloadExport, exportFileName, pickSaveTarget, writeSaveTarget } from '../lib/saveFile'
 import {
   applyParameterBatch,
+  documentForAgent,
   parameterBatchHasWork,
   parameterBatchLabel,
+  parseDocumentOrNull,
   parseScene,
   parseSceneJson,
   prettyDocument,
+  workingDocument,
   type ParameterBatch,
 } from '../lib/document'
 import { makeSnapshot, truncateTimelineLabel } from '../lib/timeline'
@@ -28,12 +31,7 @@ import { makeSnapshot, truncateTimelineLabel } from '../lib/timeline'
 const EMPTY_IR = ''
 
 function currentDocument(irCode: string): CadDocument | null {
-  if (!irCode.trim()) return null
-  try {
-    return parseSceneJson(irCode)
-  } catch {
-    return null
-  }
+  return parseDocumentOrNull(irCode)
 }
 
 function applyRunPayload(
@@ -210,7 +208,8 @@ export const useCadStore = create<CadStore>((set, get) => ({
   },
 
   calculateParameters: async (batch) => {
-    const doc = currentDocument(get().irCode)
+    const { irCode, lastGoodIrCode } = get()
+    const doc = workingDocument(irCode, lastGoodIrCode)
     if (!doc) return
     if (!parameterBatchHasWork(doc, batch)) return
     const updated = applyParameterBatch(doc, batch)
@@ -403,9 +402,9 @@ export const useCadStore = create<CadStore>((set, get) => ({
   // ── Chat ─────────────────────────────────────────────────────────────────────
 
   sendChatMessage: async (text) => {
-    const { messages, irCode, selectedBodyId, timeline, timelineIndex } = get()
+    const { messages, irCode, lastGoodIrCode, selectedBodyId, timeline, timelineIndex } = get()
     get().branchTimeline()
-    const document = currentDocument(irCode)
+    const document = documentForAgent(irCode, lastGoodIrCode)
 
     const history = messages
       .filter((m) => m.content.trim())

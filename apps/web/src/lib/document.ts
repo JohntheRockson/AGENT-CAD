@@ -311,21 +311,156 @@ export function uncommittedParameterChatWarning(dirtyCount: number): string {
   return `You have ${n}. The agent will see the last calculated model, not these drafts. Continue?`
 }
 
-export function toolbarRewriteConfirmMessage(dirtyCount: number): string {
+export function toolbarRewriteConfirmMessage(
+  dirtyCount: number,
+  editorKind: EditorTrustKind = 'aligned',
+): string {
   const base =
     'This tool asks the AI to rewrite the current solid, including a loaded golden. Continue?'
-  if (dirtyCount <= 0) return base
-  const n =
-    dirtyCount === 1
-      ? '1 uncommitted parameter change'
-      : `${dirtyCount} uncommitted parameter changes`
-  return `${base}\n\n${n} will not be sent to the agent.`
+  const extras: string[] = []
+  if (dirtyCount > 0) {
+    extras.push(
+      dirtyCount === 1
+        ? '1 uncommitted parameter change will not be sent to the agent.'
+        : `${dirtyCount} uncommitted parameter changes will not be sent to the agent.`,
+    )
+  }
+  if (editorKind === 'invalid') {
+    extras.push('Invalid editor JSON will not be sent — the agent sees the last calculated model.')
+  } else if (editorKind === 'dirty') {
+    extras.push('Unrun JSON editor edits will not be sent — the agent sees the last calculated model.')
+  }
+  if (extras.length === 0) return base
+  return `${base}\n\n${extras.join(' ')}`
 }
 
 export function uncommittedParameterExportNote(dirtyCount: number): string {
   return dirtyCount === 1
     ? '1 uncommitted parameter change — export is the last calculated model'
     : `${dirtyCount} uncommitted parameter changes — export is the last calculated model`
+}
+
+export function parseDocumentOrNull(text: string): CadDocument | null {
+  if (!text.trim()) return null
+  try {
+    return parseSceneJson(text)
+  } catch {
+    return null
+  }
+}
+
+export function documentsAlign(a: CadDocument, b: CadDocument): boolean {
+  return prettyDocument(a) === prettyDocument(b)
+}
+
+export type EditorTrustKind = 'aligned' | 'dirty' | 'invalid' | 'empty'
+
+/**
+ * Editor IR vs last-good (viewport / export). Whitespace-only edits parse
+ * equal after normalize and count as aligned.
+ */
+export function editorTrustKind(irCode: string, lastGoodIrCode: string): EditorTrustKind {
+  const current = parseDocumentOrNull(irCode)
+  const lastGood = parseDocumentOrNull(lastGoodIrCode)
+  if (!irCode.trim()) return lastGood ? 'dirty' : 'empty'
+  if (!current) return lastGood ? 'invalid' : 'empty'
+  if (!lastGood) return 'dirty'
+  return documentsAlign(current, lastGood) ? 'aligned' : 'dirty'
+}
+
+/**
+ * What the agent should see: last calculated document when it exists
+ * (matches viewport / export). Unrun or invalid editor JSON stays local
+ * until Run. Never-run paste falls back to the editor.
+ */
+export function documentForAgent(irCode: string, lastGoodIrCode: string): CadDocument | null {
+  return parseDocumentOrNull(lastGoodIrCode) ?? parseDocumentOrNull(irCode)
+}
+
+/**
+ * Calculate / parameters: use parseable editor JSON so a deliberate
+ * paste can be committed; fall back to last-good so a typo does not
+ * drop drafts or no-op Calculate.
+ */
+export function workingDocument(irCode: string, lastGoodIrCode: string): CadDocument | null {
+  return parseDocumentOrNull(irCode) ?? parseDocumentOrNull(lastGoodIrCode)
+}
+
+export function shouldConfirmChatSend(opts: {
+  editorKind: EditorTrustKind
+  hasLastGood: boolean
+  dirtyParamCount: number
+}): boolean {
+  if (opts.dirtyParamCount > 0) return true
+  if (!opts.hasLastGood) return false
+  return opts.editorKind === 'dirty' || opts.editorKind === 'invalid'
+}
+
+export function chatSendConfirmMessage(opts: {
+  editorKind: EditorTrustKind
+  hasLastGood: boolean
+  dirtyParamCount: number
+}): string {
+  const parts: string[] = []
+  if (opts.dirtyParamCount > 0) {
+    parts.push(
+      opts.dirtyParamCount === 1
+        ? '1 uncommitted parameter change'
+        : `${opts.dirtyParamCount} uncommitted parameter changes`,
+    )
+  }
+  if (opts.hasLastGood && opts.editorKind === 'invalid') {
+    parts.push('invalid JSON in the editor')
+  } else if (opts.hasLastGood && opts.editorKind === 'dirty') {
+    parts.push('unrun JSON editor edits')
+  }
+  const have =
+    parts.length === 0
+      ? 'local edits'
+      : parts.length === 1
+        ? parts[0]!
+        : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`
+  return `You have ${have}. The agent will see the last calculated model (what you see in the viewport), not these drafts. Continue?`
+}
+
+export function chatInputTrustNote(opts: {
+  editorKind: EditorTrustKind
+  hasLastGood: boolean
+  dirtyParamCount: number
+}): string | null {
+  const editor =
+    opts.hasLastGood && opts.editorKind === 'invalid'
+      ? 'JSON is invalid'
+      : opts.hasLastGood && opts.editorKind === 'dirty'
+        ? 'JSON editor does not match the last calculated model'
+        : null
+  if (opts.dirtyParamCount > 0 && editor) {
+    const n =
+      opts.dirtyParamCount === 1
+        ? '1 uncommitted parameter change'
+        : `${opts.dirtyParamCount} uncommitted parameter changes`
+    return `${n} and ${editor.toLowerCase()} — chat uses the last calculated model until Calculate / Run.`
+  }
+  if (editor) {
+    return `${editor} — chat uses the last calculated model until Run.`
+  }
+  if (opts.dirtyParamCount > 0) {
+    return opts.dirtyParamCount === 1
+      ? '1 uncommitted parameter change — chat uses the last calculated model until Calculate.'
+      : `${opts.dirtyParamCount} uncommitted parameter changes — chat uses the last calculated model until Calculate.`
+  }
+  return null
+}
+
+export function parametersLastGoodNote(opts: {
+  editorKind: EditorTrustKind
+  showingLastGood: boolean
+}): string | null {
+  if (!opts.showingLastGood) return null
+  if (opts.editorKind === 'invalid') {
+    return 'JSON is invalid — showing last calculated parameters. Fix or Run to use the editor.'
+  }
+  return 'JSON editor is empty — showing last calculated parameters.'
 }
 
 /** Scale numbers that match common ratios of the old parameter (hex vertices, halves). */

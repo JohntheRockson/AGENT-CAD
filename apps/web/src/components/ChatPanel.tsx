@@ -5,7 +5,12 @@ import {
   CheckCircle2, XCircle,
 } from 'lucide-react'
 import { useCadStore } from '../store/useStore'
-import { uncommittedParameterChatWarning } from '../lib/document'
+import {
+  chatInputTrustNote,
+  chatSendConfirmMessage,
+  editorTrustKind,
+  shouldConfirmChatSend,
+} from '../lib/document'
 import type { ActivityKind, ActivityStep, VerificationCheck } from '../types/cad'
 
 // ── Suggestion chips ──────────────────────────────────────────────────
@@ -30,8 +35,17 @@ export function ChatPanel() {
   const selectedBodyId  = useCadStore((s) => s.selectedBodyId)
   const selectBody      = useCadStore((s) => s.selectBody)
   const uncommittedParameterCount = useCadStore((s) => s.uncommittedParameterCount)
+  const irCode          = useCadStore((s) => s.irCode)
+  const lastGoodIrCode  = useCadStore((s) => s.lastGoodIrCode)
 
   const selected = bodies.find((b) => b.bodyId === selectedBodyId)
+  const editorKind = editorTrustKind(irCode, lastGoodIrCode)
+  const hasLastGood = !!lastGoodIrCode.trim()
+  const trustNote = chatInputTrustNote({
+    editorKind,
+    hasLastGood,
+    dirtyParamCount: uncommittedParameterCount,
+  })
 
   const [draft, setDraft] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -49,8 +63,16 @@ export function ChatPanel() {
   const handleSend = () => {
     const text = draft.trim()
     if (!text || isChatLoading || isRunning) return
-    if (uncommittedParameterCount > 0) {
-      if (!window.confirm(uncommittedParameterChatWarning(uncommittedParameterCount))) return
+    if (shouldConfirmChatSend({
+      editorKind,
+      hasLastGood,
+      dirtyParamCount: uncommittedParameterCount,
+    })) {
+      if (!window.confirm(chatSendConfirmMessage({
+        editorKind,
+        hasLastGood,
+        dirtyParamCount: uncommittedParameterCount,
+      }))) return
     }
     setDraft('')
     sendChatMessage(text)
@@ -174,11 +196,9 @@ export function ChatPanel() {
       <div className="border-t border-border p-2.5 space-y-2 flex-shrink-0">
 
         {/* Body scope chip */}
-        {uncommittedParameterCount > 0 && (
+        {trustNote && (
           <p className="px-1 text-[10px] text-yellow-400/90 leading-snug">
-            {uncommittedParameterCount} uncommitted parameter
-            {uncommittedParameterCount === 1 ? ' change' : ' changes'} — chat uses the last
-            calculated model until Calculate.
+            {trustNote}
           </p>
         )}
 

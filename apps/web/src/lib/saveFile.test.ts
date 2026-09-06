@@ -37,5 +37,6 @@ assert.deepEqual(
   { ok: true },
 )
 // Panel Calculate drafts do not mutate IR — export stays last-good when IR matches.
+// Dirty / invalid editor JSON still fails the string last-good gate (do not loosen).
 
 console.log('saveFile.test.ts: all assertions passed')

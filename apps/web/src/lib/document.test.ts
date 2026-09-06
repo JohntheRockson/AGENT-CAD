@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict'
 import {
   applyParameterBatch,
+  chatInputTrustNote,
+  chatSendConfirmMessage,
   collectParameterBatch,
   committedParametersSignature,
   countUncommittedParameters,
+  documentForAgent,
+  documentsAlign,
+  editorTrustKind,
   explicitParameterNames,
   inferBoltParameters,
   isExplicitParameter,
@@ -11,16 +16,20 @@ import {
   parameterBatchHasWork,
   parameterBatchLabel,
   parameterEntries,
+  parametersLastGoodNote,
+  parseDocumentOrNull,
   parseParameterDraft,
   parseSceneJson,
   prettyDocument,
   reconcileParameterDrafts,
   resolvedParameters,
   setDocumentParameter,
+  shouldConfirmChatSend,
   sliderBounds,
   toolbarRewriteConfirmMessage,
   uncommittedParameterChatWarning,
   uncommittedParameterExportNote,
+  workingDocument,
 } from './document.ts'
 import type { CadDocument, CylinderOp, ExtrudeOp, Feature, ThreadOp } from '../types/cad.ts'
 
@@ -460,6 +469,107 @@ function almost(a: number, b: number, eps = 1e-9) {
     }),
     3,
   )
+}
+
+// 9. Chat / Calculate use last-good when editor JSON is dirty or invalid
+{
+  const lastGood = prettyDocument(parseSceneJson(goldenM8NoParams()))
+  const dirty = prettyDocument(parseSceneJson(goldenM8NoParams({ cylHeight: 99 })))
+  const invalid = '{ "bodies": [ }'
+  const spaced = `  ${lastGood}  \n`
+
+  assert.equal(editorTrustKind(lastGood, lastGood), 'aligned')
+  assert.equal(editorTrustKind(spaced, lastGood), 'aligned', 'whitespace-only stays aligned')
+  assert.equal(editorTrustKind(dirty, lastGood), 'dirty')
+  assert.equal(editorTrustKind(invalid, lastGood), 'invalid')
+  assert.equal(editorTrustKind('', lastGood), 'dirty', 'cleared editor is dirty vs last-good')
+  assert.equal(editorTrustKind(dirty, ''), 'dirty')
+  assert.equal(editorTrustKind('', ''), 'empty')
+  assert.equal(editorTrustKind('{', ''), 'empty')
+
+  assert.ok(documentsAlign(parseSceneJson(lastGood), parseSceneJson(spaced)))
+  assert.equal(parseDocumentOrNull(invalid), null)
+
+  // Agent always sees last-good when it exists (viewport / export truth).
+  assert.ok(documentsAlign(documentForAgent(dirty, lastGood)!, parseSceneJson(lastGood)))
+  assert.ok(documentsAlign(documentForAgent(invalid, lastGood)!, parseSceneJson(lastGood)))
+  assert.ok(documentsAlign(documentForAgent('', lastGood)!, parseSceneJson(lastGood)))
+  assert.ok(documentsAlign(documentForAgent(lastGood, lastGood)!, parseSceneJson(lastGood)))
+  assert.equal(documentForAgent(invalid, ''), null)
+  assert.ok(documentsAlign(documentForAgent(dirty, '')!, parseSceneJson(dirty)))
+
+  // Calculate prefers parseable editor JSON; typo falls back to last-good.
+  assert.ok(documentsAlign(workingDocument(dirty, lastGood)!, parseSceneJson(dirty)))
+  assert.ok(documentsAlign(workingDocument(invalid, lastGood)!, parseSceneJson(lastGood)))
+  assert.ok(documentsAlign(workingDocument('', lastGood)!, parseSceneJson(lastGood)))
+
+  assert.equal(
+    shouldConfirmChatSend({ editorKind: 'aligned', hasLastGood: true, dirtyParamCount: 0 }),
+    false,
+  )
+  assert.equal(
+    shouldConfirmChatSend({ editorKind: 'dirty', hasLastGood: true, dirtyParamCount: 0 }),
+    true,
+  )
+  assert.equal(
+    shouldConfirmChatSend({ editorKind: 'invalid', hasLastGood: true, dirtyParamCount: 0 }),
+    true,
+  )
+  assert.equal(
+    shouldConfirmChatSend({ editorKind: 'dirty', hasLastGood: false, dirtyParamCount: 0 }),
+    false,
+    'never-run paste does not confirm',
+  )
+  assert.equal(
+    shouldConfirmChatSend({ editorKind: 'aligned', hasLastGood: true, dirtyParamCount: 1 }),
+    true,
+  )
+
+  const dirtyConfirm = chatSendConfirmMessage({
+    editorKind: 'dirty',
+    hasLastGood: true,
+    dirtyParamCount: 0,
+  })
+  assert.ok(dirtyConfirm.includes('unrun JSON editor edits'))
+  assert.ok(dirtyConfirm.includes('last calculated model'))
+  const bothConfirm = chatSendConfirmMessage({
+    editorKind: 'invalid',
+    hasLastGood: true,
+    dirtyParamCount: 2,
+  })
+  assert.ok(bothConfirm.includes('2 uncommitted parameter changes'))
+  assert.ok(bothConfirm.includes('invalid JSON'))
+
+  assert.ok(
+    chatInputTrustNote({
+      editorKind: 'aligned',
+      hasLastGood: true,
+      dirtyParamCount: 1,
+    })?.includes('last calculated model until Calculate'),
+  )
+  assert.ok(
+    chatInputTrustNote({
+      editorKind: 'dirty',
+      hasLastGood: true,
+      dirtyParamCount: 0,
+    })?.includes('until Run'),
+  )
+  assert.equal(
+    chatInputTrustNote({
+      editorKind: 'dirty',
+      hasLastGood: false,
+      dirtyParamCount: 0,
+    }),
+    null,
+  )
+  assert.ok(
+    parametersLastGoodNote({ editorKind: 'invalid', showingLastGood: true })?.includes('JSON is invalid'),
+  )
+  assert.equal(parametersLastGoodNote({ editorKind: 'dirty', showingLastGood: false }), null)
+
+  const rewriteEditor = toolbarRewriteConfirmMessage(0, 'dirty')
+  assert.ok(rewriteEditor.includes('Unrun JSON editor edits will not be sent'))
+  assert.ok(toolbarRewriteConfirmMessage(1, 'invalid').includes('Invalid editor JSON'))
 }
 
 console.log('document.test.ts: all assertions passed')

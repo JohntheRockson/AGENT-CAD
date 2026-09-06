@@ -10,16 +10,19 @@ import {
   isExplicitParameter,
   parameterAllowsZero,
   parameterEntries,
+  parseDocumentOrNull,
   parseParameterDraft,
-  parseSceneJson,
+  parametersLastGoodNote,
   reconcileParameterDrafts,
   sameParameterValue,
   sliderBounds,
   unitSuffix,
+  editorTrustKind,
 } from '../lib/document'
 
 export function ParametersPanel() {
   const irCode              = useCadStore((s) => s.irCode)
+  const lastGoodIrCode      = useCadStore((s) => s.lastGoodIrCode)
   const isRunning           = useCadStore((s) => s.isRunning)
   const isChatLoading       = useCadStore((s) => s.isChatLoading)
   const timeline            = useCadStore((s) => s.timeline)
@@ -32,13 +35,14 @@ export function ParametersPanel() {
   const [pendingDeletes, setPendingDeletes] = useState<string[]>([])
   const [committedSig, setCommittedSig] = useState('')
 
-  const doc = useMemo(() => {
-    try {
-      return irCode.trim() ? parseSceneJson(irCode) : null
-    } catch {
-      return null
-    }
-  }, [irCode])
+  const parsedCurrent = useMemo(() => parseDocumentOrNull(irCode), [irCode])
+  const doc = useMemo(
+    () => parsedCurrent ?? parseDocumentOrNull(lastGoodIrCode),
+    [parsedCurrent, lastGoodIrCode],
+  )
+  const editorKind = editorTrustKind(irCode, lastGoodIrCode)
+  const showingLastGood = !parsedCurrent && !!doc
+  const lastGoodNote = parametersLastGoodNote({ editorKind, showingLastGood })
 
   const entries = doc ? parameterEntries(doc) : []
   const explicitNames = doc ? explicitParameterNames(doc) : []
@@ -151,6 +155,11 @@ export function ParametersPanel() {
       {!atTip && (
         <p className="px-2.5 py-1.5 text-[10px] text-yellow-400/90 border-b border-border leading-snug">
           Historical step — edits branch from here and replace later timeline.
+        </p>
+      )}
+      {lastGoodNote && (
+        <p className="px-2.5 py-1.5 text-[10px] text-yellow-400/90 border-b border-border leading-snug">
+          {lastGoodNote}
         </p>
       )}
 
