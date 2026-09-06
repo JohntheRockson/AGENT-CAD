@@ -16,6 +16,10 @@
 # actions/checkout@v5 and actions/setup-node@v5 are the Node 24 action
 # runtime (v4 is Node 20, deprecated / removed from runners mid-Sept 2026).
 # apps/web still installs Node 22 below — that is the project toolchain.
+#
+# Every cargo invocation uses --locked so a stale Cargo.lock cannot go green.
+# Root workspace lock for kernel/agent/server; tests/reports/Cargo.lock for
+# the inspector (nested workspace). npm ci already fails on a stale package-lock.
 
 name: CI
 
@@ -53,13 +57,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: kernel lib tests (mock — not OCCT)
-        run: cargo test -p kernel --lib
+        run: cargo test --locked -p kernel --lib
 
       - name: kernel ir tests (mock — not OCCT)
-        run: cargo test -p kernel --test ir_tests
+        run: cargo test --locked -p kernel --test ir_tests
 
       - name: agent tests
-        run: cargo test -p agent
+        run: cargo test --locked -p agent
 
       # Look-right acceptance (synthetic helix / smooth-rod / STEP / fillet).
       # No OCCT — the golden job still runs the inspector binary with --features occt.
@@ -103,13 +107,13 @@ jobs:
       # Default features include `occt` (see crates/server/Cargo.toml).
       # Do not pass --no-default-features — that would be mock-only.
       - name: cargo build -p server --release (links occt)
-        run: cargo build -p server --release
+        run: cargo build --locked -p server --release
 
       # Same default occt features as the release binary above. Unit tests live
       # in src/main.rs and src/preview.rs (verify prompt, fastener recipe, SSE
       # keep-document, mesh-component count). No GEMINI_KEY / network.
       - name: cargo test -p server --release
-        run: cargo test -p server --release
+        run: cargo test --locked -p server --release
 
   occt-golden:
     name: OCCT golden M8 STEP/STL
@@ -130,7 +134,7 @@ jobs:
       # asserts (25s). Do not loosen those helix/timing checks in the tests.
       - name: kernel OCCT geometry tests (release)
         id: occt-geometry
-        run: cargo test --release -p kernel --features occt --test occt_geometry
+        run: cargo test --locked --release -p kernel --features occt --test occt_geometry
 
       # Golden M8 + STEP/STL honesty via tests/reports inspector.
       # if: always() so STEP/STL still reports when a prior geometry test fails.
@@ -140,7 +144,7 @@ jobs:
         if: always() && !cancelled()
         run: |
           set +e
-          cargo run --release --manifest-path tests/reports/Cargo.toml --features occt \
+          cargo run --locked --release --manifest-path tests/reports/Cargo.toml --features occt \
             > "${RUNNER_TEMP}/inspector.out"
           inspector_rc=$?
           set -e
