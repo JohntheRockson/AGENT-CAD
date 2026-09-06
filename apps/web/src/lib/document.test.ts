@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import {
   applyParameterBatch,
+  bodyDisplayName,
   chatInputTrustNote,
   chatSendConfirmMessage,
   collectParameterBatch,
@@ -11,6 +12,7 @@ import {
   documentsAlign,
   editorTrustKind,
   explicitParameterNames,
+  hideShowTimelineLabel,
   inferBoltParameters,
   irAfterBodyRemoval,
   isExplicitParameter,
@@ -24,10 +26,15 @@ import {
   parseParameterDraft,
   parseSceneJson,
   planDeleteBody,
+  planRenameBody,
+  planSetBodyVisible,
   prettyDocument,
   reconcileParameterDrafts,
   removeBodyFromDocument,
+  renameBodyInDocument,
+  renameBodyTimelineLabel,
   resolvedParameters,
+  setBodyVisibleInDocument,
   setDocumentParameter,
   shouldConfirmChatSend,
   sliderBounds,
@@ -696,6 +703,158 @@ function almost(a: number, b: number, eps = 1e-9) {
   almost(combined!.surface_area, 9)
   assert.equal(combined!.is_solid, false)
   assert.deepEqual(combined!.bbox, [-1, 0, 0, 2, 4, 3])
+}
+
+// 11. Hide / rename: History when aligned; dirty editor does not hide the solid
+{
+  const twoBody = parseSceneJson(JSON.stringify({
+    documentId: 'two',
+    units: 'mm',
+    bodies: [
+      {
+        bodyId: 'body_a',
+        name: 'Bolt',
+        visible: true,
+        features: [{ op: 'box', size: [10, 10, 10] }],
+      },
+      {
+        bodyId: 'body_b',
+        name: 'Nut',
+        visible: true,
+        features: [{ op: 'cylinder', diameter: 8, height: 6 }],
+      },
+    ],
+  }))
+  const aligned = prettyDocument(twoBody)
+
+  assert.equal(bodyDisplayName({ name: '  Bolt  ', bodyId: 'body_a' }), 'Bolt')
+  assert.equal(hideShowTimelineLabel('Bolt', false), 'Hide Bolt')
+  assert.equal(hideShowTimelineLabel('Bolt', true), 'Show Bolt')
+  assert.equal(renameBodyTimelineLabel('Bolt', 'Hex bolt'), 'Rename Bolt → Hex bolt')
+  assert.equal(renameBodyTimelineLabel('  ', 'x'), 'Rename body → x')
+
+  const hiddenDoc = setBodyVisibleInDocument(twoBody, 'body_a', false)
+  assert.ok(hiddenDoc)
+  assert.equal(hiddenDoc.bodies.find((b) => b.bodyId === 'body_a')?.visible, false)
+  assert.equal(twoBody.bodies.find((b) => b.bodyId === 'body_a')?.visible, true, 'source not mutated')
+  assert.equal(setBodyVisibleInDocument(twoBody, 'body_a', true), null, 'already visible')
+  assert.equal(setBodyVisibleInDocument(twoBody, 'missing', false), null)
+
+  const renamedDoc = renameBodyInDocument(twoBody, 'body_a', '  Hex bolt  ')
+  assert.ok(renamedDoc)
+  assert.equal(renamedDoc.bodies.find((b) => b.bodyId === 'body_a')?.name, 'Hex bolt')
+  assert.equal(twoBody.bodies.find((b) => b.bodyId === 'body_a')?.name, 'Bolt')
+  assert.equal(renameBodyInDocument(twoBody, 'body_a', 'Bolt'), null)
+  assert.equal(renameBodyInDocument(twoBody, 'body_a', '   '), null)
+  assert.equal(renameBodyInDocument(twoBody, 'missing', 'X'), null)
+
+  const hideScene = planSetBodyVisible({
+    irCode: aligned,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    visible: false,
+  })
+  assert.ok(hideScene && hideScene.kind === 'scene')
+  assert.equal(hideScene.label, 'Hide Bolt')
+  assert.ok(documentsAlign(parseSceneJson(hideScene.nextIrCode), hiddenDoc))
+  // Chat / export last-good after an aligned hide is the hidden solid.
+  assert.ok(
+    documentsAlign(documentForAgent(hideScene.nextIrCode, hideScene.nextIrCode)!, hiddenDoc),
+  )
+
+  const showScene = planSetBodyVisible({
+    irCode: hideScene.nextIrCode,
+    lastGoodIrCode: hideScene.nextIrCode,
+    bodyId: 'body_a',
+    visible: true,
+  })
+  assert.ok(showScene && showScene.kind === 'scene')
+  assert.equal(showScene.label, 'Show Bolt')
+
+  const renameScene = planRenameBody({
+    irCode: aligned,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    name: 'Hex bolt',
+  })
+  assert.ok(renameScene && renameScene.kind === 'scene')
+  assert.equal(renameScene.label, 'Rename Bolt → Hex bolt')
+  assert.ok(documentsAlign(parseSceneJson(renameScene.nextIrCode), renamedDoc))
+
+  const dirtyIr = prettyDocument({
+    ...twoBody,
+    bodies: twoBody.bodies.map((b) =>
+      b.bodyId === 'body_b' ? { ...b, name: 'Nut draft' } : b,
+    ),
+  })
+  assert.notEqual(dirtyIr, aligned)
+
+  const hideDraft = planSetBodyVisible({
+    irCode: dirtyIr,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    visible: false,
+  })
+  assert.ok(hideDraft && hideDraft.kind === 'editor-only')
+  assert.equal(parseDocumentOrNull(hideDraft.nextIrCode)?.bodies.find((b) => b.bodyId === 'body_a')?.visible, false)
+  // Viewport / chat / export stay on last-good (Bolt still visible).
+  assert.ok(documentsAlign(documentForAgent(hideDraft.nextIrCode, aligned)!, twoBody))
+  assert.equal(
+    parseDocumentOrNull(aligned)?.bodies.find((b) => b.bodyId === 'body_a')?.visible !== false,
+    true,
+  )
+
+  const renameDraft = planRenameBody({
+    irCode: dirtyIr,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    name: 'Hex bolt',
+  })
+  assert.ok(renameDraft && renameDraft.kind === 'editor-only')
+  assert.equal(parseDocumentOrNull(renameDraft.nextIrCode)?.bodies.find((b) => b.bodyId === 'body_a')?.name, 'Hex bolt')
+  assert.ok(documentsAlign(documentForAgent(renameDraft.nextIrCode, aligned)!, twoBody))
+
+  assert.equal(
+    planSetBodyVisible({
+      irCode: '{ "bodies": [ }',
+      lastGoodIrCode: aligned,
+      bodyId: 'body_a',
+      visible: false,
+    }),
+    null,
+    'invalid JSON does not hide the last-good mesh',
+  )
+  assert.equal(
+    planRenameBody({
+      irCode: '{ "bodies": [ }',
+      lastGoodIrCode: aligned,
+      bodyId: 'body_a',
+      name: 'Hex bolt',
+    }),
+    null,
+    'invalid JSON does not rename the last-good solid',
+  )
+  assert.equal(
+    planSetBodyVisible({ irCode: aligned, lastGoodIrCode: aligned, bodyId: 'nope', visible: false }),
+    null,
+  )
+
+  // Cycle 4 delete invariants still hold next to hide/rename.
+  assert.equal(
+    planDeleteBody({
+      irCode: '{ "bodies": [ }',
+      lastGoodIrCode: aligned,
+      bodyId: 'body_a',
+    }),
+    null,
+    'invalid JSON still cannot strip the last-good mesh',
+  )
+  const dirtyDelete = planDeleteBody({
+    irCode: dirtyIr,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+  })
+  assert.ok(dirtyDelete && dirtyDelete.kind === 'editor-only')
 }
 
 console.log('document.test.ts: all assertions passed')

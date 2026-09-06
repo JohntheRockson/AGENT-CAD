@@ -593,6 +593,131 @@ export function planDeleteBody(opts: {
   return null
 }
 
+export function bodyDisplayName(body: { name?: string; bodyId: string }): string {
+  const cleaned = (body.name || body.bodyId).replace(/\s+/g, ' ').trim()
+  return cleaned || 'body'
+}
+
+/** No-op when the id is missing or visibility is already the requested value. */
+export function setBodyVisibleInDocument(
+  doc: CadDocument,
+  bodyId: string,
+  visible: boolean,
+): CadDocument | null {
+  const body = doc.bodies.find((b) => b.bodyId === bodyId)
+  if (!body) return null
+  const current = body.visible !== false
+  if (current === visible) return null
+  return {
+    ...doc,
+    bodies: doc.bodies.map((b) => (b.bodyId === bodyId ? { ...b, visible } : b)),
+  }
+}
+
+/** No-op when the id is missing, the name is empty, or it already matches. */
+export function renameBodyInDocument(
+  doc: CadDocument,
+  bodyId: string,
+  name: string,
+): CadDocument | null {
+  const cleaned = name.replace(/\s+/g, ' ').trim()
+  if (!cleaned) return null
+  const body = doc.bodies.find((b) => b.bodyId === bodyId)
+  if (!body) return null
+  if (bodyDisplayName(body) === cleaned) return null
+  return {
+    ...doc,
+    bodies: doc.bodies.map((b) => (b.bodyId === bodyId ? { ...b, name: cleaned } : b)),
+  }
+}
+
+export function hideShowTimelineLabel(name: string, visible: boolean): string {
+  const cleaned = name.replace(/\s+/g, ' ').trim() || 'body'
+  return visible ? `Show ${cleaned}` : `Hide ${cleaned}`
+}
+
+export function renameBodyTimelineLabel(from: string, to: string): string {
+  const a = from.replace(/\s+/g, ' ').trim() || 'body'
+  const b = to.replace(/\s+/g, ' ').trim() || 'body'
+  return `Rename ${a} → ${b}`
+}
+
+export type BodyMetaPlan =
+  | {
+      kind: 'scene'
+      nextIrCode: string
+      label: string
+    }
+  | {
+      kind: 'editor-only'
+      nextIrCode: string
+    }
+
+function planBodyMetaEdit(
+  opts: { irCode: string; lastGoodIrCode: string },
+  apply: (doc: CadDocument) => { next: CadDocument; label: string } | null,
+): BodyMetaPlan | null {
+  const current = parseDocumentOrNull(opts.irCode)
+  const lastGood = parseDocumentOrNull(opts.lastGoodIrCode)
+  const aligned = opts.irCode === opts.lastGoodIrCode
+
+  if (lastGood && aligned) {
+    const result = apply(lastGood)
+    if (!result) return null
+    return { kind: 'scene', nextIrCode: prettyDocument(result.next), label: result.label }
+  }
+  if (current) {
+    const result = apply(current)
+    if (!result) return null
+    return { kind: 'editor-only', nextIrCode: prettyDocument(result.next) }
+  }
+  return null
+}
+
+/**
+ * Hide/show follow the same last-good vs draft rules as delete.
+ * Aligned: viewport + last-good + History. Dirty editor: JSON only.
+ * Invalid JSON: no-op (do not hide the last-good mesh while chat still has it).
+ */
+export function planSetBodyVisible(opts: {
+  irCode: string
+  lastGoodIrCode: string
+  bodyId: string
+  visible: boolean
+}): BodyMetaPlan | null {
+  return planBodyMetaEdit(opts, (doc) => {
+    const next = setBodyVisibleInDocument(doc, opts.bodyId, opts.visible)
+    if (!next) return null
+    const body = doc.bodies.find((b) => b.bodyId === opts.bodyId)
+    if (!body) return null
+    return { next, label: hideShowTimelineLabel(bodyDisplayName(body), opts.visible) }
+  })
+}
+
+/**
+ * Rename follows the same last-good vs draft rules as delete.
+ * Aligned: viewport + last-good + History. Dirty editor: JSON only.
+ * Invalid JSON: no-op.
+ */
+export function planRenameBody(opts: {
+  irCode: string
+  lastGoodIrCode: string
+  bodyId: string
+  name: string
+}): BodyMetaPlan | null {
+  return planBodyMetaEdit(opts, (doc) => {
+    const next = renameBodyInDocument(doc, opts.bodyId, opts.name)
+    if (!next) return null
+    const body = doc.bodies.find((b) => b.bodyId === opts.bodyId)
+    if (!body) return null
+    const renamed = next.bodies.find((b) => b.bodyId === opts.bodyId)
+    return {
+      next,
+      label: renameBodyTimelineLabel(bodyDisplayName(body), bodyDisplayName(renamed ?? body)),
+    }
+  })
+}
+
 /** Scale numbers that match common ratios of the old parameter (hex vertices, halves). */
 function scaleLike(v: number, oldVal: number, newVal: number, key?: string): number | null {
   const tol = numberTol(oldVal)

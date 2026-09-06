@@ -24,6 +24,8 @@ import {
   parseScene,
   parseSceneJson,
   planDeleteBody,
+  planRenameBody,
+  planSetBodyVisible,
   prettyDocument,
   workingDocument,
   type ParameterBatch,
@@ -237,15 +239,29 @@ export const useCadStore = create<CadStore>((set, get) => ({
   setOutlinerOpen: (open) => set({ outlinerOpen: open }),
 
   setBodyVisible: (id, visible) => {
-    const doc = currentDocument(get().irCode)
-    if (!doc) return
-    doc.bodies = doc.bodies.map((b) => (b.bodyId === id ? { ...b, visible } : b))
-    const nextIr = prettyDocument(doc)
-    set({
-      irCode: nextIr,
-      lastGoodIrCode: get().lastGoodIrCode === get().irCode ? nextIr : get().lastGoodIrCode,
-      bodies: get().bodies.map((b) => (b.bodyId === id ? { ...b, visible } : b)),
+    const s = get()
+    const plan = planSetBodyVisible({
+      irCode: s.irCode,
+      lastGoodIrCode: s.lastGoodIrCode,
+      bodyId: id,
+      visible,
     })
+    if (!plan) return
+
+    // Unrun / dirty editor: mutate the JSON draft only. Viewport, last-good,
+    // export, and chat stay on the trusted solid (#17 / Cycle 2 / Cycle 4).
+    if (plan.kind === 'editor-only') {
+      set({ irCode: plan.nextIrCode })
+      return
+    }
+
+    get().branchTimeline()
+    set({
+      irCode: plan.nextIrCode,
+      lastGoodIrCode: plan.nextIrCode,
+      bodies: s.bodies.map((b) => (b.bodyId === id ? { ...b, visible } : b)),
+    })
+    get().pushTimelineSnapshot(plan.label, 'manual')
   },
 
   isolateBody: (id) => {
@@ -253,15 +269,28 @@ export const useCadStore = create<CadStore>((set, get) => ({
   },
 
   renameBody: (id, name) => {
-    const doc = currentDocument(get().irCode)
-    if (!doc) return
-    doc.bodies = doc.bodies.map((b) => (b.bodyId === id ? { ...b, name } : b))
-    const nextIr = prettyDocument(doc)
-    set({
-      irCode: nextIr,
-      lastGoodIrCode: get().lastGoodIrCode === get().irCode ? nextIr : get().lastGoodIrCode,
-      bodies: get().bodies.map((b) => (b.bodyId === id ? { ...b, name } : b)),
+    const s = get()
+    const plan = planRenameBody({
+      irCode: s.irCode,
+      lastGoodIrCode: s.lastGoodIrCode,
+      bodyId: id,
+      name,
     })
+    if (!plan) return
+
+    if (plan.kind === 'editor-only') {
+      set({ irCode: plan.nextIrCode })
+      return
+    }
+
+    get().branchTimeline()
+    const cleaned = name.replace(/\s+/g, ' ').trim()
+    set({
+      irCode: plan.nextIrCode,
+      lastGoodIrCode: plan.nextIrCode,
+      bodies: s.bodies.map((b) => (b.bodyId === id ? { ...b, name: cleaned } : b)),
+    })
+    get().pushTimelineSnapshot(plan.label, 'manual')
   },
 
   deleteBody: (id) => {
