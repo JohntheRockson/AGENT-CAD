@@ -150,7 +150,7 @@ Reject thread-first then fuse a head.
 Reject fillet edges:"all" after thread (that rounds the helix).
 Reject a hex-head bolt fully threaded from the head (missing dead_height).
 head_width must drive the hex wrench size; dead_height must drive thread start.
-major_diameter must drive the shank cylinder.
+major_diameter (or the ISO size token when that param is omitted) must drive the shank cylinder.
 Require under-head fillet before thread and a tip chamfer (edges:"top").
 "#;
 
@@ -323,6 +323,10 @@ mod tests {
         assert!(
             v.contains("major_diameter") && v.contains("cylinder"),
             "verify must require major_diameter to drive the shank"
+        );
+        assert!(
+            v.contains("omitted") || v.contains("iso size"),
+            "verify must bind the ISO size token when major_diameter is omitted"
         );
         assert!(
             v.contains("fillet") && v.contains("before thread"),

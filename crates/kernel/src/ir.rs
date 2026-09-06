@@ -36,7 +36,8 @@ pub struct CadDocument {
     /// Also emit `dead_height` / `unthreaded_length` for the unthreaded grip
     /// under the head (do not always fully-thread from head to tip).
     /// Recipe verify requires `head_width` to match hex AF, `major_diameter`
-    /// to match the shank cylinder, and `dead_height` to drive thread start
+    /// (or the ISO size token when that param is omitted) to match the shank
+    /// cylinder, and `dead_height` to drive thread start
     /// (`head_height + dead_height`). Also require under-head fillet before
     /// thread and a tip chamfer; never fillet `edges:"all"` after the helix.
     #[serde(default)]

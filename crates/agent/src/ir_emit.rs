@@ -92,8 +92,8 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 /// `edges:"all"` after the thread (that rounds the helix), when the
 /// ISO size table does not actually drive the hex / unthreaded grip
 /// (fully-threaded from the head, `head_width` ≠ hex AF, or
-/// `major_diameter` ≠ shank cylinder), or when the bolt is missing an
-/// under-head fillet before thread or a tip chamfer.
+/// `major_diameter` / ISO size token ≠ shank cylinder), or when the bolt
+/// is missing an under-head fillet before thread or a tip chamfer.
 ///
 /// Internal taps (plate + tap) are not bolts and are left alone.
 pub fn fastener_recipe_violation(doc: &CadDocument) -> Option<String> {
@@ -159,6 +159,8 @@ fn body_fastener_violation(
 /// `head_width` must match hex AF; `major_diameter` must match the shank;
 /// thread start must leave `dead_height`. Explicit thread Ø/pitch must
 /// match the size table when both are set (ISO `size:"M8"` may stay null).
+/// When `major_diameter` is omitted, the ISO size token still drives the
+/// shank (M8 → Ø8) — omitting the param is not a license to hard-code Ø10.
 /// After those checks, require under-head fillet before thread and a tip
 /// chamfer (still reject fillet-`all` after the helix).
 fn bolt_params_drive_hex_and_grip(
@@ -207,16 +209,32 @@ fn bolt_params_drive_hex_and_grip(
         params,
         &["major_diameter", "shank_diameter", "thread_diameter"],
     );
-    if let (Some(md), Some(d)) = (major, cyl_d) {
+    let iso_major = thread
+        .size
+        .as_deref()
+        .and_then(|s| kernel::thread::parse_size(s).ok())
+        .map(|spec| spec.major_diameter);
+    if let (Some(md), Some(iso)) = (major, iso_major) {
+        if (md - iso).abs() > 0.2 {
+            return Some(
+                "major_diameter must match the ISO size token; \
+                 M8 is Ø8 — do not keep a size-table lie next to size:\"M8\""
+                    .into(),
+            );
+        }
+    }
+    let expected_major = major.or(iso_major);
+    if let (Some(md), Some(d)) = (expected_major, cyl_d) {
         if (md - d).abs() > 0.2 {
             return Some(
-                "cylinder diameter must be driven by major_diameter; \
+                "cylinder diameter must be driven by major_diameter \
+                 (or the ISO size token when major_diameter is omitted); \
                  do not hard-code a different shank than the size table"
                     .into(),
             );
         }
     }
-    if let (Some(md), Some(td)) = (major, thread.diameter) {
+    if let (Some(md), Some(td)) = (expected_major, thread.diameter) {
         if (md - td).abs() > 0.2 {
             return Some(
                 "thread diameter must match major_diameter when both are set; \
@@ -902,6 +920,92 @@ mod tests {
         assert!(
             fastener_recipe_violation(&example_m8_bolt_document()).is_none(),
             "golden hex→fillet→thread→chamfer must still pass"
+        );
+    }
+
+    /// Cycle 2 only compared major_diameter when the param was present.
+    /// Omitting it and hard-coding a Ø10 shank next to size:"M8" still
+    /// passed — a size-table lie by null. ISO token must drive the shank.
+    #[test]
+    fn fastener_rules_iso_size_drives_shank_when_major_omitted() {
+        let hex_cyl_finish = |cyl_d: f64| {
+            serde_json::json!([
+                { "op": "sketch", "plane": "XY",
+                  "profile": { "hex": { "across_flats": 13 } } },
+                { "op": "extrude", "depth": 5.3 },
+                { "op": "cylinder", "diameter": cyl_d, "height": 35.7, "at": [0, 0, 4.3] },
+                { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                { "op": "thread", "kind": "external", "size": "M8",
+                  "length": 26.7, "at": [0, 0, 13.3] },
+                { "op": "chamfer", "distance": 0.5, "edges": "top" }
+            ])
+        };
+
+        let omitted_wrong = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(10.0)
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&omitted_wrong)
+            .expect("size M8 with omitted major_diameter and Ø10 shank must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("major_diameter") || l.contains("cylinder") || l.contains("iso"),
+            "reason should name the undriven / ISO shank: {reason}"
+        );
+
+        let omitted_ok = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(8.0)
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&omitted_ok).is_none(),
+            "size M8 with omitted major_diameter and Ø8 shank must still pass"
+        );
+
+        let table_lie = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 10.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(10.0)
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&table_lie)
+            .expect("size M8 with major_diameter 10 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("major_diameter") || l.contains("iso") || l.contains("m8"),
+            "reason should name the token/table conflict: {reason}"
         );
     }
 }

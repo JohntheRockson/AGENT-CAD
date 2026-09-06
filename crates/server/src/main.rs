@@ -1344,8 +1344,14 @@ fn fastener_repair_hint(err: &str) -> String {
         || l.contains("fastener")
         || l.contains("hex")
         || l.contains("fillet")
+        || l.contains("major_diameter")
+        || l.contains("shank")
+        || l.contains("chamfer")
+        || l.contains("dead_height")
+        || l.contains("grip")
+        || l.contains("pitch")
     {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. hex AF must match head_width. cylinder diameter must match major_diameter. Fillet under-head before thread. Chamfer the tip edges:\"top\". Never thread first and fuse a hex head on. Never fillet edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. hex AF must match head_width. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted). Fillet under-head before thread. Chamfer the tip edges:\"top\". Never thread first and fuse a hex head on. Never fillet edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
     } else {
         String::new()
     }
@@ -1752,6 +1758,39 @@ mod tests {
             .expect("legal order without fillet/chamfer must fail verify");
         let l = reason.to_ascii_lowercase();
         assert!(l.contains("fillet") || l.contains("chamfer"), "{reason}");
+
+        // Cycle 2 hole: omit major_diameter, hard-code Ø10 next to size M8.
+        let omitted_major = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 10, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&omitted_major)
+            .expect("omitted major_diameter + M8 + Ø10 shank must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("major_diameter") || l.contains("cylinder") || l.contains("iso"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -1776,6 +1815,17 @@ mod tests {
         assert!(
             l.contains("major_diameter") && l.contains("cylinder"),
             "repair must say cylinder diameter matches major_diameter: {hint}"
+        );
+        assert!(
+            l.contains("omitted") || l.contains("iso"),
+            "repair must say ISO Ø still applies when major_diameter is omitted: {hint}"
+        );
+        // Cycle 2 judge reason named cylinder/major_diameter, not thread/hex/fillet.
+        let shank_reason =
+            "cylinder diameter must be driven by major_diameter (or the ISO size token when major_diameter is omitted)";
+        assert!(
+            !fastener_repair_hint(shank_reason).is_empty(),
+            "repair hint must fire on the major_diameter / ISO shank reason"
         );
         assert!(
             l.contains("fillet") && l.contains("before thread"),
