@@ -68,12 +68,14 @@ Exit code 0 only if **all** checks pass.
    Named `"all"` / junction-edge indices still have to show that torus.
    Silent no-op = **FAIL**. Δvolume alone is **not** sufficient. Hex-corner
    XY R (AF13 vertex inset) is **not** sufficient.
-5. **ISO golden** — IR is AF 13 / Ø8 / P 1.25 / L 40 / head ~5.3.
+5. **ISO golden** — IR is AF 13 / Ø8 / P 1.25 / L 40 / head ~5.3, **mm**.
    **Parameters and features** must both match: `head_width=13` with hex
-   AF 10 is FAIL; `M8x1` / a pitch override other than 1.25 is FAIL.
+   AF 10 is FAIL; `M8x1` / a pitch override other than 1.25 is FAIL;
+   Ø8 cylinder with height ≠ 35.7 or `at.z` ≠ 4.3 is FAIL.
    Executed **tip-to-top** AABB must stay within **0.20 mm** of L=40
-   (zmax and span). 40.095-class crest tessellation PASSes. A 40.5 mm tip
-   FAILs. This is tip-to-top look-right, not ISO 4017 under-head length.
+   (**zmin≈0**, zmax, and span). A 40 mm span seated at zmin=-0.5
+   (tip at 39.5) FAILs. 40.095-class crest tessellation PASSes. A 40.5 mm
+   tip FAILs. This is tip-to-top look-right, not ISO 4017 under-head length.
    Golden **execute** must stay in the seconds class (**FAIL if > 40 s**);
    do not tessellate a long uncut host. Warmup is not this budget. Helix
    / seam / entry bars are not relaxed.

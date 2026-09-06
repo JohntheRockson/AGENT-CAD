@@ -1,6 +1,6 @@
 //! Locked ISO M8×40 caliper golden — AF 13, Ø8, P 1.25, L 40, head ~5.3.
 
-use kernel::ir::CadDocument;
+use kernel::ir::{CadDocument, Units};
 
 /// Wrench size (ISO hex-head across flats), mm.
 pub const AF_MM: f64 = 13.0;
@@ -17,6 +17,9 @@ pub const HEAD_HEIGHT_MM: f64 = 5.3;
 pub const THREAD_Z0_MM: f64 = 5.3;
 /// Thread length on the golden, mm.
 pub const THREAD_LEN_MM: f64 = 34.7;
+/// Shank cylinder height and origin Z (recipe: Ø8 × 35.7 at z=4.3 → tip 40).
+pub const SHANK_HEIGHT_MM: f64 = 35.7;
+pub const SHANK_Z_AT_MM: f64 = 4.3;
 
 /// Mid-shank band used for helix / ISO-V / sliver (avoids head and tip).
 pub const SHANK_Z0_MM: f64 = 12.0;
@@ -55,6 +58,9 @@ pub fn check_golden_ir(doc: &CadDocument) -> (bool, String) {
     let length = doc.parameters.get("bolt_length").copied();
 
     let mut fail: Vec<String> = Vec::new();
+    if doc.units != Units::Mm {
+        fail.push(format!("units {:?} (want mm)", doc.units));
+    }
     lock_dim("param head_width", param_af, AF_MM, 1e-6, &mut fail);
     lock_dim("hex across_flats", feat_af, AF_MM, 1e-6, &mut fail);
     lock_dim("param head_height", param_head, HEAD_HEIGHT_MM, 0.15, &mut fail);
@@ -88,8 +94,9 @@ pub fn check_golden_ir(doc: &CadDocument) -> (bool, String) {
         Ok(()) => {}
         Err(e) => fail.push(e),
     }
-    if !has_d8_shank(doc) {
-        fail.push("missing Ø8 shank cylinder".into());
+    match shank_lock(doc) {
+        Ok(()) => {}
+        Err(e) => fail.push(e),
     }
     if fail.is_empty() {
         (
@@ -143,6 +150,17 @@ pub fn check_tip_to_top_length(bbox: [f64; 6]) -> (bool, String) {
         return (
             false,
             format!("no usable Z bbox {bbox:?} — cannot verify tip-to-top L={LENGTH_MM}"),
+        );
+    }
+    // Span-only used to PASS a 40 mm window sitting below the origin
+    // (zmin=-0.5, zmax=39.5): tip short, head not at z=0.
+    if zmin.abs() > TIP_LENGTH_TOL_MM {
+        return (
+            false,
+            format!(
+                "tip-to-top not seated at z=0: zmin={zmin:.4} \
+                 (tol {TIP_LENGTH_TOL_MM} mm; span-only would hide a short tip)"
+            ),
         );
     }
     if overshoot > TIP_LENGTH_TOL_MM {
@@ -258,14 +276,38 @@ fn thread_lock(doc: &CadDocument) -> Result<(), String> {
     Ok(())
 }
 
-fn has_d8_shank(doc: &CadDocument) -> bool {
-    use kernel::ir::Feature;
-    doc.bodies.iter().any(|b| {
-        b.features.iter().any(|f| match f {
-            Feature::Cylinder(c) => (c.diameter - SHANK_D_MM).abs() < 1e-6,
-            _ => false,
-        })
-    })
+/// Ø8 × 35.7 at z=4.3 — diameter-only used to PASS a short/shifted shank.
+fn shank_lock(doc: &CadDocument) -> Result<(), String> {
+    use kernel::ir::{Feature, RevolveAxis};
+    let mut found = None;
+    for body in &doc.bodies {
+        for f in &body.features {
+            if let Feature::Cylinder(c) = f {
+                found = Some(c);
+                break;
+            }
+        }
+    }
+    let c = found.ok_or_else(|| "missing shank cylinder".to_string())?;
+    if (c.diameter - SHANK_D_MM).abs() > 1e-6 {
+        return Err(format!(
+            "shank diameter {} (want {SHANK_D_MM})",
+            c.diameter
+        ));
+    }
+    if (c.height - SHANK_HEIGHT_MM).abs() > 1e-6 {
+        return Err(format!(
+            "shank height {} (want {SHANK_HEIGHT_MM}; Ø-only is not L=40)",
+            c.height
+        ));
+    }
+    if (c.at[2] - SHANK_Z_AT_MM).abs() > 1e-6 {
+        return Err(format!("shank at.z {} (want {SHANK_Z_AT_MM})", c.at[2]));
+    }
+    if c.axis != RevolveAxis::Z {
+        return Err(format!("shank axis {:?} (want Z)", c.axis));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -310,6 +352,14 @@ mod tests {
         let (ok, detail) = check_tip_to_top_length([-7.5, -6.5, 0.0, 7.5, 6.5, 38.0]);
         assert!(!ok, "38 mm span must FAIL: {detail}");
         assert!(detail.contains("shorter"), "{detail}");
+    }
+
+    #[test]
+    fn tip_shifted_down_40mm_span_fails() {
+        // Same span as L=40, but seated below the origin — tip at 39.5.
+        let (ok, detail) = check_tip_to_top_length([-7.5, -6.5, -0.5, 7.5, 6.5, 39.5]);
+        assert!(!ok, "zmin=-0.5 / zmax=39.5 must FAIL: {detail}");
+        assert!(detail.contains("zmin") || detail.contains("seated"), "{detail}");
     }
 
     #[test]
@@ -366,6 +416,33 @@ mod tests {
         let (ok, detail) = check_golden_ir(&doc);
         assert!(!ok, "M8x1 fine must FAIL ISO lock: {detail}");
         assert!(detail.contains("M8X1") || detail.contains("fine"), "{detail}");
+    }
+
+    #[test]
+    fn shank_height_20_with_d8_fails() {
+        let text = include_str!("../m8_x40.json");
+        let mut doc = load_golden_document(text).expect("golden document");
+        use kernel::ir::Feature;
+        for body in &mut doc.bodies {
+            for f in &mut body.features {
+                if let Feature::Cylinder(c) = f {
+                    c.height = 20.0;
+                }
+            }
+        }
+        let (ok, detail) = check_golden_ir(&doc);
+        assert!(!ok, "Ø8 × 20 must FAIL ISO lock: {detail}");
+        assert!(detail.contains("height"), "{detail}");
+    }
+
+    #[test]
+    fn units_inch_fails() {
+        let text = include_str!("../m8_x40.json");
+        let mut doc = load_golden_document(text).expect("golden document");
+        doc.units = Units::Inch;
+        let (ok, detail) = check_golden_ir(&doc);
+        assert!(!ok, "inch units must FAIL ISO lock: {detail}");
+        assert!(detail.contains("units"), "{detail}");
     }
 
     #[test]

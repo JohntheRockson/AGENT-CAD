@@ -582,6 +582,7 @@ fn render_markdown(r: &ReportData) -> String {
          STEP that is empty/crash **or** ≈ the uncut hex+shank while the viewport is threaded is FAIL. \
          A tip-to-top AABB that overshoots locked L=40 by more than 0.20 mm is FAIL \
          (crest at 40.095 is ok; not ISO 4017 under-head). \
+         A 40 mm span seated below z=0 (short tip) is FAIL. \
          ISO params must match features (AF13 hex, not head_width-only). \
          Golden execute above 40s class is FAIL (do not tessellate a long uncut host).\n\n",
     );

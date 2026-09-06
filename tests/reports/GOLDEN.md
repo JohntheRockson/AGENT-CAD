@@ -18,7 +18,7 @@ Feature recipe (mm, +Z shank):
 
 1. Sketch hex `across_flats` 13 on XY
 2. Extrude depth 5.3
-3. Cylinder Ø8 × 35.7 at `[0, 0, 4.3]` (overlaps the head)
+3. Cylinder Ø8 × **35.7** at `[0, 0, 4.3]` (overlaps the head). Diameter-only is not L=40.
 4. External thread **coarse** M8 × 34.7 at `[0, 0, 5.3]` (`M8x1` / pitch override ≠ 1.25 is not the golden)
 
 Look-right (viewport + STL) must see a helix / ISO-V groove, not stacked
