@@ -221,23 +221,20 @@ fn bolt_params_drive_hex_and_grip(
     cyl_i: usize,
     thread_i: usize,
 ) -> Option<String> {
-    let hex_af = match &body.features[hex_i] {
-        Feature::Sketch(op) => match &op.profile {
-            Profile::Hex(h) => Some(h.across_flats),
-            _ => None,
-        },
-        _ => None,
-    };
+    let hex_af = hex_across_flats(&body.features[hex_i]);
     let cyl_d = match &body.features[cyl_i] {
         Feature::Cylinder(op) => Some(op.diameter),
         _ => None,
     };
-    let head_from_feat = body.features[hex_i + 1..thread_i]
-        .iter()
-        .find_map(|f| match f {
-            Feature::Extrude(op) => Some(op.depth),
-            _ => None,
-        });
+    let head_from_feat = match &body.features[hex_i] {
+        Feature::Fuse(op) => Some(op.depth),
+        _ => body.features[hex_i + 1..thread_i]
+            .iter()
+            .find_map(|f| match f {
+                Feature::Extrude(op) => Some(op.depth),
+                _ => None,
+            }),
+    };
     let thread = match &body.features[thread_i] {
         Feature::Thread(op) => op,
         _ => return None,
@@ -524,8 +521,24 @@ fn edges_all_or_longest(edges: &EdgeSelection) -> bool {
     edges_named(edges, "all") || edges_named(edges, "longest")
 }
 
+fn hex_across_flats(f: &Feature) -> Option<f64> {
+    match f {
+        Feature::Sketch(op) => match &op.profile {
+            Profile::Hex(h) => Some(h.across_flats),
+            _ => None,
+        },
+        // Catalog fuse joins a boss. Models sometimes emit the hex head as
+        // fuse instead of sketch+extrude; that still has to be ISO AF 13.
+        Feature::Fuse(op) => match &op.profile {
+            Profile::Hex(h) => Some(h.across_flats),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn is_hex_head(f: &Feature) -> bool {
-    matches!(f, Feature::Sketch(op) if matches!(op.profile, Profile::Hex(_)))
+    hex_across_flats(f).is_some()
 }
 
 fn is_external_thread(f: &Feature) -> bool {
@@ -2104,6 +2117,69 @@ mod tests {
         assert!(
             fastener_recipe_violation(&hex_plate_tap).is_none(),
             "internal tap on a hex plate must not become a bolt"
+        );
+
+        // Fuse-hex head (catalog boss) used to skip is_hex_head, so a Body
+        // named AF-10 M8 shipped. Kernel already treats fuse hex as a hex.
+        let fuse_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "fuse", "profile": { "hex": { "across_flats": 10 } },
+                      "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&fuse_af10)
+            .expect("fuse-hex AF 10 next to size M8 must fail even when named Body");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "reason should name the fuse-hex AF lie: {reason}"
+        );
+
+        let fuse_af13 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "fuse", "profile": { "hex": { "across_flats": 13 } },
+                      "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&fuse_af13).is_none(),
+            "fuse-hex AF 13 with the golden shank/thread must still pass"
         );
     }
 }
