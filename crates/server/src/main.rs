@@ -1351,7 +1351,7 @@ fn fastener_repair_hint(err: &str) -> String {
         || l.contains("grip")
         || l.contains("pitch")
     {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted or also 10 — never the old AF 10 table. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. Fillet under-head before thread. Chamfer the tip after thread edges:\"top\" — a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted — never the old wrench size of 10. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. Fillet under-head before thread. Chamfer the tip after thread edges:\"top\" — a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
     } else {
         String::new()
     }
@@ -1973,7 +1973,7 @@ mod tests {
             "repair must reteach tip chamfer after thread: {hint}"
         );
         assert!(
-            l.contains("af") && l.contains("13") && (l.contains("omitted") || l.contains("10")),
+            l.contains("af") && l.contains("13") && l.contains("omitted"),
             "repair must reteach ISO M8 AF 13 even if head_width is omitted: {hint}"
         );
         let af_reason =
