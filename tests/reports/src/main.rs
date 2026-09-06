@@ -522,7 +522,8 @@ fn render_markdown(r: &ReportData) -> String {
     s.push_str(&format!("**Overall: {overall}**\n\n"));
     s.push_str(
         "Inspector only. No kernel/web/OCCT-WASM edits. Kernel owns STEP implementation. \
-         A silent fillet no-op is FAIL. AABB-only STL of a smooth rod is FAIL. \
+         A silent fillet no-op is FAIL. Hex-corner R or Δvolume without under-head junction R is FAIL. \
+         AABB-only STL of a smooth rod is FAIL. \
          A mid-shank helix/AABB bar with instance-window seams or a dead→thread entry notch is FAIL. \
          STEP that is empty/crash **or** ≈ the uncut hex+shank while the viewport is threaded is FAIL.\n\n",
     );
@@ -558,7 +559,7 @@ fn render_markdown(r: &ReportData) -> String {
         escape_md(&r.step_detail)
     ));
     s.push_str(&format!(
-        "| 4) fillet under-head / named R (Δvol-only = FAIL; silent no-op = FAIL) | {} | {} |\n",
+        "| 4) fillet under-head junction R (hex-corner / Δvol-only = FAIL; silent no-op = FAIL) | {} | {} |\n",
         mark(r.fillet_pass),
         escape_md(&r.fillet_detail)
     ));
@@ -620,7 +621,8 @@ fn render_markdown(r: &ReportData) -> String {
     s.push_str(&format!(
         "Fillet variant: same features with `{{ op: fillet, radius: {FILLET_RADIUS_MM} }}` inserted after the \
          Ø8 cylinder (under-head junction if topology names edges; otherwise named `all`). \
-         Δvolume alone is not a pass.\n\n"
+         Acceptance requires measurable under-head junction R≈{FILLET_RADIUS_MM} mm \
+         (head ~5.3 / Ø8). Hex-corner R or Δvolume alone is not a pass.\n\n"
     ));
     s.push_str("## Failed commands / why (not faked)\n\n");
     if r.failed_cmds.is_empty() {
@@ -661,6 +663,7 @@ fn report_json(r: &ReportData) -> serde_json::Value {
             "helix_continuous_and_clean_entry": { "result": mark(r.helix_windows_pass), "detail": r.helix_windows_detail },
             "stl_look_right_not_aabb_only": { "result": mark(r.stl_pass), "detail": r.stl_detail },
             "step_honesty": { "result": mark(r.step_pass), "detail": r.step_detail },
+            "fillet_under_head_junction_r": { "result": mark(r.fillet_pass), "detail": r.fillet_detail },
             "fillet_under_head_or_named_r": { "result": mark(r.fillet_pass), "detail": r.fillet_detail },
         },
         "look_right": {

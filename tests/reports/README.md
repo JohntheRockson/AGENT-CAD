@@ -62,6 +62,8 @@ Exit code 0 only if **all** checks pass.
    When STEP exists: if the viewport is threaded but STEP is essentially the
    uncut hex+shank (smooth Ø8 / no groove / volume≈uncut), **FAIL**.
    Inspector does not implement STEP.
-4. **Fillet R** — under-head junction or named edges, measurable R and hex
-   look change. Silent no-op = **FAIL**. Δvolume alone is **not** sufficient.
+4. **Fillet R** — measurable **under-head junction** R≈0.8 mm at head ~5.3 / Ø8.
+   Named `"all"` / junction-edge indices still have to show that torus.
+   Silent no-op = **FAIL**. Δvolume alone is **not** sufficient. Hex-corner
+   XY R (AF13 vertex inset) is **not** sufficient.
 5. **ISO golden** — IR is AF 13 / Ø8 / P 1.25 / L 40 / head ~5.3.
