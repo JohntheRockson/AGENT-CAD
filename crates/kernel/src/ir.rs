@@ -39,7 +39,7 @@ pub struct CadDocument {
     /// (or the ISO size token when that param is omitted) to match the shank
     /// cylinder, and `dead_height` to drive thread start
     /// (`head_height + dead_height`). Also require under-head fillet before
-    /// thread and a tip chamfer; never fillet `edges:"all"` after the helix.
+    /// thread and a tip chamfer; never fillet or chamfer `edges:"all"` after the helix.
     #[serde(default)]
     pub parameters: BTreeMap<String, f64>,
     pub bodies: Vec<CadBody>,

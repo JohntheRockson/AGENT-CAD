@@ -147,7 +147,7 @@ Do not diagnose tessellation or wasm crashes; that is the kernel's job.
 Fastener order (judge only):
 A hex-head bolt must be hex extrude → overlapping cylinder → thread CUT.
 Reject thread-first then fuse a head.
-Reject fillet edges:"all" after thread (that rounds the helix).
+Reject fillet or chamfer edges:"all" after thread (that wrecks the helix).
 Reject a hex-head bolt fully threaded from the head (missing dead_height).
 head_width must drive the hex wrench size; dead_height must drive thread start.
 major_diameter (or the ISO size token when that param is omitted) must drive the shank cylinder.
@@ -309,8 +309,8 @@ mod tests {
             "verify must reject thread-first"
         );
         assert!(
-            v.contains("edges:\"all\"") && v.contains("after thread"),
-            "verify must reject fillet-all after thread"
+            v.contains("edges:\"all\"") && v.contains("after thread") && v.contains("chamfer"),
+            "verify must reject fillet-all and chamfer-all after thread"
         );
         assert!(
             v.contains("dead_height") && (v.contains("fully threaded") || v.contains("unthreaded")),

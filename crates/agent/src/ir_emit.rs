@@ -8,7 +8,7 @@
 //! honesty is Kernel. Do not "fix" tessellation crashes by teaching
 //! thread-first in the prompt.
 
-use kernel::ir::{CadDocument, Feature, FilletOp, Profile, ThreadKind, ThreadOp};
+use kernel::ir::{CadDocument, ChamferOp, Feature, FilletOp, Profile, ThreadKind, ThreadOp};
 
 /// ISO M8 size table (ISO 261 coarse + ISO 4014/4017 hex).
 pub const M8_MAJOR_DIAMETER: f64 = 8.0;
@@ -88,8 +88,8 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 /// Deterministic fastener-order judge used by verify/repair.
 ///
 /// Returns `Some(reason)` when a hex-head / external-thread body is not
-/// hex → overlapping cylinder → thread CUT, when a fillet uses
-/// `edges:"all"` after the thread (that rounds the helix), when the
+/// hex → overlapping cylinder → thread CUT, when a fillet or chamfer uses
+/// `edges:"all"` after the thread (that wrecks the helix), when the
 /// ISO size table does not actually drive the hex / unthreaded grip
 /// (fully-threaded from the head, `head_width` ≠ hex AF, or
 /// `major_diameter` / ISO size token ≠ shank cylinder), or when the bolt
@@ -118,14 +118,22 @@ fn body_fastener_violation(
 
     if let Some(t) = thread_i {
         for f in &body.features[t + 1..] {
-            if let Feature::Fillet(FilletOp { edges, .. }) = f {
-                if edges.is_all() {
+            match f {
+                Feature::Fillet(FilletOp { edges, .. }) if edges.is_all() => {
                     return Some(
                         "fillet edges:\"all\" after thread rounds the helix; \
                          fillet under-head before thread, chamfer the tip with edges:\"top\""
                             .into(),
                     );
                 }
+                Feature::Chamfer(ChamferOp { edges, .. }) if edges.is_all() => {
+                    return Some(
+                        "chamfer edges:\"all\" after thread wrecks the helix; \
+                         chamfer the tip with edges:\"top\""
+                            .into(),
+                    );
+                }
+                _ => {}
             }
         }
     }
@@ -162,7 +170,7 @@ fn body_fastener_violation(
 /// When `major_diameter` is omitted, the ISO size token still drives the
 /// shank (M8 → Ø8) — omitting the param is not a license to hard-code Ø10.
 /// After those checks, require under-head fillet before thread and a tip
-/// chamfer (still reject fillet-`all` after the helix).
+/// chamfer (still reject fillet-`all` / chamfer-`all` after the helix).
 fn bolt_params_drive_hex_and_grip(
     body: &kernel::ir::CadBody,
     params: &std::collections::BTreeMap<String, f64>,
@@ -290,8 +298,8 @@ fn bolt_params_drive_hex_and_grip(
 }
 
 /// Golden recipe finishing: fillet the under-head junction *before* the
-/// helix, then chamfer the tip. Fillet-`all` after thread is rejected
-/// earlier (it rounds the groove).
+/// helix, then chamfer the tip. Fillet-`all` / chamfer-`all` after thread
+/// are rejected earlier (they wreck the groove).
 fn bolt_requires_underhead_fillet_and_tip_chamfer(
     body: &kernel::ir::CadBody,
     thread_i: usize,
@@ -597,6 +605,41 @@ mod tests {
         .unwrap();
         let reason = fastener_recipe_violation(&fillet_all).expect("fillet-all after thread");
         assert!(reason.contains("all"), "{reason}");
+
+        // Cycle 3 requires a chamfer; EdgeSelection defaults to "all", so a
+        // bare chamfer after thread wrecks the helix the same way fillet-all does.
+        let chamfer_all = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5 }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&chamfer_all)
+            .expect("chamfer-all after thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("chamfer") && l.contains("all"),
+            "reason should name chamfer-all after thread: {reason}"
+        );
 
         let tap = CadDocument::from_json_value(serde_json::json!({
             "units": "mm",
