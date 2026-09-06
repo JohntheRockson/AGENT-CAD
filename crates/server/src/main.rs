@@ -1345,7 +1345,7 @@ fn fastener_repair_hint(err: &str) -> String {
         || l.contains("hex")
         || l.contains("fillet")
     {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. hex AF must match head_width. Never thread first and fuse a hex head on. Never fillet edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. hex AF must match head_width. cylinder diameter must match major_diameter. Never thread first and fuse a hex head on. Never fillet edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
     } else {
         String::new()
     }
@@ -1693,6 +1693,37 @@ mod tests {
             l.contains("unthreaded") || l.contains("dead_height") || l.contains("grip"),
             "{reason}"
         );
+
+        let undriven_shank = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 10, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&undriven_shank)
+            .expect("major_diameter 8 with cylinder Ø10 must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("major_diameter") || l.contains("cylinder") || l.contains("shank"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -1713,6 +1744,10 @@ mod tests {
         assert!(
             l.contains("head_height") && l.contains("dead_height"),
             "repair must say thread at is head_height + dead_height"
+        );
+        assert!(
+            l.contains("major_diameter") && l.contains("cylinder"),
+            "repair must say cylinder diameter matches major_diameter: {hint}"
         );
         assert!(fastener_repair_hint("unrelated box error").is_empty());
     }

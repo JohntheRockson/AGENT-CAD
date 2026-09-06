@@ -150,6 +150,7 @@ Reject thread-first then fuse a head.
 Reject fillet edges:"all" after thread (that rounds the helix).
 Reject a hex-head bolt fully threaded from the head (missing dead_height).
 head_width must drive the hex wrench size; dead_height must drive thread start.
+major_diameter must drive the shank cylinder.
 "#;
 
 #[cfg(test)]
@@ -317,6 +318,10 @@ mod tests {
         assert!(
             v.contains("head_width") && v.contains("drive"),
             "verify must require head_width to drive the hex"
+        );
+        assert!(
+            v.contains("major_diameter") && v.contains("cylinder"),
+            "verify must require major_diameter to drive the shank"
         );
         assert!(
             !v.contains("draft_extrude") && !v.contains("## feature ops"),

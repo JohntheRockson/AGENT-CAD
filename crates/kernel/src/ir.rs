@@ -35,8 +35,9 @@ pub struct CadDocument {
     /// `major_diameter` 8, `pitch` 1.25, `head_width` / across-flats 13 — not 10.
     /// Also emit `dead_height` / `unthreaded_length` for the unthreaded grip
     /// under the head (do not always fully-thread from head to tip).
-    /// Recipe verify requires `head_width` to match hex AF and `dead_height`
-    /// to drive thread start (`head_height + dead_height`).
+    /// Recipe verify requires `head_width` to match hex AF, `major_diameter`
+    /// to match the shank cylinder, and `dead_height` to drive thread start
+    /// (`head_height + dead_height`).
     #[serde(default)]
     pub parameters: BTreeMap<String, f64>,
     pub bodies: Vec<CadBody>,

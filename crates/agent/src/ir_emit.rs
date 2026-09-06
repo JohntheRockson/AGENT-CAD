@@ -91,7 +91,8 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 /// hex → overlapping cylinder → thread CUT, when a fillet uses
 /// `edges:"all"` after the thread (that rounds the helix), or when the
 /// ISO size table does not actually drive the hex / unthreaded grip
-/// (fully-threaded from the head, or `head_width` ≠ hex AF).
+/// (fully-threaded from the head, `head_width` ≠ hex AF, or
+/// `major_diameter` ≠ shank cylinder).
 ///
 /// Internal taps (plate + tap) are not bolts and are left alone.
 pub fn fastener_recipe_violation(doc: &CadDocument) -> Option<String> {
@@ -137,7 +138,9 @@ fn body_fastener_violation(
     }
 
     match (hex_i, cyl_i) {
-        (Some(h), Some(c)) if h < c && c < t => bolt_params_drive_hex_and_grip(body, params, h, t),
+        (Some(h), Some(c)) if h < c && c < t => {
+            bolt_params_drive_hex_and_grip(body, params, h, c, t)
+        }
         (Some(h), Some(c)) if t < h || t < c => Some(
             "thread-first then fuse a head is rejected; \
              hex extrude → overlapping cylinder → thread CUT"
@@ -152,11 +155,14 @@ fn body_fastener_violation(
 }
 
 /// SW/Fusion mental model: the size table drives the feature tree.
-/// `head_width` must match hex AF; thread start must leave `dead_height`.
+/// `head_width` must match hex AF; `major_diameter` must match the shank;
+/// thread start must leave `dead_height`. Explicit thread Ø/pitch must
+/// match the size table when both are set (ISO `size:"M8"` may stay null).
 fn bolt_params_drive_hex_and_grip(
     body: &kernel::ir::CadBody,
     params: &std::collections::BTreeMap<String, f64>,
     hex_i: usize,
+    cyl_i: usize,
     thread_i: usize,
 ) -> Option<String> {
     let hex_af = match &body.features[hex_i] {
@@ -164,6 +170,10 @@ fn bolt_params_drive_hex_and_grip(
             Profile::Hex(h) => Some(h.across_flats),
             _ => None,
         },
+        _ => None,
+    };
+    let cyl_d = match &body.features[cyl_i] {
+        Feature::Cylinder(op) => Some(op.diameter),
         _ => None,
     };
     let head_from_feat = body.features[hex_i + 1..thread_i]
@@ -185,6 +195,38 @@ fn bolt_params_drive_hex_and_grip(
             return Some(
                 "hex across_flats must be driven by head_width; \
                  do not hard-code a different wrench size than the size table"
+                    .into(),
+            );
+        }
+    }
+
+    let major = first_param(
+        params,
+        &["major_diameter", "shank_diameter", "thread_diameter"],
+    );
+    if let (Some(md), Some(d)) = (major, cyl_d) {
+        if (md - d).abs() > 0.2 {
+            return Some(
+                "cylinder diameter must be driven by major_diameter; \
+                 do not hard-code a different shank than the size table"
+                    .into(),
+            );
+        }
+    }
+    if let (Some(md), Some(td)) = (major, thread.diameter) {
+        if (md - td).abs() > 0.2 {
+            return Some(
+                "thread diameter must match major_diameter when both are set; \
+                 for M8 leave diameter/pitch null (ISO 261)"
+                    .into(),
+            );
+        }
+    }
+    if let (Some(p), Some(tp)) = (first_param(params, &["pitch", "thread_pitch"]), thread.pitch) {
+        if (p - tp).abs() > 0.05 {
+            return Some(
+                "thread pitch must match the size-table pitch when both are set; \
+                 for M8 leave diameter/pitch null (ISO 261)"
                     .into(),
             );
         }
@@ -615,6 +657,72 @@ mod tests {
         assert!(
             l.contains("dead_height") || l.contains("parameter"),
             "reason should name the undriven grip: {reason}"
+        );
+
+        // Size table Ø8 while the shank is Ø10 — same class of lie as AF 10.
+        let undriven_shank = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 1.25
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 10, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&undriven_shank)
+            .expect("major_diameter 8 with cylinder Ø10 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("major_diameter") || l.contains("cylinder") || l.contains("shank"),
+            "reason should name the undriven shank: {reason}"
+        );
+
+        // Explicit thread pitch that fights the size table (ISO M8 stays null).
+        let undriven_pitch = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 1.25
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "pitch": 2.0, "length": 26.7, "at": [0, 0, 13.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&undriven_pitch)
+            .expect("pitch 1.25 with thread pitch 2 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("pitch"),
+            "reason should name the undriven pitch: {reason}"
         );
     }
 }
