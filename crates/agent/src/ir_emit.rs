@@ -8,7 +8,9 @@
 //! honesty is Kernel. Do not "fix" tessellation crashes by teaching
 //! thread-first in the prompt.
 
-use kernel::ir::{CadDocument, ChamferOp, Feature, FilletOp, Profile, ThreadKind, ThreadOp};
+use kernel::ir::{
+    CadDocument, ChamferOp, EdgeSelection, Feature, FilletOp, Profile, ThreadKind, ThreadOp,
+};
 
 /// ISO M8 size table (ISO 261 coarse + ISO 4014/4017 hex).
 pub const M8_MAJOR_DIAMETER: f64 = 8.0;
@@ -120,16 +122,20 @@ fn body_fastener_violation(
     if let Some(t) = thread_i {
         for f in &body.features[t + 1..] {
             match f {
-                Feature::Fillet(FilletOp { edges, .. }) if edges.is_all() => {
+                Feature::Fillet(FilletOp { edges, .. })
+                    if edges.is_all() || edges_named(edges, "longest") =>
+                {
                     return Some(
-                        "fillet edges:\"all\" after thread rounds the helix; \
+                        "fillet edges:\"all\" or \"longest\" after thread rounds the helix; \
                          fillet under-head before thread, chamfer the tip with edges:\"top\""
                             .into(),
                     );
                 }
-                Feature::Chamfer(ChamferOp { edges, .. }) if edges.is_all() => {
+                Feature::Chamfer(ChamferOp { edges, .. })
+                    if edges.is_all() || edges_named(edges, "longest") =>
+                {
                     return Some(
-                        "chamfer edges:\"all\" after thread wrecks the helix; \
+                        "chamfer edges:\"all\" or \"longest\" after thread wrecks the helix; \
                          chamfer the tip with edges:\"top\""
                             .into(),
                     );
@@ -412,7 +418,10 @@ fn bolt_requires_underhead_fillet_and_tip_chamfer(
     }
     let has_tip_chamfer = body.features[thread_i + 1..]
         .iter()
-        .any(|f| matches!(f, Feature::Chamfer(_)));
+        .any(|f| match f {
+            Feature::Chamfer(op) => edges_named(&op.edges, "top"),
+            _ => false,
+        });
     if !has_tip_chamfer {
         return Some("hex-head bolt must chamfer the tip (edges:\"top\") after the thread".into());
     }
@@ -437,6 +446,10 @@ fn first_param(params: &std::collections::BTreeMap<String, f64>, names: &[&str])
             .copied()
             .filter(|v| v.is_finite() && *v > 0.0)
     })
+}
+
+fn edges_named(edges: &EdgeSelection, name: &str) -> bool {
+    matches!(edges, EdgeSelection::Named(s) if s.eq_ignore_ascii_case(name))
 }
 
 fn is_hex_head(f: &Feature) -> bool {
@@ -1517,6 +1530,42 @@ mod tests {
         assert!(
             fastener_recipe_violation(&example_m8_bolt_document()).is_none(),
             "golden thread ending at the tip must still pass"
+        );
+
+        // Cycle 5 rejected chamfer-all; edges:"longest" after thread still
+        // counted as a tip chamfer and can cut the helix (the under-head
+        // fillet teaches "longest", so models copy it onto the tip).
+        let chamfer_longest = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "longest" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&chamfer_longest)
+            .expect("chamfer-longest after thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("chamfer") && (l.contains("longest") || l.contains("top")),
+            "reason should name chamfer-longest / require edges:top: {reason}"
         );
 
         // Hexagonal plate + internal tap is not a bolt (no past-tip / recipe judge).
