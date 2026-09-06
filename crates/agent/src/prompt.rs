@@ -91,7 +91,7 @@ hole { "op":"hole", "diameter":<d>, "depth":<h>, "center":[x,y], "plane":"XY", "
 cut { "op":"cut", "profile":<P>, "depth":<h>, "at":[x,y,z], "plane":"XY", "face":"largest"|<i>, "through": true }
 fuse { "op":"fuse", "profile":<P>, "depth":<h>, "at":[x,y,z], "plane":"XY", "face":"largest"|<i> }
 common { "op":"common", "profile":<P>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
-fillet { "op":"fillet", "radius":<r>, "edges":"all"|"top"|"longest"|[i] }  r < half wall. Never edges:"all" after thread.
+fillet { "op":"fillet", "radius":<r>, "edges":"all"|"top"|"longest"|[i] }  r < half wall. Never edges:"all" or "longest" after thread.
 chamfer { "op":"chamfer", "distance":<d>, "angle":<deg>, "edges":"all"|"top"|[i] }
 transform { "op":"transform", "translate":[x,y,z], "rotate":{"axis":[x,y,z],"angle":<deg>,"origin":[x,y,z]}, "scale":<s> }
 mirror { "op":"mirror", "plane":"YZ"|"XZ"|"XY", "origin":[x,y,z], "fuse": true }
@@ -260,6 +260,10 @@ mod tests {
         assert!(
             SYSTEM_PROMPT.contains(r#"fillet/chamfer edges:"all" or "longest" after thread"#),
             "must forbid chamfer/fillet edges:longest after thread, not only fillet-all"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains(r#"Never edges:"all" or "longest" after thread"#),
+            "op catalog fillet line must forbid longest after thread, not only all"
         );
     }
 
