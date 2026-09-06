@@ -104,7 +104,7 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 /// (fully-threaded from the head, `head_width` ≠ hex AF, ISO M8 ≠ AF 13,
 /// or `major_diameter` / ISO size token ≠ shank cylinder), when a body
 /// named M8 (or an Ø8 shank) keeps the old AF 10 / Ø10 table with size
-/// omitted, when helix/torus fakes a thread, when draft/thicken (like
+/// omitted, when helix/torus fakes a thread, when draft/thicken/common (like
 /// shell/offset) follows the helix, when the helix
 /// runs past the tip, or when the bolt is missing an under-head fillet
 /// before thread or a tip chamfer.
@@ -168,6 +168,13 @@ fn body_fastener_violation(
                 Feature::Draft(_) | Feature::Thicken(_) => {
                     return Some(
                         "draft or thicken after thread wrecks the helix; \
+                         chamfer the tip with edges:\"top\" only"
+                            .into(),
+                    );
+                }
+                Feature::Common(_) => {
+                    return Some(
+                        "common after thread wrecks the helix; \
                          chamfer the tip with edges:\"top\" only"
                             .into(),
                     );
@@ -3453,6 +3460,36 @@ mod tests {
             "reason should name thicken after thread: {reason}"
         );
 
+        let common_after = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "common",
+                      "profile": { "circle": { "d": 6 } },
+                      "depth": 40 }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&common_after)
+            .expect("common after thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("common") && l.contains("after thread"),
+            "reason should name common after thread: {reason}"
+        );
+
         let cut_after = CadDocument::from_json_value(serde_json::json!({
             "units": "mm",
             "parameters": params,
@@ -3517,14 +3554,17 @@ mod tests {
                     { "op": "thread", "kind": "tap", "size": "M8",
                       "center": [0, 0], "through": true },
                     { "op": "draft", "faces": "side", "angle": 2 },
-                    { "op": "thicken", "thickness": 0.4, "face": "largest" }
+                    { "op": "thicken", "thickness": 0.4, "face": "largest" },
+                    { "op": "common",
+                      "profile": { "circle": { "d": 30 } },
+                      "depth": 12 }
                 ]
             }]
         }))
         .unwrap();
         assert!(
             fastener_recipe_violation(&hex_plate_tap).is_none(),
-            "hex-plate tap with draft/thicken after tap must stay unjudged"
+            "hex-plate tap with draft/thicken/common after tap must stay unjudged"
         );
         assert!(
             fastener_recipe_violation(&example_m8_bolt_document()).is_none(),
