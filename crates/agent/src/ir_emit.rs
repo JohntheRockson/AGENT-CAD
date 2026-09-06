@@ -114,6 +114,7 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 /// A body named stud with hex+shank and no Thread op is rejected
 /// (`stud plate` stays unjudged). A box-head named bolt/screw with no
 /// Thread op is rejected (`bolt circle` / `bolt-on` stay unjudged).
+/// documentId M8 / stud with body name Body is the same blank-shank skip.
 pub fn fastener_recipe_violation(doc: &CadDocument) -> Option<String> {
     for body in &doc.bodies {
         if let Some(reason) =
@@ -234,10 +235,13 @@ fn body_fastener_violation(
     // (Cycle 22 only caught tap). Cycle 32 required bolt/screw in the
     // name; a body named only "M8" / "M8x40" still shipped a blank shank.
     // Cycle 39: named stud (token, not student) is the same skip.
-    // Hex-plate / stud-plate taps stay unjudged (plate in the name, or an
-    // internal tap).
+    // Cycle 41: documentId m8_bolt / hex_stud with body name "Body" was
+    // the same skip (Cycle 38 already bound documentId for AF 13).
+    // Hex-plate / stud-plate taps stay unjudged (plate in the name or
+    // documentId, or an internal tap). Do not use bodyId — leftover
+    // `body_m8_bolt` slugs are too common on non-bolts.
     if thread_i.is_none()
-        && body_name_needs_thread_cut(&body.name)
+        && (body_name_needs_thread_cut(&body.name) || body_name_needs_thread_cut(doc_id))
         && hex_i.is_some()
         && cyl_i.is_some()
         && !body.features.iter().any(is_internal_thread)
@@ -3773,6 +3777,51 @@ mod tests {
         assert!(
             fastener_recipe_violation(&stud_plate_tap).is_none(),
             "stud plate + boss + tap must stay unjudged"
+        );
+
+        let doc_id_blank = CadDocument::from_json_value(serde_json::json!({
+            "documentId": "m8_bolt",
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&doc_id_blank)
+            .expect("documentId M8 + hex + shank with no thread must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("external") && l.contains("thread"),
+            "reason should require external CUT on documentId M8: {reason}"
+        );
+
+        let doc_id_plate = CadDocument::from_json_value(serde_json::json!({
+            "documentId": "m8_hex_plate",
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "Body",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "cylinder", "diameter": 16, "height": 4, "at": [0, 0, 12] },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&doc_id_plate).is_none(),
+            "documentId m8_hex_plate + tap must stay unjudged"
         );
     }
 
