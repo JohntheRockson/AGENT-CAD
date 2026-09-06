@@ -164,6 +164,10 @@ fn is_fastener(name: &str) -> bool {
         || n.contains("fastener")
         || n.contains("washer")
         || n.contains("nut")
+        || n.contains("screw")
+        // Word-boundary "tap" / "tapped" — do not match "taper" on a knuckle.
+        || n.split(|c: char| !c.is_ascii_alphabetic())
+            .any(|w| matches!(w, "tap" | "tapped"))
 }
 
 fn is_arm(name: &str) -> bool {
@@ -595,5 +599,15 @@ mod tests {
         let count = mesh_component_count(&mesh(positions, indices));
         assert!(count > 3, "got {count}");
         assert!(is_fragmented("Steering Knuckle", count));
+        // Internal taps / cap screws tessellate like bolts (many faces).
+        // Without this, preview force-repairs a legal plate tap named "M8 tap".
+        assert!(!is_fragmented("M8 tap", count));
+        assert!(!is_fragmented("tapped plate", count));
+        assert!(!is_fragmented("hex cap screw", count));
+        assert!(!is_fragmented("M8 Bolt", count));
+        assert!(
+            is_fragmented("knuckle taper", count),
+            "\"tap\" must not match taper on a knuckle"
+        );
     }
 }
