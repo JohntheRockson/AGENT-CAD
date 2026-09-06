@@ -12,6 +12,10 @@
 #   OCCT golden M8 STEP/STL
 #
 # Explicitly not added: mock/stub helix coverage.
+#
+# actions/checkout@v5 and actions/setup-node@v5 are the Node 24 action
+# runtime (v4 is Node 20, deprecated / removed from runners mid-Sept 2026).
+# apps/web still installs Node 22 below — that is the project toolchain.
 
 name: CI
 
@@ -34,7 +38,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@1.95.0
@@ -52,7 +56,7 @@ jobs:
         run: cargo test -p agent
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22"
           cache: npm
@@ -76,7 +80,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@1.95.0
@@ -95,7 +99,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@1.95.0
