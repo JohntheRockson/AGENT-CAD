@@ -55,6 +55,12 @@ jobs:
       - name: agent tests
         run: cargo test -p agent
 
+      # Look-right acceptance (synthetic helix / smooth-rod / STEP / fillet).
+      # No OCCT — the golden job still runs the inspector binary with --features occt.
+      # --locked: this nested workspace has its own Cargo.lock.
+      - name: inspector look-right unit tests (mock — not OCCT)
+        run: cargo test --locked --manifest-path tests/reports/Cargo.toml
+
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:

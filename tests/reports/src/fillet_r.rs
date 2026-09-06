@@ -374,6 +374,7 @@ mod tests {
     use super::*;
     use crate::look_right::synthetic_smooth_rod_hex;
     use crate::mesh_util::bbox_from_mesh;
+    use kernel::engine::MeshProvenance;
 
     #[test]
     fn under_head_r_is_measurable_on_torus() {
@@ -391,6 +392,7 @@ mod tests {
             bbox: bbox_from_mesh(&base_mesh),
             surface_area: 1.0,
             is_solid: true,
+            mesh_provenance: MeshProvenance::Brep,
         };
         let head = hex_head_metrics(&base_mesh, SHANK_R_MM);
         let mut filleted = base.clone();
@@ -416,6 +418,7 @@ mod tests {
             bbox: bbox_from_mesh(&base_mesh),
             surface_area: 1.0,
             is_solid: true,
+            mesh_provenance: MeshProvenance::Brep,
         };
         let head = hex_head_metrics(&base_mesh, SHANK_R_MM);
         let (ok, detail, _, _) = check_fillet(
@@ -436,6 +439,7 @@ mod tests {
             bbox: bbox_from_mesh(&base_mesh),
             surface_area: 1.0,
             is_solid: true,
+            mesh_provenance: MeshProvenance::Brep,
         };
         let head = hex_head_metrics(&base_mesh, SHANK_R_MM);
         let filleted_mesh = synthetic_under_head_fillet_mesh(FILLET_RADIUS_MM);
@@ -444,6 +448,7 @@ mod tests {
             bbox: bbox_from_mesh(&filleted_mesh),
             surface_area: 1.0,
             is_solid: true,
+            mesh_provenance: MeshProvenance::Brep,
         };
         let (ok, detail, _, _) = check_fillet(
             &Ok((filleted, filleted_mesh)),

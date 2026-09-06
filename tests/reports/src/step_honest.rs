@@ -320,6 +320,7 @@ mod tests {
     use super::*;
     use crate::look_right::{synthetic_iso_helix_mesh, synthetic_smooth_rod_hex};
     use crate::mesh_util::mesh_points;
+    use kernel::engine::MeshProvenance;
 
     #[test]
     fn empty_step_fails() {
@@ -347,6 +348,7 @@ mod tests {
             bbox: [-7.5, -6.5, 0.0, 7.5, 6.5, 40.0],
             surface_area: 1.0,
             is_solid: true,
+            mesh_provenance: MeshProvenance::Brep,
         };
         let c = check_step_honest(&step, None, Some(&helix), Some(&uncut_metrics), None);
         assert!(!c.ok, "uncut host must FAIL: {}", c.detail);
