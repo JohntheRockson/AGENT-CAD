@@ -148,11 +148,11 @@ fn body_fastener_violation(
                     );
                 }
                 Feature::Chamfer(ChamferOp { edges, .. })
-                    if edges_all_or_longest(edges) =>
+                    if !edges_named(edges, "top") =>
                 {
                     return Some(
-                        "chamfer edges:\"all\" or \"longest\" after thread wrecks the helix; \
-                         chamfer the tip with edges:\"top\""
+                        "chamfer after thread must use edges:\"top\"; \
+                         edges:\"all\" or \"longest\" wreck the helix"
                             .into(),
                     );
                 }
@@ -162,6 +162,17 @@ fn body_fastener_violation(
     }
 
     let looks_like_bolt = body_name_is_bolt(&body.name) || hex_i.is_some();
+    // Name-gated: hex-plate taps are not named "bolt". A hex+tap named
+    // "M8 Bolt" used to skip every recipe check (thread_i is external-only).
+    if thread_i.is_none()
+        && body_name_is_bolt(&body.name)
+        && body.features.iter().any(is_internal_thread)
+    {
+        return Some(
+            "hex-head bolt must use external thread CUT, not tap/internal"
+                .into(),
+        );
+    }
     let Some(t) = thread_i else {
         return None;
     };
@@ -546,6 +557,16 @@ fn is_external_thread(f: &Feature) -> bool {
         f,
         Feature::Thread(ThreadOp {
             kind: ThreadKind::External,
+            ..
+        })
+    )
+}
+
+fn is_internal_thread(f: &Feature) -> bool {
+    matches!(
+        f,
+        Feature::Thread(ThreadOp {
+            kind: ThreadKind::Internal,
             ..
         })
     )
@@ -2180,6 +2201,73 @@ mod tests {
         assert!(
             fastener_recipe_violation(&fuse_af13).is_none(),
             "fuse-hex AF 13 with the golden shank/thread must still pass"
+        );
+
+        let named_bolt_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&named_bolt_tap)
+            .expect("a body named bolt with tap/internal must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("external") && (l.contains("tap") || l.contains("internal")),
+            "reason should require external CUT, not tap: {reason}"
+        );
+
+        let chamfer_bottom_then_top = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.4, "edges": "bottom" },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&chamfer_bottom_then_top)
+            .expect("non-top chamfer after thread must fail even if a later tip chamfer exists");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("chamfer") && (l.contains("top") || l.contains("after thread")),
+            "reason should require chamfer edges:top after thread: {reason}"
         );
     }
 }
