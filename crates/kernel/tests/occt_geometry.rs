@@ -2087,3 +2087,167 @@ fn m8_instanced_underhead_fillet_is_visible_in_mesh() {
     assert_helix_continuous_across_instance_windows(&out.mesh, 1.25, zmin + 8.0, zmin + 36.0);
     assert_clean_thread_entry(&out.mesh, 4.0, 1.25, zmin + 5.3);
 }
+
+/// Inspector `FILLET_RADIUS_MM = 0.8`. Cycle 1 locked R=0.4 only — keep-band
+/// must keep the real-R torus in the instanced viewport (n≥12, err≤0.35).
+fn m8_filleted_thread_program(radius: f64) -> CadProgram {
+    serde_json::from_value(serde_json::json!({
+        "units": "mm",
+        "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": { "hex": { "across_flats": 13 } } },
+            { "op": "extrude", "depth": 5.3 },
+            { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+            { "op": "fillet", "radius": radius, "edges": "all" },
+            { "op": "thread", "kind": "external", "size": "M8", "length": 34.7, "at": [0, 0, 5.3] }
+        ]
+    }))
+    .unwrap()
+}
+
+#[test]
+fn m8_instanced_underhead_fillet_r08_is_visible_in_mesh() {
+    let unfilleted = Engine::new()
+        .execute(&golden_m8_x40_program())
+        .expect("unfilleted golden");
+    let no_thread: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": { "hex": { "across_flats": 13 } } },
+            { "op": "extrude", "depth": 5.3 },
+            { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+            { "op": "fillet", "radius": 0.8, "edges": "all" }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let host = Engine::new()
+        .execute(&no_thread)
+        .expect("R=0.8 hex+shank fillet (no thread)");
+    let host_fit = under_head_fillet_r_median_err(&host.mesh, 5.3, 4.0, 0.8);
+    eprintln!(
+        "R=0.8 BEFORE/host-no-thread: ΔV={:.3} fit={:?}",
+        host.metrics.volume - unfilleted.metrics.volume,
+        host_fit
+    );
+
+    let out = Engine::new()
+        .execute(&m8_filleted_thread_program(0.8))
+        .expect("R=0.8 fillet + long thread must build");
+    assert_eq!(
+        out.metrics.mesh_provenance,
+        MeshProvenance::InstancedThread,
+        "34.7 mm thread must still instance at R=0.8"
+    );
+    let dv = out.metrics.volume - unfilleted.metrics.volume;
+    let fit = under_head_fillet_r_median_err(&out.mesh, 5.3, 4.0, 0.8);
+    eprintln!("R=0.8 instanced: ΔV={dv:.3} fit={fit:?} vol={}", out.metrics.volume);
+    let (n, err) = fit.unwrap_or_else(|| {
+        panic!(
+            "Inspector under_head R=0.8 is NONE on instanced viewport (ΔV={dv:.3}) — \
+             keep-band / strip_thread_envelope ate the blend"
+        )
+    });
+    assert!(
+        n >= 12 && err <= 0.35,
+        "Inspector R=0.8 under-head must be visible: n={n} err={err:.3} ΔV={dv:.3}"
+    );
+    let [_, _, zmin, _, _, _] = out.metrics.bbox;
+    assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    assert_iso_v_thread_profile(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    assert_helix_continuous_across_instance_windows(&out.mesh, 1.25, zmin + 8.0, zmin + 36.0);
+    assert_clean_thread_entry(&out.mesh, 4.0, 1.25, zmin + 5.3);
+
+    // Inspector path: golden CadDocument + fillet R=0.8 after the cylinder.
+    let doc = iso_m8_x40_golden_document_with_fillet(0.8);
+    let doc_out = Engine::new()
+        .execute_document(&doc)
+        .expect("Inspector-path R=0.8 document")
+        .into_model_output()
+        .expect("document mesh");
+    let doc_dv = doc_out.metrics.volume - unfilleted.metrics.volume;
+    let doc_fit = under_head_fillet_r_median_err(&doc_out.mesh, 5.3, 4.0, 0.8);
+    eprintln!(
+        "R=0.8 document-path: ΔV={doc_dv:.3} fit={doc_fit:?} prov={:?}",
+        doc_out.metrics.mesh_provenance
+    );
+    let (dn, derr) = doc_fit.unwrap_or_else(|| {
+        panic!("Inspector document-path under_head R=0.8 is NONE (ΔV={doc_dv:.3})")
+    });
+    assert!(
+        dn >= 12 && derr <= 0.35,
+        "Inspector document-path R=0.8: n={dn} err={derr:.3} ΔV={doc_dv:.3}"
+    );
+
+    // Inspector names under-head edges from hex+shank topology, then fillets
+    // those indices at R=0.8 (not "all").
+    let hex_shank = hex_shank_program();
+    let topo = Engine::new()
+        .list_topology(&hex_shank)
+        .expect("hex+shank topology");
+    let mut idxs: Vec<usize> = Vec::new();
+    for e in &topo.edges {
+        let r = e.mid[0].hypot(e.mid[1]);
+        let on_junction_z = (e.mid[2] - 5.3).abs() <= 0.85;
+        let around_shank = r >= 4.0 - 0.35 && r <= 4.0 + 2.8;
+        let named = e
+            .tags
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("circle") || t.eq_ignore_ascii_case("underhead"));
+        let circular = e.curve_type.to_ascii_lowercase().contains("circle");
+        if on_junction_z && around_shank && (named || circular || e.length > 4.0) {
+            idxs.push(e.index);
+        }
+    }
+    idxs.sort_unstable();
+    idxs.dedup();
+    eprintln!("R=0.8 Inspector edge indices: {idxs:?}");
+    let mut ir: serde_json::Value =
+        serde_json::from_str(include_str!("../../../tests/reports/m8_x40.json")).unwrap();
+    let feat = if idxs.is_empty() {
+        serde_json::json!({ "op": "fillet", "radius": 0.8, "edges": "all" })
+    } else {
+        serde_json::json!({ "op": "fillet", "radius": 0.8, "edges": idxs })
+    };
+    let features = ir["bodies"][0]["features"].as_array_mut().unwrap();
+    let insert_at = features
+        .iter()
+        .position(|f| f["op"] == "cylinder")
+        .map(|i| i + 1)
+        .unwrap_or(features.len());
+    features.insert(insert_at, feat);
+    let named_doc = CadDocument::from_json_value(ir).expect("named-edge fillet doc");
+    let named_out = Engine::new()
+        .execute_document(&named_doc)
+        .expect("named-edge R=0.8")
+        .into_model_output()
+        .expect("named mesh");
+    let named_dv = named_out.metrics.volume - unfilleted.metrics.volume;
+    let named_fit = under_head_fillet_r_median_err(&named_out.mesh, 5.3, 4.0, 0.8);
+    eprintln!("R=0.8 named-edge path: ΔV={named_dv:.3} fit={named_fit:?}");
+    let (nn, nerr) = named_fit.unwrap_or_else(|| {
+        panic!("Inspector named-edge under_head R=0.8 is NONE (ΔV={named_dv:.3}) idxs={idxs:?}")
+    });
+    assert!(
+        nn >= 12 && nerr <= 0.35,
+        "Inspector named-edge R=0.8: n={nn} err={nerr:.3} ΔV={named_dv:.3}"
+    );
+}
+
+fn iso_m8_x40_golden_document_with_fillet(radius: f64) -> CadDocument {
+    const RAW: &str = include_str!("../../../tests/reports/m8_x40.json");
+    let mut ir: serde_json::Value = serde_json::from_str(RAW).expect("golden JSON");
+    let feat = serde_json::json!({ "op": "fillet", "radius": radius, "edges": "all" });
+    let features = ir["bodies"][0]["features"]
+        .as_array_mut()
+        .expect("golden features");
+    let insert_at = features
+        .iter()
+        .position(|f| f["op"] == "cylinder")
+        .map(|i| i + 1)
+        .unwrap_or(features.len());
+    features.insert(insert_at, feat);
+    CadDocument::from_json_value(ir).expect("golden+fillet CadDocument")
+}

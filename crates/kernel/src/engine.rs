@@ -1797,14 +1797,21 @@ pub(crate) mod occt_backend {
     /// A few mm past the bearing face — enough for an under-head R, never a
     /// long uncut shank (must stay inside the 8-turn cap budget).
     fn underhead_fillet_keep_band(pitch: f64) -> f64 {
-        (pitch * 1.25).clamp(0.55, 2.0)
+        // Inspector real-R bar is ≈0.8 mm. The quarter-torus lives at
+        // z ∈ [thread_z0, thread_z0+R]; keep that plus a tessellation
+        // margin. Still clamp so the host cap stays inside the 8-turn budget.
+        (pitch * 1.25)
+            .max(0.8 + pitch * 0.75)
+            .clamp(0.55, 2.0)
     }
 
     fn strip_thread_envelope(mesh: &MeshData, tp: &ThreadPreview) -> MeshData {
         let r_major = tp.major * 0.5;
         let r_wall = r_major + tp.pitch * 0.15;
         let r_wall2 = (r_wall * r_wall) as f32;
-        let r_fillet = (r_major + 0.03) as f32;
+        // Inspector samples the torus at r > r_major+0.06. A tight +0.03
+        // keep plus coarse host tessellation starved R=0.8 (n<12 / NONE).
+        let r_fillet = (r_major - 0.02) as f32;
         let z0 = tp.at[2] as f32;
         let z1 = (tp.at[2] + tp.length) as f32;
         let z_fillet = z0 + underhead_fillet_keep_band(tp.pitch) as f32;
@@ -2718,6 +2725,19 @@ pub(crate) mod occt_backend {
             if !circles.is_empty() {
                 return circles;
             }
+            // Inspector names bearing-face hex flats as "under-head" because
+            // list_topology used to report axis-centered circle mids at r=0,
+            // so the Ø junction never entered the index list. If the caller
+            // pointed at the head/shank junction band, still blend the circle
+            // so R≈0.8 is a real torus (not ΔV-only hex corners).
+            if candidates_look_like_underhead(k, solid, &candidate_ids) {
+                if let Ok(all) = k.get_sub_shapes(solid, "edge") {
+                    let junctions = circular_junction_edges(k, solid, &all, 2);
+                    if !junctions.is_empty() {
+                        return junctions;
+                    }
+                }
+            }
         }
         let straight_ids = filter_to_line_edges(k, candidate_ids.clone());
         let pool = if !straight_ids.is_empty() {
@@ -2726,6 +2746,34 @@ pub(crate) mod occt_backend {
             candidate_ids
         };
         select_blend_edges(k, solid, pool, radius)
+    }
+
+    /// True when named edges sit on the bearing-face / first-thread band
+    /// (Inspector's under-head picker), not the hex crown or the tip.
+    fn candidates_look_like_underhead(
+        k: &mut occt_wasm::OcctKernel,
+        solid: Handle,
+        ids: &[u32],
+    ) -> bool {
+        let Ok(bb) = k.get_bounding_box(solid, false) else {
+            return false;
+        };
+        let z0 = bb.min.z;
+        let zspan = (bb.max.z - bb.min.z).abs().max(1e-9);
+        let mut n = 0u32;
+        let mut near = 0u32;
+        for &id in ids {
+            let Ok(eb) = k.get_bounding_box(id_to_handle(id), false) else {
+                continue;
+            };
+            n += 1;
+            let midz = 0.5 * (eb.min.z + eb.max.z);
+            let z_rel = (midz - z0) / zspan;
+            if (0.08..=0.22).contains(&z_rel) {
+                near += 1;
+            }
+        }
+        n > 0 && near * 2 >= n
     }
 
     fn handle_chamfer(
@@ -4723,22 +4771,34 @@ pub(crate) mod occt_backend {
             for (index, &id) in edge_ids.iter().enumerate() {
                 let h = id_to_handle(id);
                 let length = k.get_length(h).unwrap_or(0.0);
+                let curve_type = k.curve_type(h).unwrap_or_else(|_| "unknown".into());
                 let bb = k.get_bounding_box(h, false).ok();
                 let mid = bb
                     .map(|b| {
-                        [
-                            0.5 * (b.min.x + b.max.x),
-                            0.5 * (b.min.y + b.max.y),
-                            0.5 * (b.min.z + b.max.z),
-                        ]
+                        let cx = 0.5 * (b.min.x + b.max.x);
+                        let cy = 0.5 * (b.min.y + b.max.y);
+                        let cz = 0.5 * (b.min.z + b.max.z);
+                        // Axis-centered circles have bbox mid on the axis (r=0).
+                        // Inspector's under-head filter uses mid XY radius
+                        // (`around_shank`); report a point on the curve.
+                        let circular = curve_type.to_ascii_lowercase().contains("circle");
+                        if circular && cx.hypot(cy) < 0.5 {
+                            let rx = 0.5 * (b.max.x - b.min.x).abs();
+                            [cx + rx, cy, cz]
+                        } else {
+                            [cx, cy, cz]
+                        }
                     })
                     .unwrap_or([0.0; 3]);
-                let curve_type = k.curve_type(h).unwrap_or_else(|_| "unknown".into());
                 let mut tags = Vec::new();
                 if curve_type.eq_ignore_ascii_case("line") {
                     tags.push("line".into());
                 } else if curve_type.to_ascii_lowercase().contains("circle") {
                     tags.push("circle".into());
+                    let r = mid[0].hypot(mid[1]);
+                    if r > 1.5 && r < 12.0 {
+                        tags.push("underhead".into());
+                    }
                 }
                 edges.push(crate::topology::EdgeInfo {
                     index,
