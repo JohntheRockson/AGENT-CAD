@@ -95,20 +95,37 @@ pub struct ThreadInstancePlan {
 }
 
 impl ThreadInstancePlan {
-    /// Window starts along the thread, last start = `length - usable` so the
-    /// rod never overshoots the tip (bbox stays tip-to-top honest).
+    /// Window starts along the thread. Interior and last stations sit on the
+    /// integer-stride lattice (pure Z-translate). The last rod may overshoot
+    /// `length` by <1 stride; callers crop the tip so bbox stays honest.
     pub fn window_starts(&self, length: f64) -> Vec<f64> {
         if length <= self.usable + 1e-9 {
             return vec![0.0];
         }
-        let last_start = length - self.usable;
+        // `length - usable` is generally a fractional turn (M8×40: 28.45 mm =
+        // 22.76 P). That leftover yaw on Frenet/bead residuals showed up as a
+        // ~0.16-turn helix jump / RMS flap at the last instance seam. Snap the
+        // last station onto the integer-stride lattice (pure Z-translate);
+        // callers crop the overshoot so the tip stays honest.
+        let last_raw = (length - self.usable).max(0.0);
+        let last_start = if self.stride > 1e-12 {
+            let n = (last_raw / self.stride).ceil().max(0.0);
+            n * self.stride
+        } else {
+            last_raw
+        };
         let mut starts = Vec::new();
         let mut z = 0.0;
         while z < last_start - 1e-9 {
             starts.push(z);
             z += self.stride;
         }
-        starts.push(last_start);
+        if starts
+            .last()
+            .is_none_or(|&s| (s - last_start).abs() > 1e-9)
+        {
+            starts.push(last_start);
+        }
         starts
     }
 }
@@ -1601,8 +1618,15 @@ pub(crate) mod occt_backend {
         // Do not strip_z_caps on the cropped rod: the crop plane already
         // removed proto end disks, and |nz|≈1 tests also eat U-groove flanks
         // at every window, which starved yaw and looked like a seam.
+        let tip_z = tp.at[2] + tp.length;
         for &z_along in &starts {
-            parts.push(place_thread_mesh(&cropped, &tp, z_along));
+            let mut placed = place_thread_mesh(&cropped, &tp, z_along);
+            // Integer-stride last station can overshoot the tip by <1 stride.
+            // Crop (do not leave a longer bbox, and do not tessellate extra).
+            if z_along + plan.usable > tp.length + 1e-9 {
+                placed = super::crop_thread_mesh_to_z_hi(&placed, tip_z);
+            }
+            parts.push(placed);
         }
         if starts.is_empty() {
             return Err(occt_err("thread preview produced no helical segments"));
@@ -4951,6 +4975,24 @@ pub fn crop_and_rephase_thread_mesh(
     yaw_translate_mesh(&cropped, -2.0 * std::f64::consts::PI * (z_lo / pitch.max(1e-9)), [0.0, 0.0, -z_lo], false)
 }
 
+/// Keep the settled helix up to `z_hi` and clamp any straddling vertices so
+/// an integer-stride last window cannot grow the tip past the thread length.
+pub fn crop_thread_mesh_to_z_hi(mesh: &MeshData, z_hi: f64) -> MeshData {
+    let z_hi_f = z_hi as f32;
+    let mut cropped = filter_mesh_triangles(mesh, |mesh, a, b, c| {
+        let za = mesh.positions[a * 3 + 2];
+        let zb = mesh.positions[b * 3 + 2];
+        let zc = mesh.positions[c * 3 + 2];
+        (za + zb + zc) / 3.0 <= z_hi_f + 0.04
+    });
+    for i in 0..cropped.positions.len() / 3 {
+        if cropped.positions[i * 3 + 2] > z_hi_f {
+            cropped.positions[i * 3 + 2] = z_hi_f;
+        }
+    }
+    cropped
+}
+
 /// Rotate a cropped thread-rod mesh about Z by the helix phase for `z_along`
 /// and translate it to `at + (0, 0, z_along)`.
 pub fn place_thread_segment(
@@ -5140,13 +5182,22 @@ mod thread_budget_tests {
         assert!((starts[0]).abs() < 1e-12);
         let last = *starts.last().unwrap();
         assert!(
-            (last + plan.usable - 34.7).abs() < 1e-9,
-            "last window must end at thread tip, last={last} usable={}",
+            last + plan.usable + 1e-9 >= 34.7,
+            "last window must cover the tip, last={last} usable={}",
             plan.usable
         );
+        let last_turns = last / 1.25;
         assert!(
-            starts.windows(2).all(|w| w[1] - w[0] > 0.0),
-            "window starts must be increasing"
+            (last_turns - last_turns.round()).abs() < 1e-9,
+            "last window start must be an integer number of pitches \
+             (old length-usable was 22.76 P / ~0.16-turn seam flap), got {last_turns}"
+        );
+        assert!(
+            starts.windows(2).all(|w| {
+                let dt = (w[1] - w[0]) / 1.25;
+                w[1] - w[0] > 0.0 && (dt - dt.round()).abs() < 1e-9
+            }),
+            "window starts must increase by integer turns, starts={starts:?}"
         );
     }
 
@@ -5225,6 +5276,37 @@ mod thread_budget_tests {
             d.abs() < 0.08,
             "overlapping instances must share helix yaw, Δ={d:.4} ({ya} vs {yb})"
         );
+    }
+
+    #[test]
+    fn m8_last_window_is_integer_turns_not_length_minus_usable() {
+        let plan = plan_thread_instances(34.7, 1.25).expect("M8×40 must instance");
+        let starts = plan.window_starts(34.7);
+        let last = *starts.last().unwrap();
+        // The pre-fix last station (length - usable) was 28.45 mm = 22.76 P.
+        let fractional_legacy = 34.7 - plan.usable;
+        assert!(
+            ((fractional_legacy / 1.25) - (fractional_legacy / 1.25).round()).abs() > 0.05,
+            "fixture drift: length-usable is no longer a fractional turn"
+        );
+        assert!(
+            (last - fractional_legacy).abs() > 1e-6,
+            "last start must not stay on the fractional length-usable station"
+        );
+        let cropped = crop_thread_mesh_to_z_hi(
+            &synthetic_helix_ribbon(1.25, plan.usable + 2.0, 3.3, 16),
+            plan.usable - 0.4,
+        );
+        let zmax = cropped
+            .positions
+            .chunks(3)
+            .filter_map(|c| c.get(2).copied())
+            .fold(f32::MIN, f32::max);
+        assert!(
+            zmax <= (plan.usable - 0.4) as f32 + 1e-5,
+            "tip crop must not leave vertices past z_hi, zmax={zmax}"
+        );
+        assert!(!cropped.positions.is_empty(), "tip crop kept the rod");
     }
 }
 

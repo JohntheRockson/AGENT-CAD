@@ -917,14 +917,15 @@ fn helix_phase_from_yaw(z: f64, yaw: f64, pitch: f64) -> f64 {
     (z / pitch.max(1e-9) - yaw / (2.0 * std::f64::consts::PI)).rem_euclid(1.0)
 }
 
-/// Fail if instanced slabs meet with a visible helix step (Ian's mid-shank
-/// horizontal jumps). Does not loosen the mid-shank helix / ISO checks.
-fn assert_helix_continuous_across_instance_windows(
+/// Ian / Atlas helix-continuity metrics. Thresholds stay fail-closed:
+/// worst jump < 0.10 turn and RMS < 0.08. A ~0.163 jump (or RMS past 0.08)
+/// is the #22 CI flap — do not loosen these.
+fn helix_window_continuity_stats(
     mesh: &kernel::engine::MeshData,
     pitch: f64,
     z0: f64,
     z1: f64,
-) {
+) -> (usize, f64, f64, f64) {
     let step = (pitch * 0.40).clamp(0.35, 0.55);
     let mut phases: Vec<(f64, f64)> = Vec::new();
     let mut z = z0;
@@ -934,12 +935,9 @@ fn assert_helix_continuous_across_instance_windows(
         }
         z += step;
     }
-    assert!(
-        phases.len() >= 8,
-        "too few deep-groove phase samples ({}) between {z0:.1} and {z1:.1} — \
-         cannot inspect instance seams",
-        phases.len()
-    );
+    if phases.len() < 2 {
+        return (phases.len(), f64::NAN, f64::NAN, z0);
+    }
     let mut unwrapped = vec![phases[0].1];
     for i in 1..phases.len() {
         let mut p = phases[i].1;
@@ -964,6 +962,26 @@ fn assert_helix_continuous_across_instance_windows(
     let mean = unwrapped.iter().sum::<f64>() / unwrapped.len() as f64;
     let var = unwrapped.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / unwrapped.len() as f64;
     let rms = var.sqrt();
+    (phases.len(), worst, rms, worst_at)
+}
+
+/// Fail if instanced slabs meet with a visible helix step (Ian's mid-shank
+/// horizontal jumps). Does not loosen the mid-shank helix / ISO checks.
+fn assert_helix_continuous_across_instance_windows(
+    mesh: &kernel::engine::MeshData,
+    pitch: f64,
+    z0: f64,
+    z1: f64,
+) {
+    let (n, worst, rms, worst_at) = helix_window_continuity_stats(mesh, pitch, z0, z1);
+    eprintln!(
+        "helix continuity: samples={n} worst={worst:.4} turn rms={rms:.4} at z={worst_at:.2}"
+    );
+    assert!(
+        n >= 8,
+        "too few deep-groove phase samples ({n}) between {z0:.1} and {z1:.1} — \
+         cannot inspect instance seams"
+    );
     assert!(
         worst < 0.10 && rms < 0.08,
         "helix phase jumps {worst:.3} turn (rms {rms:.3}) near z={worst_at:.2} \
