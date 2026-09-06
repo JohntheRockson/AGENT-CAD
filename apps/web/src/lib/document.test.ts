@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import {
   applyParameterBatch,
   collectParameterBatch,
+  committedParametersSignature,
+  countUncommittedParameters,
   explicitParameterNames,
   inferBoltParameters,
   isExplicitParameter,
@@ -12,9 +14,13 @@ import {
   parseParameterDraft,
   parseSceneJson,
   prettyDocument,
+  reconcileParameterDrafts,
   resolvedParameters,
   setDocumentParameter,
   sliderBounds,
+  toolbarRewriteConfirmMessage,
+  uncommittedParameterChatWarning,
+  uncommittedParameterExportNote,
 } from './document.ts'
 import type { CadDocument, CylinderOp, ExtrudeOp, Feature, ThreadOp } from '../types/cad.ts'
 
@@ -387,6 +393,73 @@ function almost(a: number, b: number, eps = 1e-9) {
   assert.equal(collected.values.head_width, undefined)
   assert.deepEqual(collected.deletes, ['head_width'])
   assert.deepEqual(collected.invalid, [])
+}
+
+// 8. Drafts survive cosmetic IR updates; prune after Calculate / lost names
+{
+  const committed = { bolt_length: 40, head_height: 5.3, dead_height: 0 }
+  const explicit = ['bolt_length', 'head_height', 'dead_height']
+  const kept = reconcileParameterDrafts({
+    committed,
+    explicitNames: explicit,
+    drafts: { bolt_length: '50', head_height: '5.3', dead_height: 'nope' },
+    pendingDeletes: ['head_height'],
+  })
+  // Cosmetic IR (rename / Run pretty-print): same committed values keep dirty + invalid.
+  almost(Number(kept.drafts.bolt_length), 50)
+  assert.equal(kept.drafts.head_height, undefined, 'draft matching committed is pruned')
+  assert.equal(kept.drafts.dead_height, 'nope')
+  assert.deepEqual(kept.pendingDeletes, ['head_height'])
+  assert.equal(
+    committedParametersSignature(committed),
+    committedParametersSignature({ dead_height: 0, bolt_length: 40, head_height: 5.3 }),
+  )
+}
+
+{
+  // After Calculate commits 50, the matching draft is no longer dirty.
+  const afterCalc = reconcileParameterDrafts({
+    committed: { bolt_length: 50, head_height: 5.3, dead_height: 0 },
+    explicitNames: ['bolt_length', 'head_height', 'dead_height'],
+    drafts: { bolt_length: '50' },
+    pendingDeletes: [],
+  })
+  assert.deepEqual(afterCalc.drafts, {})
+}
+
+{
+  // Deleted explicit name that reappears as inferred-only must not stay pending-delete.
+  const afterDelete = reconcileParameterDrafts({
+    committed: { bolt_length: 50, head_height: 5.3, dead_height: 0 },
+    explicitNames: ['head_height', 'dead_height'],
+    drafts: { bolt_length: '55', gone: '1' },
+    pendingDeletes: ['bolt_length', 'gone'],
+  })
+  assert.equal(afterDelete.drafts.gone, undefined)
+  almost(Number(afterDelete.drafts.bolt_length), 55)
+  assert.deepEqual(afterDelete.pendingDeletes, [])
+}
+
+{
+  assert.ok(
+    uncommittedParameterChatWarning(2).includes('last calculated model'),
+  )
+  assert.ok(uncommittedParameterChatWarning(1).includes('1 uncommitted'))
+  assert.ok(uncommittedParameterExportNote(2).includes('export is the last calculated'))
+  const rewrite = toolbarRewriteConfirmMessage(0)
+  assert.ok(rewrite.includes('loaded golden'))
+  assert.ok(!rewrite.includes('uncommitted'))
+  const rewriteDirty = toolbarRewriteConfirmMessage(1)
+  assert.ok(rewriteDirty.includes('1 uncommitted parameter change'))
+  assert.ok(rewriteDirty.includes('will not be sent to the agent'))
+  assert.equal(
+    countUncommittedParameters({
+      values: { bolt_length: 50 },
+      deletes: ['head_width'],
+      invalid: ['dead_height'],
+    }),
+    3,
+  )
 }
 
 console.log('document.test.ts: all assertions passed')

@@ -81,6 +81,10 @@ interface CadStore {
   exportStatus: string | null
   runError:   string | null
 
+  /** Panel-local Calculate drafts (not IR). Chat/export can warn without reading the panel. */
+  uncommittedParameterCount: number
+  setUncommittedParameterCount: (n: number) => void
+
   messages:      ChatMessage[]
   isChatLoading: boolean
 
@@ -143,6 +147,10 @@ export const useCadStore = create<CadStore>((set, get) => ({
   isExporting: false,
   exportStatus: null,
   runError:   null,
+
+  uncommittedParameterCount: 0,
+  setUncommittedParameterCount: (n) =>
+    set({ uncommittedParameterCount: n > 0 ? n : 0 }),
 
   messages:      [],
   isChatLoading: false,

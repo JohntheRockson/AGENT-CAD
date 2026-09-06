@@ -5,6 +5,7 @@ import {
   CheckCircle2, XCircle,
 } from 'lucide-react'
 import { useCadStore } from '../store/useStore'
+import { uncommittedParameterChatWarning } from '../lib/document'
 import type { ActivityKind, ActivityStep, VerificationCheck } from '../types/cad'
 
 // ── Suggestion chips ──────────────────────────────────────────────────
@@ -23,10 +24,12 @@ const SUGGESTIONS = [
 export function ChatPanel() {
   const messages        = useCadStore((s) => s.messages)
   const isChatLoading   = useCadStore((s) => s.isChatLoading)
+  const isRunning       = useCadStore((s) => s.isRunning)
   const sendChatMessage = useCadStore((s) => s.sendChatMessage)
   const bodies          = useCadStore((s) => s.bodies)
   const selectedBodyId  = useCadStore((s) => s.selectedBodyId)
   const selectBody      = useCadStore((s) => s.selectBody)
+  const uncommittedParameterCount = useCadStore((s) => s.uncommittedParameterCount)
 
   const selected = bodies.find((b) => b.bodyId === selectedBodyId)
 
@@ -45,7 +48,10 @@ export function ChatPanel() {
 
   const handleSend = () => {
     const text = draft.trim()
-    if (!text || isChatLoading) return
+    if (!text || isChatLoading || isRunning) return
+    if (uncommittedParameterCount > 0) {
+      if (!window.confirm(uncommittedParameterChatWarning(uncommittedParameterCount))) return
+    }
     setDraft('')
     sendChatMessage(text)
   }
@@ -168,6 +174,14 @@ export function ChatPanel() {
       <div className="border-t border-border p-2.5 space-y-2 flex-shrink-0">
 
         {/* Body scope chip */}
+        {uncommittedParameterCount > 0 && (
+          <p className="px-1 text-[10px] text-yellow-400/90 leading-snug">
+            {uncommittedParameterCount} uncommitted parameter
+            {uncommittedParameterCount === 1 ? ' change' : ' changes'} — chat uses the last
+            calculated model until Calculate.
+          </p>
+        )}
+
         {selected && (
           <div className="flex items-center gap-1.5 px-1">
             <span className="text-[10px] text-dim">Editing body:</span>
@@ -209,7 +223,7 @@ export function ChatPanel() {
           </div>
           <button
             onClick={handleSend}
-            disabled={!draft.trim() || isChatLoading}
+            disabled={!draft.trim() || isChatLoading || isRunning}
             className="w-9 h-9 rounded-xl bg-accent text-white flex items-center justify-center
                        hover:bg-accent-lite disabled:opacity-30 disabled:cursor-not-allowed
                        transition-colors flex-shrink-0 shadow-sm"

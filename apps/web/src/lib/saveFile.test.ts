@@ -36,5 +36,6 @@ assert.deepEqual(
   }),
   { ok: true },
 )
+// Panel Calculate drafts do not mutate IR — export stays last-good when IR matches.
 
 console.log('saveFile.test.ts: all assertions passed')

@@ -1,8 +1,10 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { SlidersHorizontal, Loader2, Trash2, RotateCcw } from 'lucide-react'
 import { useCadStore } from '../store/useStore'
 import {
   collectParameterBatch,
+  committedParametersSignature,
+  countUncommittedParameters,
   explicitParameterNames,
   formatParameterName,
   isExplicitParameter,
@@ -10,6 +12,7 @@ import {
   parameterEntries,
   parseParameterDraft,
   parseSceneJson,
+  reconcileParameterDrafts,
   sameParameterValue,
   sliderBounds,
   unitSuffix,
@@ -18,21 +21,16 @@ import {
 export function ParametersPanel() {
   const irCode              = useCadStore((s) => s.irCode)
   const isRunning           = useCadStore((s) => s.isRunning)
+  const isChatLoading       = useCadStore((s) => s.isChatLoading)
   const timeline            = useCadStore((s) => s.timeline)
   const timelineIndex       = useCadStore((s) => s.timelineIndex)
   const calculateParameters = useCadStore((s) => s.calculateParameters)
+  const setUncommittedParameterCount = useCadStore((s) => s.setUncommittedParameterCount)
 
   const [open, setOpen] = useState(true)
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [pendingDeletes, setPendingDeletes] = useState<string[]>([])
-  const [draftIr, setDraftIr] = useState(irCode)
-
-  // New committed IR (Calculate success, chat, timeline) clears local drafts.
-  if (draftIr !== irCode) {
-    setDraftIr(irCode)
-    setDrafts({})
-    setPendingDeletes([])
-  }
+  const [committedSig, setCommittedSig] = useState('')
 
   const doc = useMemo(() => {
     try {
@@ -48,6 +46,20 @@ export function ParametersPanel() {
     () => Object.fromEntries(entries),
     [entries],
   )
+  const nextCommittedSig = committedParametersSignature(committed)
+  // Cosmetic IR (pretty-print Run, rename, hide) keeps still-dirty drafts.
+  // Calculate / chat / timeline change committed values and prune what no longer applies.
+  if (committedSig !== nextCommittedSig) {
+    setCommittedSig(nextCommittedSig)
+    const next = reconcileParameterDrafts({
+      committed,
+      explicitNames,
+      drafts,
+      pendingDeletes,
+    })
+    setDrafts(next.drafts)
+    setPendingDeletes(next.pendingDeletes)
+  }
   const atTip = timeline.length === 0 || timelineIndex >= timeline.length - 1
 
   const batch = useMemo(
@@ -61,8 +73,14 @@ export function ParametersPanel() {
     [committed, explicitNames, drafts, pendingDeletes],
   )
 
-  const dirtyCount = Object.keys(batch.values).length + batch.deletes.length
-  const canCalculate = dirtyCount > 0 && batch.invalid.length === 0 && !isRunning
+  const dirtyCount = countUncommittedParameters(batch)
+  const busy = isRunning || isChatLoading
+  const canCalculate = dirtyCount > 0 && batch.invalid.length === 0 && !busy
+
+  useEffect(() => {
+    setUncommittedParameterCount(dirtyCount)
+    return () => setUncommittedParameterCount(0)
+  }, [dirtyCount, setUncommittedParameterCount])
 
   const setDraft = useCallback((name: string, raw: string) => {
     setDrafts((prev) => ({ ...prev, [name]: raw }))
@@ -151,7 +169,7 @@ export function ParametersPanel() {
               name={name}
               committed={value}
               draft={draft}
-              disabled={isRunning}
+              disabled={busy}
               dirty={dirtyValue}
               invalid={invalid}
               pendingDelete={pendingDelete}
@@ -181,11 +199,13 @@ export function ParametersPanel() {
                 : 'No uncommitted parameter changes'
           }
         >
-          {isRunning ? <Loader2 size={10} className="animate-spin" /> : null}
+          {busy ? <Loader2 size={10} className="animate-spin" /> : null}
           Calculate
         </button>
         {isRunning ? (
           <span className="text-[10px] text-accent">Rebuilding…</span>
+        ) : isChatLoading ? (
+          <span className="text-[10px] text-accent">Agent busy…</span>
         ) : dirtyCount > 0 ? (
           <span className="text-[10px] text-muted">
             {dirtyCount} uncommitted

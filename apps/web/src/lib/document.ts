@@ -258,6 +258,76 @@ export function collectParameterBatch(opts: {
   return { values, deletes, invalid }
 }
 
+/** Dirty value edits + pending deletes + invalid drafts (all uncommitted panel work). */
+export function countUncommittedParameters(batch: {
+  values: Record<string, number>
+  deletes: string[]
+  invalid: string[]
+}): number {
+  return Object.keys(batch.values).length + batch.deletes.length + batch.invalid.length
+}
+
+/**
+ * Keep still-dirty drafts across cosmetic IR updates (pretty-print Run,
+ * rename, visibility). Drop drafts/deletes that no longer apply after
+ * Calculate, chat, or a timeline restore changed committed values.
+ */
+export function reconcileParameterDrafts(opts: {
+  committed: Record<string, number>
+  explicitNames: readonly string[]
+  drafts: Record<string, string>
+  pendingDeletes: readonly string[]
+}): { drafts: Record<string, string>; pendingDeletes: string[] } {
+  const drafts: Record<string, string> = {}
+  for (const [name, raw] of Object.entries(opts.drafts)) {
+    if (!Object.prototype.hasOwnProperty.call(opts.committed, name)) continue
+    const current = opts.committed[name]!
+    const parsed = parseParameterDraft(raw, name)
+    if (parsed == null) {
+      if (raw !== String(current)) drafts[name] = raw
+      continue
+    }
+    if (!sameParameterValue(parsed, current)) drafts[name] = raw
+  }
+  const explicit = new Set(opts.explicitNames)
+  const pendingDeletes = opts.pendingDeletes.filter((name) => explicit.has(name))
+  return { drafts, pendingDeletes }
+}
+
+export function committedParametersSignature(committed: Record<string, number>): string {
+  return JSON.stringify(
+    Object.keys(committed)
+      .sort()
+      .map((name) => [name, committed[name]]),
+  )
+}
+
+/** Chat/toolbar copy: agent sees last calculated IR, not panel drafts. */
+export function uncommittedParameterChatWarning(dirtyCount: number): string {
+  const n =
+    dirtyCount === 1
+      ? '1 uncommitted parameter change'
+      : `${dirtyCount} uncommitted parameter changes`
+  return `You have ${n}. The agent will see the last calculated model, not these drafts. Continue?`
+}
+
+export function toolbarRewriteConfirmMessage(dirtyCount: number): string {
+  const base =
+    'This tool asks the AI to rewrite the current solid, including a loaded golden. Continue?'
+  if (dirtyCount <= 0) return base
+  const n =
+    dirtyCount === 1
+      ? '1 uncommitted parameter change'
+      : `${dirtyCount} uncommitted parameter changes`
+  return `${base}\n\n${n} will not be sent to the agent.`
+}
+
+export function uncommittedParameterExportNote(dirtyCount: number): string {
+  return dirtyCount === 1
+    ? '1 uncommitted parameter change — export is the last calculated model'
+    : `${dirtyCount} uncommitted parameter changes — export is the last calculated model`
+}
+
 /** Scale numbers that match common ratios of the old parameter (hex vertices, halves). */
 function scaleLike(v: number, oldVal: number, newVal: number, key?: string): number | null {
   const tol = numberTol(oldVal)
