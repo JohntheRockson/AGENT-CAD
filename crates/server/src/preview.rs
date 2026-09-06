@@ -700,6 +700,10 @@ mod tests {
             reject_reason(&hex_plate, &out).is_none(),
             "preview must not reject a named hex plate with a tap"
         );
+        assert!(
+            quality_notes(&out)[0].fragmented,
+            "name-only quality_notes still flags hex plate; IR Thread is what exempts it"
+        );
 
         let prompt_example = kernel::CadDocument::from_json_value(serde_json::json!({
             "units": "mm",
