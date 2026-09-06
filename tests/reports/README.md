@@ -49,9 +49,15 @@ Exit code 0 only if **all** checks pass.
 
 1. **Viewport look-right** — helix (`angular_radius_spread`, `distinct_groove_yaws`),
    ISO-V profile, no vertical uncut strip. Stacked ticks fail.
+   Also **instance-window continuity** (deep-root helix phase worst < 0.10 turn,
+   rms < 0.08) and a **clean thread entry** (first turn is a groove on the helix,
+   not leftover cylinder / pipe-entry notch). Mid-shank AABB/helix can no longer
+   PASS with visible slab jumps — same bar as kernel #22
+   (`assert_helix_continuous_across_instance_windows` /
+   `assert_clean_thread_entry`).
 2. **STL look-right** — non-empty **and** same bbox as the viewport mesh **and**
-   the same helix/ISO-V/sliver asserts. A smooth Ø8 rod with the same AABB
-   must **FAIL** (AABB-only is not enough).
+   the same helix/ISO-V/sliver **and** continuity/entry asserts. A smooth Ø8 rod
+   or a seamed-slab helix with the same AABB must **FAIL** (AABB-only is not enough).
 3. **STEP honesty** — empty or crash = **FAIL** (honest on current main).
    When STEP exists: if the viewport is threaded but STEP is essentially the
    uncut hex+shank (smooth Ø8 / no groove / volume≈uncut), **FAIL**.

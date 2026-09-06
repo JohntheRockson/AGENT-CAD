@@ -22,6 +22,11 @@ pub const THREAD_LEN_MM: f64 = 34.7;
 pub const SHANK_Z0_MM: f64 = 12.0;
 pub const SHANK_Z1_MM: f64 = 28.0;
 
+/// Instance-window continuity band — matches `occt_geometry.rs` (#22)
+/// `assert_helix_continuous_across_instance_windows(..., zmin+8, zmin+36)`.
+pub const HELIX_WINDOW_Z0_MM: f64 = 8.0;
+pub const HELIX_WINDOW_Z1_MM: f64 = 36.0;
+
 pub const FILLET_RADIUS_MM: f64 = 0.8;
 
 pub fn load_golden_document(text: &str) -> Result<CadDocument, String> {

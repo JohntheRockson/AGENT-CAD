@@ -22,4 +22,6 @@ Feature recipe (mm, +Z shank):
 4. External thread M8 × 34.7 at `[0, 0, 5.3]`
 
 Look-right (viewport + STL) must see a helix / ISO-V groove, not stacked
-ticks or a smooth Ø8 rod that merely shares this AABB.
+ticks or a smooth Ø8 rod that merely shares this AABB. The helix must
+also continue across instance-window seams (deep-root phase) and the
+dead→thread start must be a groove, not leftover cylinder.

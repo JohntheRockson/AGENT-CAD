@@ -391,6 +391,7 @@ mod tests {
             bbox: bbox_from_mesh(&base_mesh),
             surface_area: 1.0,
             is_solid: true,
+            mesh_provenance: Default::default(),
         };
         let head = hex_head_metrics(&base_mesh, SHANK_R_MM);
         let mut filleted = base.clone();
@@ -416,6 +417,7 @@ mod tests {
             bbox: bbox_from_mesh(&base_mesh),
             surface_area: 1.0,
             is_solid: true,
+            mesh_provenance: Default::default(),
         };
         let head = hex_head_metrics(&base_mesh, SHANK_R_MM);
         let (ok, detail, _, _) = check_fillet(
@@ -436,6 +438,7 @@ mod tests {
             bbox: bbox_from_mesh(&base_mesh),
             surface_area: 1.0,
             is_solid: true,
+            mesh_provenance: Default::default(),
         };
         let head = hex_head_metrics(&base_mesh, SHANK_R_MM);
         let filleted_mesh = synthetic_under_head_fillet_mesh(FILLET_RADIUS_MM);
@@ -444,6 +447,7 @@ mod tests {
             bbox: bbox_from_mesh(&filleted_mesh),
             surface_area: 1.0,
             is_solid: true,
+            mesh_provenance: Default::default(),
         };
         let (ok, detail, _, _) = check_fillet(
             &Ok((filleted, filleted_mesh)),

@@ -347,6 +347,7 @@ mod tests {
             bbox: [-7.5, -6.5, 0.0, 7.5, 6.5, 40.0],
             surface_area: 1.0,
             is_solid: true,
+            mesh_provenance: Default::default(),
         };
         let c = check_step_honest(&step, None, Some(&helix), Some(&uncut_metrics), None);
         assert!(!c.ok, "uncut host must FAIL: {}", c.detail);

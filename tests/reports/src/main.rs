@@ -310,6 +310,8 @@ fn run() -> Result<bool, String> {
             n_yaws: 0,
             sliver_ok: false,
             iso_v_ok: false,
+            continuous_ok: false,
+            entry_ok: false,
         });
     let (stl_pass, stl_detail, stl_bbox) =
         check_stl_look_right(&stl_bytes, mesh_bbox, baseline.as_ref().map(|o| &o.mesh));
@@ -340,17 +342,26 @@ fn run() -> Result<bool, String> {
         failed_cmds.push(format!("fillet R: {fillet_detail}"));
     }
 
+    let helix_windows_pass = look.continuous_ok && look.entry_ok;
+    let helix_windows_detail = if helix_windows_pass {
+        "helix continuous across instance windows (worst < 0.10 turn, rms < 0.08); clean thread entry (first-turn groove on helix)".into()
+    } else {
+        look.detail.clone()
+    };
+
     let all_pass = golden_pass && look.ok && stl_pass && step.ok && fillet_pass;
 
     let report = ReportData {
         all_pass,
         golden_pass,
         look_pass: look.ok,
+        helix_windows_pass,
         step_pass: step.ok,
         stl_pass,
         fillet_pass,
         golden_detail,
         look_detail: look.detail.clone(),
+        helix_windows_detail,
         step_detail: step.detail.clone(),
         stl_detail,
         fillet_detail,
@@ -366,6 +377,8 @@ fn run() -> Result<bool, String> {
         look_variation: look.variation,
         look_spread: look.spread,
         look_yaws: look.n_yaws,
+        look_continuous: look.continuous_ok,
+        look_entry: look.entry_ok,
         uses_occt: engine.uses_occt(),
         log,
         failed_cmds,
@@ -465,11 +478,13 @@ struct ReportData {
     all_pass: bool,
     golden_pass: bool,
     look_pass: bool,
+    helix_windows_pass: bool,
     step_pass: bool,
     stl_pass: bool,
     fillet_pass: bool,
     golden_detail: String,
     look_detail: String,
+    helix_windows_detail: String,
     step_detail: String,
     stl_detail: String,
     fillet_detail: String,
@@ -485,6 +500,8 @@ struct ReportData {
     look_variation: f64,
     look_spread: f64,
     look_yaws: usize,
+    look_continuous: bool,
+    look_entry: bool,
     uses_occt: bool,
     log: Vec<String>,
     failed_cmds: Vec<String>,
@@ -506,6 +523,7 @@ fn render_markdown(r: &ReportData) -> String {
     s.push_str(
         "Inspector only. No kernel/web/OCCT-WASM edits. Kernel owns STEP implementation. \
          A silent fillet no-op is FAIL. AABB-only STL of a smooth rod is FAIL. \
+         A mid-shank helix/AABB bar with instance-window seams or a dead→thread entry notch is FAIL. \
          STEP that is empty/crash **or** ≈ the uncut hex+shank while the viewport is threaded is FAIL.\n\n",
     );
     s.push_str("## How to run\n\n");
@@ -525,7 +543,12 @@ fn render_markdown(r: &ReportData) -> String {
         escape_md(&r.look_detail)
     ));
     s.push_str(&format!(
-        "| 2) STL look-right (not AABB-only; smooth rod = FAIL) | {} | {} |\n",
+        "| 1b) instance-window helix continuity + clean thread entry | {} | {} |\n",
+        mark(r.helix_windows_pass),
+        escape_md(&r.helix_windows_detail)
+    ));
+    s.push_str(&format!(
+        "| 2) STL look-right (not AABB-only; smooth rod / seamed slab = FAIL) | {} | {} |\n",
         mark(r.stl_pass),
         escape_md(&r.stl_detail)
     ));
@@ -635,6 +658,7 @@ fn report_json(r: &ReportData) -> serde_json::Value {
         "checks": {
             "iso_caliper_golden": { "result": mark(r.golden_pass), "detail": r.golden_detail },
             "viewport_look_right": { "result": mark(r.look_pass), "detail": r.look_detail },
+            "helix_continuous_and_clean_entry": { "result": mark(r.helix_windows_pass), "detail": r.helix_windows_detail },
             "stl_look_right_not_aabb_only": { "result": mark(r.stl_pass), "detail": r.stl_detail },
             "step_honesty": { "result": mark(r.step_pass), "detail": r.step_detail },
             "fillet_under_head_or_named_r": { "result": mark(r.fillet_pass), "detail": r.fillet_detail },
@@ -643,6 +667,8 @@ fn report_json(r: &ReportData) -> serde_json::Value {
             "variation": r.look_variation,
             "spread": r.look_spread,
             "distinct_yaws": r.look_yaws,
+            "continuous_ok": r.look_continuous,
+            "entry_ok": r.look_entry,
         },
         "files": {
             "obj_bytes": r.obj_bytes,
