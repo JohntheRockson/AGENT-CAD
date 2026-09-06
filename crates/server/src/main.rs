@@ -1351,7 +1351,7 @@ fn fastener_repair_hint(err: &str) -> String {
         || l.contains("grip")
         || l.contains("pitch")
     {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. hex AF must match head_width. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted). Fillet under-head before thread. Chamfer the tip edges:\"top\". Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. hex AF must match head_width. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. Fillet under-head before thread. Chamfer the tip edges:\"top\". Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
     } else {
         String::new()
     }
@@ -1826,6 +1826,40 @@ mod tests {
             l.contains("chamfer") && l.contains("all"),
             "{reason}"
         );
+
+        // Cycle 2 hole: omit pitch, hard-code thread.pitch 2.0 next to size M8.
+        let omitted_pitch = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "pitch": 2.0, "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&omitted_pitch)
+            .expect("omitted pitch + M8 + thread.pitch 2.0 must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("pitch") && (l.contains("iso") || l.contains("omitted") || l.contains("1.25")),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -1879,6 +1913,16 @@ mod tests {
         assert!(
             !fastener_repair_hint(chamfer_all_reason).is_empty(),
             "repair hint must fire on the chamfer-all reason"
+        );
+        assert!(
+            l.contains("thread.pitch") || (l.contains("pitch") && l.contains("omitted")),
+            "repair must reteach ISO pitch when the pitch param is omitted: {hint}"
+        );
+        let pitch_reason =
+            "thread pitch must match the size-table pitch (or the ISO size token when pitch is omitted)";
+        assert!(
+            !fastener_repair_hint(pitch_reason).is_empty(),
+            "repair hint must fire on the omitted-pitch / ISO reason"
         );
         assert!(fastener_repair_hint("unrelated box error").is_empty());
     }

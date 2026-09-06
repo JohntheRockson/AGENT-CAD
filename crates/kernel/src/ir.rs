@@ -38,8 +38,10 @@ pub struct CadDocument {
     /// Recipe verify requires `head_width` to match hex AF, `major_diameter`
     /// (or the ISO size token when that param is omitted) to match the shank
     /// cylinder, and `dead_height` to drive thread start
-    /// (`head_height + dead_height`). Also require under-head fillet before
-    /// thread and a tip chamfer; never fillet or chamfer `edges:"all"` after the helix.
+    /// (`head_height + dead_height`). Explicit `thread.pitch` must match ISO
+    /// when the pitch param is omitted (M8 → 1.25). Also require under-head
+    /// fillet before thread and a tip chamfer; never fillet or chamfer
+    /// `edges:"all"` after the helix.
     #[serde(default)]
     pub parameters: BTreeMap<String, f64>,
     pub bodies: Vec<CadBody>,

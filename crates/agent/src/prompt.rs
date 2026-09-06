@@ -151,6 +151,7 @@ Reject fillet or chamfer edges:"all" after thread (that wrecks the helix).
 Reject a hex-head bolt fully threaded from the head (missing dead_height).
 head_width must drive the hex wrench size; dead_height must drive thread start.
 major_diameter (or the ISO size token when that param is omitted) must drive the shank cylinder.
+Explicit thread.pitch must match ISO when the pitch param is omitted (M8 is 1.25; prefer null).
 Require under-head fillet before thread and a tip chamfer (edges:"top").
 "#;
 
@@ -327,6 +328,10 @@ mod tests {
         assert!(
             v.contains("omitted") || v.contains("iso size"),
             "verify must bind the ISO size token when major_diameter is omitted"
+        );
+        assert!(
+            v.contains("thread.pitch") || (v.contains("pitch") && v.contains("1.25")),
+            "verify must bind explicit thread.pitch to ISO when pitch is omitted"
         );
         assert!(
             v.contains("fillet") && v.contains("before thread"),

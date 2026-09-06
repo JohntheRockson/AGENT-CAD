@@ -169,6 +169,8 @@ fn body_fastener_violation(
 /// match the size table when both are set (ISO `size:"M8"` may stay null).
 /// When `major_diameter` is omitted, the ISO size token still drives the
 /// shank (M8 → Ø8) — omitting the param is not a license to hard-code Ø10.
+/// When `pitch` is omitted, an explicit `thread.pitch` must still match
+/// the ISO token (M8 → 1.25).
 /// After those checks, require under-head fillet before thread and a tip
 /// chamfer (still reject fillet-`all` / chamfer-`all` after the helix).
 fn bolt_params_drive_hex_and_grip(
@@ -217,11 +219,12 @@ fn bolt_params_drive_hex_and_grip(
         params,
         &["major_diameter", "shank_diameter", "thread_diameter"],
     );
-    let iso_major = thread
+    let iso_spec = thread
         .size
         .as_deref()
-        .and_then(|s| kernel::thread::parse_size(s).ok())
-        .map(|spec| spec.major_diameter);
+        .and_then(|s| kernel::thread::parse_size(s).ok());
+    let iso_major = iso_spec.as_ref().map(|spec| spec.major_diameter);
+    let iso_pitch = iso_spec.as_ref().map(|spec| spec.pitch);
     if let (Some(md), Some(iso)) = (major, iso_major) {
         if (md - iso).abs() > 0.2 {
             return Some(
@@ -251,14 +254,15 @@ fn bolt_params_drive_hex_and_grip(
             );
         }
     }
-    if let (Some(p), Some(tp)) = (
-        first_param(params, &["pitch", "thread_pitch"]),
-        thread.pitch,
-    ) {
+    let pitch_param = first_param(params, &["pitch", "thread_pitch"]);
+    // When the pitch param is omitted, an explicit thread.pitch still has to
+    // match the ISO token (M8 → 1.25). Both-set stays the existing check.
+    if let (Some(p), Some(tp)) = (pitch_param.or(iso_pitch), thread.pitch) {
         if (p - tp).abs() > 0.05 {
             return Some(
-                "thread pitch must match the size-table pitch when both are set; \
-                 for M8 leave diameter/pitch null (ISO 261)"
+                "thread pitch must match the size-table pitch \
+                 (or the ISO size token when pitch is omitted); \
+                 for M8 leave diameter/pitch null (ISO 261 coarse 1.25)"
                     .into(),
             );
         }
@@ -1049,6 +1053,98 @@ mod tests {
         assert!(
             l.contains("major_diameter") || l.contains("iso") || l.contains("m8"),
             "reason should name the token/table conflict: {reason}"
+        );
+    }
+
+    /// Cycle 2 only compared thread.pitch to the size-table pitch when the
+    /// param was present. Omitting it and hard-coding thread.pitch 2.0 next
+    /// to size:"M8" still passed — a size-table lie by null. ISO token
+    /// (M8 → 1.25) must drive an explicit thread.pitch.
+    #[test]
+    fn fastener_rules_iso_size_drives_explicit_pitch_when_param_omitted() {
+        let hex_cyl_finish = |thread_pitch: Option<f64>| {
+            let mut thread = serde_json::json!({
+                "op": "thread", "kind": "external", "size": "M8",
+                "length": 26.7, "at": [0, 0, 13.3]
+            });
+            if let Some(p) = thread_pitch {
+                thread["pitch"] = serde_json::json!(p);
+            }
+            serde_json::json!([
+                { "op": "sketch", "plane": "XY",
+                  "profile": { "hex": { "across_flats": 13 } } },
+                { "op": "extrude", "depth": 5.3 },
+                { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                thread,
+                { "op": "chamfer", "distance": 0.5, "edges": "top" }
+            ])
+        };
+
+        let omitted_wrong = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(Some(2.0))
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&omitted_wrong)
+            .expect("omitted pitch + M8 + thread.pitch 2.0 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("pitch") && (l.contains("iso") || l.contains("omitted") || l.contains("1.25")),
+            "reason should name the undriven / ISO pitch: {reason}"
+        );
+
+        let omitted_null = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(None)
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&omitted_null).is_none(),
+            "size M8 with omitted pitch param and null thread.pitch must still pass"
+        );
+
+        let omitted_matches = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(Some(1.25))
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&omitted_matches).is_none(),
+            "explicit thread.pitch 1.25 next to M8 with omitted pitch param must pass"
         );
     }
 }
