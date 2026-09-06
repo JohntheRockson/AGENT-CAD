@@ -91,8 +91,8 @@ pub fn program_json_for_chat(doc: Option<&CadDocument>) -> Option<serde_json::Va
 /// hex → overlapping cylinder → thread CUT, when a fillet or chamfer uses
 /// `edges:"all"` after the thread (that wrecks the helix), when the
 /// ISO size table does not actually drive the hex / unthreaded grip
-/// (fully-threaded from the head, `head_width` ≠ hex AF, or
-/// `major_diameter` / ISO size token ≠ shank cylinder), or when the bolt
+/// (fully-threaded from the head, `head_width` ≠ hex AF, ISO M8 ≠ AF 13,
+/// or `major_diameter` / ISO size token ≠ shank cylinder), or when the bolt
 /// is missing an under-head fillet before thread or a tip chamfer.
 ///
 /// Internal taps (plate + tap) are not bolts and are left alone.
@@ -203,16 +203,37 @@ fn bolt_params_drive_hex_and_grip(
         _ => return None,
     };
 
-    if let (Some(hw), Some(af)) = (
-        first_param(params, &["head_width", "hex_width", "across_flats"]),
-        hex_af,
-    ) {
+    let head_width = first_param(params, &["head_width", "hex_width", "across_flats"]);
+    if let (Some(hw), Some(af)) = (head_width, hex_af) {
         if (hw - af).abs() > 0.2 {
             return Some(
                 "hex across_flats must be driven by head_width; \
                  do not hard-code a different wrench size than the size table"
                     .into(),
             );
+        }
+    }
+    // Cycle 1 only compared head_width to hex when the param was present.
+    // size:"M8" + head_width 10 + AF 10 (the old table) still passed — a
+    // consistent wrench-size lie. ISO 4014/4017 M8 is AF 13.
+    if let Some(iso_af) = iso_hex_across_flats(thread.size.as_deref()) {
+        if let Some(af) = hex_af {
+            if (af - iso_af).abs() > 0.2 {
+                return Some(
+                    "hex across_flats must match the ISO size token; \
+                     M8 is AF 13 — not 10, even if head_width is omitted or also 10"
+                        .into(),
+                );
+            }
+        }
+        if let Some(hw) = head_width {
+            if (hw - iso_af).abs() > 0.2 {
+                return Some(
+                    "head_width must match the ISO size token; \
+                     M8 is AF 13 — do not keep the old AF 10 table next to size:\"M8\""
+                        .into(),
+                );
+            }
         }
     }
 
@@ -326,6 +347,17 @@ fn bolt_requires_underhead_fillet_and_tip_chamfer(
         return Some("hex-head bolt must chamfer the tip (edges:\"top\") after the thread".into());
     }
     None
+}
+
+/// ISO 4014/4017 hex across-flats for sizes the recipe already teaches.
+/// M8 only — do not invent a full hex catalog here.
+fn iso_hex_across_flats(size: Option<&str>) -> Option<f64> {
+    let spec = kernel::thread::parse_size(size?).ok()?;
+    if (spec.major_diameter - M8_MAJOR_DIAMETER).abs() < 0.2 {
+        Some(M8_ACROSS_FLATS)
+    } else {
+        None
+    }
 }
 
 fn first_param(params: &std::collections::BTreeMap<String, f64>, names: &[&str]) -> Option<f64> {
@@ -1180,6 +1212,93 @@ mod tests {
         assert!(
             fastener_recipe_violation(&omitted_matches).is_none(),
             "explicit thread.pitch 1.25 next to M8 with omitted pitch param must pass"
+        );
+    }
+
+    /// Cycle 1 only compared head_width to hex when both were set. The old
+    /// AF 10 table still passed if the param and the sketch agreed, and an
+    /// omitted head_width + hard-coded AF 10 next to size:"M8" also passed.
+    /// ISO 4014/4017 M8 is AF 13.
+    #[test]
+    fn fastener_rules_iso_m8_drives_hex_af_when_head_width_omitted_or_10() {
+        let hex_cyl_finish = |af: f64| {
+            serde_json::json!([
+                { "op": "sketch", "plane": "XY",
+                  "profile": { "hex": { "across_flats": af } } },
+                { "op": "extrude", "depth": 5.3 },
+                { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                { "op": "thread", "kind": "external", "size": "M8",
+                  "length": 26.7, "at": [0, 0, 13.3] },
+                { "op": "chamfer", "distance": 0.5, "edges": "top" }
+            ])
+        };
+
+        let old_table = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 10.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(10.0)
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&old_table)
+            .expect("size M8 with head_width 10 and AF 10 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "reason should name the AF 10 / ISO 13 lie: {reason}"
+        );
+
+        let omitted_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(10.0)
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&omitted_af10)
+            .expect("omitted head_width + M8 + AF 10 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso"),
+            "reason should name the omitted-head_width / ISO AF lie: {reason}"
+        );
+
+        let omitted_af13 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": hex_cyl_finish(13.0)
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&omitted_af13).is_none(),
+            "size M8 with omitted head_width and AF 13 must still pass"
         );
     }
 }

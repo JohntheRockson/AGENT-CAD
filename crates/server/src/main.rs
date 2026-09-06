@@ -1351,7 +1351,7 @@ fn fastener_repair_hint(err: &str) -> String {
         || l.contains("grip")
         || l.contains("pitch")
     {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. hex AF must match head_width. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. Fillet under-head before thread. Chamfer the tip after thread edges:\"top\" — a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted or also 10 — never the old AF 10 table. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. Fillet under-head before thread. Chamfer the tip after thread edges:\"top\" — a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
     } else {
         String::new()
     }
@@ -1894,6 +1894,40 @@ mod tests {
             l.contains("chamfer") && (l.contains("tip") || l.contains("after")),
             "{reason}"
         );
+
+        // Cycle 1 hole: old AF 10 table next to size M8 (param and hex agree).
+        let old_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 10.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 10 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&old_af10)
+            .expect("size M8 with AF 10 table must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -1937,6 +1971,16 @@ mod tests {
         assert!(
             l.contains("chamfer") && l.contains("tip") && l.contains("after thread"),
             "repair must reteach tip chamfer after thread: {hint}"
+        );
+        assert!(
+            l.contains("af") && l.contains("13") && (l.contains("omitted") || l.contains("10")),
+            "repair must reteach ISO M8 AF 13 even if head_width is omitted: {hint}"
+        );
+        let af_reason =
+            "hex across_flats must match the ISO size token; M8 is AF 13 — not 10, even if head_width is omitted or also 10";
+        assert!(
+            !fastener_repair_hint(af_reason).is_empty(),
+            "repair hint must fire on the ISO AF reason"
         );
         assert!(
             l.contains("chamfer") && l.contains("edges:\"all\"") && l.contains("after thread"),

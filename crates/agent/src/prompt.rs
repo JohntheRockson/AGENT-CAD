@@ -149,7 +149,8 @@ A hex-head bolt must be hex extrude → overlapping cylinder → thread CUT.
 Reject thread-first then fuse a head.
 Reject fillet or chamfer edges:"all" after thread (that wrecks the helix).
 Reject a hex-head bolt fully threaded from the head (missing dead_height).
-head_width must drive the hex wrench size; dead_height must drive thread start.
+head_width must drive the hex wrench size; ISO M8 is AF 13 even if head_width is omitted (not 10).
+dead_height must drive thread start.
 major_diameter (or the ISO size token when that param is omitted) must drive the shank cylinder.
 Explicit thread.pitch must match ISO when the pitch param is omitted (M8 is 1.25; prefer null).
 Require under-head fillet before thread and a tip chamfer after thread (edges:"top").
@@ -320,6 +321,10 @@ mod tests {
         assert!(
             v.contains("head_width") && v.contains("drive"),
             "verify must require head_width to drive the hex"
+        );
+        assert!(
+            (v.contains("af 13") || v.contains("af is 13")) && (v.contains("omitted") || v.contains("iso")),
+            "verify must bind ISO M8 to AF 13 when head_width is omitted"
         );
         assert!(
             v.contains("major_diameter") && v.contains("cylinder"),
