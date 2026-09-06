@@ -11,7 +11,8 @@ use inspect_m8::fillet_r::{
     check_fillet, insert_fillet_after_cylinder, under_head_edge_indices, FilletEdges,
 };
 use inspect_m8::golden::{
-    check_golden_ir, load_golden_document, FILLET_RADIUS_MM, LENGTH_MM, SHANK_R_MM,
+    check_golden_ir, check_tip_to_top_length, load_golden_document, FILLET_RADIUS_MM,
+    SHANK_R_MM,
 };
 use inspect_m8::look_right::{bbox_tol_mm, check_stl_look_right, check_viewport_look_right};
 use inspect_m8::mesh_util::{bbox_from_mesh, fmt_bb, hex_head_metrics, HexHead};
@@ -132,14 +133,31 @@ fn run() -> Result<bool, String> {
         .as_ref()
         .map(|o| bbox_from_mesh(&o.mesh))
         .unwrap_or([0.0; 6]);
-    {
-        let tip = mesh_bbox[5];
-        let dz = (tip - LENGTH_MM).abs();
-        if dz > 0.05 {
-            log.push(format!(
-                "soft tip note: mesh zmax={tip:.4} vs L={LENGTH_MM} (Δ={dz:.4} mm) — not a fail"
-            ));
+    let (length_pass, length_detail) = if baseline.is_none() {
+        (
+            false,
+            "no execute bbox — cannot verify tip-to-top L=40".into(),
+        )
+    } else {
+        let mesh = check_tip_to_top_length(mesh_bbox);
+        let kern = baseline
+            .as_ref()
+            .map(|o| check_tip_to_top_length(o.metrics.bbox))
+            .unwrap_or((true, String::new()));
+        if !mesh.0 {
+            mesh
+        } else if !kern.0 {
+            (
+                false,
+                format!("kernel bbox: {}", kern.1),
+            )
+        } else {
+            mesh
         }
+    };
+    log.push(format!("tip-to-top length: {length_detail}"));
+    if !length_pass {
+        failed_cmds.push(format!("tip-to-top length: {length_detail}"));
     }
     let head_base = baseline
         .as_ref()
@@ -358,17 +376,19 @@ fn run() -> Result<bool, String> {
         look.detail.clone()
     };
 
-    let all_pass = golden_pass && look.ok && stl_pass && step.ok && fillet_pass;
+    let all_pass = golden_pass && length_pass && look.ok && stl_pass && step.ok && fillet_pass;
 
     let report = ReportData {
         all_pass,
         golden_pass,
+        length_pass,
         look_pass: look.ok,
         helix_windows_pass,
         step_pass: step.ok,
         stl_pass,
         fillet_pass,
         golden_detail,
+        length_detail,
         look_detail: look.detail.clone(),
         helix_windows_detail,
         step_detail: step.detail.clone(),
@@ -486,12 +506,14 @@ fn probe_step(
 struct ReportData {
     all_pass: bool,
     golden_pass: bool,
+    length_pass: bool,
     look_pass: bool,
     helix_windows_pass: bool,
     step_pass: bool,
     stl_pass: bool,
     fillet_pass: bool,
     golden_detail: String,
+    length_detail: String,
     look_detail: String,
     helix_windows_detail: String,
     step_detail: String,
@@ -534,7 +556,9 @@ fn render_markdown(r: &ReportData) -> String {
          A silent fillet no-op is FAIL. Hex-corner R or Δvolume without under-head junction R is FAIL. \
          AABB-only STL of a smooth rod is FAIL. \
          A mid-shank helix/AABB bar with instance-window seams or a dead→thread entry notch is FAIL. \
-         STEP that is empty/crash **or** ≈ the uncut hex+shank while the viewport is threaded is FAIL.\n\n",
+         STEP that is empty/crash **or** ≈ the uncut hex+shank while the viewport is threaded is FAIL. \
+         A tip-to-top AABB that overshoots locked L=40 by more than 0.20 mm is FAIL \
+         (crest at 40.095 is ok; not ISO 4017 under-head).\n\n",
     );
     s.push_str("## How to run\n\n");
     s.push_str("```bash\ncargo run --release --manifest-path tests/reports/Cargo.toml --features occt\n```\n\n");
@@ -546,6 +570,11 @@ fn render_markdown(r: &ReportData) -> String {
         "| 0) ISO caliper golden (AF 13, Ø8, P 1.25, L 40, head ~5.3) | {} | {} |\n",
         mark(r.golden_pass),
         escape_md(&r.golden_detail)
+    ));
+    s.push_str(&format!(
+        "| 0b) tip-to-top length (zmax/span vs L=40, tol 0.20 mm) | {} | {} |\n",
+        mark(r.length_pass),
+        escape_md(&r.length_detail)
     ));
     s.push_str(&format!(
         "| 1) viewport look-right (helix / ISO-V / no sliver) | {} | {} |\n",
@@ -594,15 +623,10 @@ fn render_markdown(r: &ReportData) -> String {
         "Look-right numbers: variation={:.4} spread={:.4} distinct_yaws={}\n\n",
         r.look_variation, r.look_spread, r.look_yaws
     ));
-    {
-        let tip = r.mesh_bbox[5];
-        let dz = (tip - LENGTH_MM).abs();
-        if dz > 0.05 {
-            s.push_str(&format!(
-                "Soft tip note (not a fail): mesh zmax={tip:.4} vs locked L={LENGTH_MM} (Δ={dz:.4} mm).\n\n"
-            ));
-        }
-    }
+    s.push_str(&format!(
+        "Tip-to-top length: {}\n\n",
+        r.length_detail
+    ));
     if let Some(bb) = r.stl_bbox {
         s.push_str(&format!("STL parsed bbox: `{}`\n\n", fmt_bb(bb)));
     }
@@ -677,6 +701,7 @@ fn report_json(r: &ReportData) -> serde_json::Value {
         },
         "checks": {
             "iso_caliper_golden": { "result": mark(r.golden_pass), "detail": r.golden_detail },
+            "tip_to_top_length": { "result": mark(r.length_pass), "detail": r.length_detail },
             "viewport_look_right": { "result": mark(r.look_pass), "detail": r.look_detail },
             "helix_continuous_and_clean_entry": { "result": mark(r.helix_windows_pass), "detail": r.helix_windows_detail },
             "stl_look_right_not_aabb_only": { "result": mark(r.stl_pass), "detail": r.stl_detail },

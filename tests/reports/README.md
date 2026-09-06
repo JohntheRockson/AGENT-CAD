@@ -69,3 +69,6 @@ Exit code 0 only if **all** checks pass.
    Silent no-op = **FAIL**. Δvolume alone is **not** sufficient. Hex-corner
    XY R (AF13 vertex inset) is **not** sufficient.
 5. **ISO golden** — IR is AF 13 / Ø8 / P 1.25 / L 40 / head ~5.3.
+   Executed **tip-to-top** AABB must stay within **0.20 mm** of L=40
+   (zmax and span). 40.095-class crest tessellation PASSes. A 40.5 mm tip
+   FAILs. This is tip-to-top look-right, not ISO 4017 under-head length.

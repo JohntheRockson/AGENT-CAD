@@ -11,7 +11,7 @@ head **5.5** recipe is not the golden.
 | Across flats (AF) | **13 mm** | ISO 4014 / 4017 wrench size (`head_width`) |
 | Shank / major Ø | **8 mm** | M8 |
 | Pitch P | **1.25 mm** | ISO 261 coarse (`size: "M8"`) |
-| Overall length L | **40 mm** | `bolt_length` |
+| Overall length L | **40 mm** | `bolt_length` (IR). Executed tip-to-top AABB must stay within 0.20 mm (not ISO 4017 under-head). |
 | Head height | **~5.3 mm** | `head_height` (ISO hex cap ≈ 5.3) |
 
 Feature recipe (mm, +Z shank):
