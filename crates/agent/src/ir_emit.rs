@@ -9,7 +9,8 @@
 //! thread-first in the prompt.
 
 use kernel::ir::{
-    CadDocument, ChamferOp, EdgeSelection, Feature, FilletOp, Profile, ThreadKind, ThreadOp,
+    CadDocument, ChamferOp, EdgeSelection, Feature, FilletOp, LoftOp, Profile, SweepOp, SweepPath,
+    ThreadKind, ThreadOp,
 };
 
 /// ISO M8 size table (ISO 261 coarse + ISO 4014/4017 hex).
@@ -279,11 +280,15 @@ fn bolt_params_drive_hex_and_grip(
     let head_from_feat = match &body.features[hex_i] {
         Feature::Fuse(op) => Some(op.depth),
         Feature::Common(op) => Some(op.depth),
+        Feature::Loft(op) => loft_head_depth(op),
+        Feature::Sweep(op) => sweep_head_depth(op),
         _ => body.features[hex_i + 1..thread_i]
             .iter()
             .find_map(|f| match f {
                 Feature::Extrude(op) => Some(op.depth),
                 Feature::DraftExtrude(op) => Some(op.depth),
+                Feature::Sweep(op) => sweep_head_depth(op),
+                Feature::Loft(op) => loft_head_depth(op),
                 _ => None,
             }),
     };
@@ -608,6 +613,25 @@ fn hex_across_flats(f: &Feature) -> Option<f64> {
             .iter()
             .find_map(|s| profile_across_flats(&s.profile)),
         Feature::Sweep(op) => op.profile.as_ref().and_then(profile_across_flats),
+        _ => None,
+    }
+}
+
+fn loft_head_depth(op: &LoftOp) -> Option<f64> {
+    let zs: Vec<f64> = op.sections.iter().map(|s| s.at[2]).collect();
+    let min = zs.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = zs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let d = max - min;
+    (d.is_finite() && d > 0.2).then_some(d)
+}
+
+fn sweep_head_depth(op: &SweepOp) -> Option<f64> {
+    match &op.path {
+        SweepPath::Polyline { points } if points.len() >= 2 => {
+            let d = (points[points.len() - 1][2] - points[0][2]).abs();
+            (d > 0.2).then_some(d)
+        }
+        SweepPath::Helix { height, .. } if *height > 0.2 => Some(*height),
         _ => None,
     }
 }
@@ -3166,6 +3190,108 @@ mod tests {
         assert!(
             fastener_recipe_violation(&example_m8_bolt_document()).is_none(),
             "golden recipe must still pass"
+        );
+    }
+
+    /// Cycle 23 read DraftExtrude. Loft/sweep hex AF is judged, but
+    /// head_from_feat still missed sweep path / loft Z-span, so a
+    /// fully-threaded M8 shipped when head_height was omitted.
+    #[test]
+    fn fastener_rules_sweep_and_loft_head_still_drive_grip() {
+        let sweep_fully = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "sweep",
+                      "path": { "polyline": { "points": [[0,0,0],[0,0,5.3]] } } },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 34.7, "at": [0, 0, 5.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&sweep_fully)
+            .expect("sketch+sweep head + thread at the head must fail without head_height");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("unthreaded") || l.contains("dead_height") || l.contains("grip"),
+            "reason should name the missing grip: {reason}"
+        );
+
+        let sweep_ok = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "sweep",
+                      "path": { "polyline": { "points": [[0,0,0],[0,0,5.3]] } } },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&sweep_ok).is_none(),
+            "sketch+sweep head with a parameter-driven grip must still pass"
+        );
+
+        let loft_fully = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "loft", "sections": [
+                        { "profile": { "hex": { "across_flats": 13 } }, "at": [0, 0, 0] },
+                        { "profile": { "hex": { "across_flats": 13 } }, "at": [0, 0, 5.3] }
+                    ] },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 34.7, "at": [0, 0, 5.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&loft_fully)
+            .expect("loft hex head + thread at the head must fail without head_height");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("unthreaded") || l.contains("dead_height") || l.contains("grip"),
+            "reason should name the missing loft grip: {reason}"
         );
     }
 
