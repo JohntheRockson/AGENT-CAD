@@ -82,11 +82,7 @@ pub fn keep_document_on_kernel_failure<'a>(
     incoming: Option<&'a CadDocument>,
 ) -> Option<&'a CadDocument> {
     match last_parsed {
-        Some(d)
-            if fastener_recipe_violation(d).is_none() && d.validate().is_ok() =>
-        {
-            Some(d)
-        }
+        Some(d) if fastener_recipe_violation(d).is_none() && d.validate().is_ok() => Some(d),
         _ => incoming,
     }
 }
@@ -150,9 +146,7 @@ fn body_fastener_violation(
                             .into(),
                     );
                 }
-                Feature::Chamfer(ChamferOp { edges, .. })
-                    if !edges_named(edges, "top") =>
-                {
+                Feature::Chamfer(ChamferOp { edges, .. }) if !edges_named(edges, "top") => {
                     return Some(
                         "chamfer after thread must use edges:\"top\"; \
                          edges:\"all\" or \"longest\" wreck the helix"
@@ -415,17 +409,16 @@ fn thread_runs_past_tip(
     thread: &ThreadOp,
     thread_z: f64,
 ) -> Option<String> {
-    let tip = first_param(
-        params,
-        &["bolt_length", "overall_length", "total_length"],
-    )
-    .or_else(|| match &body.features[cyl_i] {
-        Feature::Cylinder(op) => {
-            let tip_z = op.at[2] + op.height;
-            (tip_z.is_finite() && tip_z > 0.0).then_some(tip_z)
-        }
-        _ => None,
-    })?;
+    let tip =
+        first_param(params, &["bolt_length", "overall_length", "total_length"]).or_else(|| {
+            match &body.features[cyl_i] {
+                Feature::Cylinder(op) => {
+                    let tip_z = op.at[2] + op.height;
+                    (tip_z.is_finite() && tip_z > 0.0).then_some(tip_z)
+                }
+                _ => None,
+            }
+        })?;
 
     let iso_spec = thread_iso_spec(thread, params, &[&body.name, &body.body_id]);
     let major = first_param(
@@ -472,12 +465,10 @@ fn bolt_requires_underhead_fillet_and_tip_chamfer(
                 .into(),
         );
     }
-    let has_tip_chamfer = body.features[thread_i + 1..]
-        .iter()
-        .any(|f| match f {
-            Feature::Chamfer(op) => edges_named(&op.edges, "top"),
-            _ => false,
-        });
+    let has_tip_chamfer = body.features[thread_i + 1..].iter().any(|f| match f {
+        Feature::Chamfer(op) => edges_named(&op.edges, "top"),
+        _ => false,
+    });
     if !has_tip_chamfer {
         return Some("hex-head bolt must chamfer the tip (edges:\"top\") after the thread".into());
     }
@@ -571,18 +562,64 @@ fn edges_all_or_longest(edges: &EdgeSelection) -> bool {
 
 fn hex_across_flats(f: &Feature) -> Option<f64> {
     match f {
-        Feature::Sketch(op) => match &op.profile {
-            Profile::Hex(h) => Some(h.across_flats),
-            _ => None,
-        },
+        Feature::Sketch(op) => profile_across_flats(&op.profile),
         // Catalog fuse joins a boss. Models sometimes emit the hex head as
         // fuse instead of sketch+extrude; that still has to be ISO AF 13.
-        Feature::Fuse(op) => match &op.profile {
-            Profile::Hex(h) => Some(h.across_flats),
-            _ => None,
-        },
+        Feature::Fuse(op) => profile_across_flats(&op.profile),
         _ => None,
     }
+}
+
+/// Hex AF from a profile, including a `hex` wrapped as `compound.outer`
+/// and a catalog polyline that is a regular 6-gon (hard-coded hex points).
+/// Cycle 21 caught fuse+hex; a Body-named polyline / compound hex still
+/// skipped `is_hex_head`, so size M8 + AF 10 shipped.
+fn profile_across_flats(profile: &Profile) -> Option<f64> {
+    match profile {
+        Profile::Hex(h) => Some(h.across_flats),
+        Profile::Compound(c) => profile_across_flats(&c.outer),
+        Profile::Polyline(p) => polyline_regular_hex_af(&p.points),
+        _ => None,
+    }
+}
+
+/// Regular hexagon → across-flats. `hex_vertices` uses R = AF / √3, so
+/// AF = R × √3. Drop a duplicated close point. Irregular 6-gons stay None
+/// so a wishbone outline is not judged as a hex head.
+fn polyline_regular_hex_af(points: &[[f64; 2]]) -> Option<f64> {
+    let mut pts = points.to_vec();
+    if pts.len() >= 2 {
+        let a = pts[0];
+        let b = pts[pts.len() - 1];
+        if (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6 {
+            pts.pop();
+        }
+    }
+    if pts.len() != 6 {
+        return None;
+    }
+    let cx = pts.iter().map(|p| p[0]).sum::<f64>() / 6.0;
+    let cy = pts.iter().map(|p| p[1]).sum::<f64>() / 6.0;
+    let rs: Vec<f64> = pts
+        .iter()
+        .map(|p| ((p[0] - cx).powi(2) + (p[1] - cy).powi(2)).sqrt())
+        .collect();
+    let r = rs.iter().sum::<f64>() / 6.0;
+    if !r.is_finite() || r < 0.2 {
+        return None;
+    }
+    if rs.iter().any(|ri| (ri - r).abs() > 0.2) {
+        return None;
+    }
+    for i in 0..6 {
+        let a = pts[i];
+        let b = pts[(i + 1) % 6];
+        let side = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
+        if (side - r).abs() > 0.2 {
+            return None;
+        }
+    }
+    Some(r * 3.0_f64.sqrt())
 }
 
 fn is_hex_head(f: &Feature) -> bool {
@@ -629,7 +666,7 @@ fn is_fake_thread_feature(f: &Feature) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kernel::ir::{Feature, ThreadKind, ThreadOp};
+    use kernel::ir::{hex_vertices, Feature, ThreadKind, ThreadOp};
 
     fn param(doc: &CadDocument, name: &str) -> f64 {
         *doc.parameters
@@ -986,8 +1023,8 @@ mod tests {
             }]
         }))
         .unwrap();
-        let reason = fastener_recipe_violation(&chamfer_all)
-            .expect("chamfer-all after thread must fail");
+        let reason =
+            fastener_recipe_violation(&chamfer_all).expect("chamfer-all after thread must fail");
         let l = reason.to_ascii_lowercase();
         assert!(
             l.contains("chamfer") && l.contains("all"),
@@ -1519,7 +1556,8 @@ mod tests {
             .expect("omitted pitch + M8 + thread.pitch 2.0 must fail");
         let l = reason.to_ascii_lowercase();
         assert!(
-            l.contains("pitch") && (l.contains("iso") || l.contains("omitted") || l.contains("1.25")),
+            l.contains("pitch")
+                && (l.contains("iso") || l.contains("omitted") || l.contains("1.25")),
             "reason should name the undriven / ISO pitch: {reason}"
         );
 
@@ -1583,8 +1621,8 @@ mod tests {
             }]
         }))
         .unwrap();
-        let reason = fastener_recipe_violation(&table_lie)
-            .expect("size M8 with pitch param 2.0 must fail");
+        let reason =
+            fastener_recipe_violation(&table_lie).expect("size M8 with pitch param 2.0 must fail");
         let l = reason.to_ascii_lowercase();
         assert!(
             l.contains("pitch") && (l.contains("iso") || l.contains("1.25") || l.contains("m8")),
@@ -2586,4 +2624,170 @@ mod tests {
             "golden recipe must still pass"
         );
     }
+
+    /// Cycle 21 caught fuse+hex. A catalog polyline of hex_vertices, or a
+    /// compound-wrapped hex, still skipped is_hex_head — legacy program
+    /// body name "Body" then shipped size M8 + AF 10.
+    #[test]
+    fn fastener_rules_reject_polyline_and_compound_hex_af10() {
+        let hex10 = hex_vertices(10.0, [0.0, 0.0]);
+        let hex13 = hex_vertices(13.0, [0.0, 0.0]);
+        assert!(
+            (polyline_regular_hex_af(&hex10).unwrap() - 10.0).abs() < 0.05,
+            "detector must recover AF 10 from hex_vertices"
+        );
+        assert!(
+            (polyline_regular_hex_af(&hex13).unwrap() - 13.0).abs() < 0.05,
+            "detector must recover AF 13 from hex_vertices"
+        );
+        let closed: Vec<[f64; 2]> = hex10
+            .iter()
+            .copied()
+            .chain(std::iter::once(hex10[0]))
+            .collect();
+        assert!(
+            (polyline_regular_hex_af(&closed).unwrap() - 10.0).abs() < 0.05,
+            "duplicated close point must still be a hex"
+        );
+        assert!(
+            polyline_regular_hex_af(&[
+                [0.0, 0.0],
+                [10.0, 0.0],
+                [10.0, 8.0],
+                [5.0, 12.0],
+                [0.0, 8.0],
+                [-2.0, 3.0]
+            ])
+            .is_none(),
+            "irregular 6-gon is not a hex head"
+        );
+
+        let params = serde_json::json!({
+            "bolt_length": 40.0,
+            "head_height": 5.3,
+            "head_width": 13.0,
+            "dead_height": 8.0,
+            "major_diameter": 8.0
+        });
+        let finish = |profile: serde_json::Value| {
+            serde_json::json!([
+                { "op": "sketch", "plane": "XY", "profile": profile },
+                { "op": "extrude", "depth": 5.3 },
+                { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                { "op": "thread", "kind": "external", "size": "M8",
+                  "length": 26.7, "at": [0, 0, 13.3] },
+                { "op": "chamfer", "distance": 0.5, "edges": "top" }
+            ])
+        };
+
+        let polyline_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": finish(serde_json::json!({
+                    "polyline": { "points": hex10, "closed": true }
+                }))
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&polyline_af10)
+            .expect("Body-named polyline hex AF 10 next to size M8 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "reason should name the polyline AF lie: {reason}"
+        );
+
+        let polyline_af13 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": finish(serde_json::json!({
+                    "polyline": { "points": hex13, "closed": true }
+                }))
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&polyline_af13).is_none(),
+            "Body-named polyline hex AF 13 with the golden shank/thread must still pass"
+        );
+
+        let compound_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": finish(serde_json::json!({
+                    "compound": {
+                        "outer": { "hex": { "across_flats": 10 } },
+                        "holes": []
+                    }
+                }))
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&compound_af10)
+            .expect("compound-wrapped hex AF 10 next to size M8 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "reason should name the compound AF lie: {reason}"
+        );
+
+        let fuse_polyline_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": params,
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "fuse",
+                      "profile": { "polyline": { "points": hex10, "closed": true } },
+                      "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = fastener_recipe_violation(&fuse_polyline_af10)
+            .expect("fuse polyline hex AF 10 next to size M8 must fail");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "reason should name the fuse-polyline AF lie: {reason}"
+        );
+
+        let hex_plate_polyline_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "hex plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "polyline": { "points": hex_vertices(40.0, [0.0, 0.0]),
+                                                 "closed": true } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            fastener_recipe_violation(&hex_plate_polyline_tap).is_none(),
+            "polyline hex-plate tap must stay unjudged"
+        );
+    }
+
 }

@@ -749,9 +749,8 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                         // "fix" the deterministic judge would have rejected,
                         // and do not keep it as last_document.
                         if let Some(recipe_err) = reject_verify_fix(&fixed) {
-                            last_error = format!(
-                                "Corrected document failed fastener recipe: {recipe_err}"
-                            );
+                            last_error =
+                                format!("Corrected document failed fastener recipe: {recipe_err}");
                             tracing::warn!(attempt, %last_error, "verify fix broke fastener recipe");
                             contents.push(GeminiContent {
                                 role: "model".to_string(),
@@ -1886,10 +1885,7 @@ mod tests {
         let reason = agent::fastener_recipe_violation(&chamfer_all)
             .expect("chamfer-all after thread must fail verify");
         let l = reason.to_ascii_lowercase();
-        assert!(
-            l.contains("chamfer") && l.contains("all"),
-            "{reason}"
-        );
+        assert!(l.contains("chamfer") && l.contains("all"), "{reason}");
 
         // Cycle 2 hole: omit pitch, hard-code thread.pitch 2.0 next to size M8.
         let omitted_pitch = CadDocument::from_json_value(serde_json::json!({
@@ -1921,7 +1917,8 @@ mod tests {
             .expect("omitted pitch + M8 + thread.pitch 2.0 must fail verify");
         let l = reason.to_ascii_lowercase();
         assert!(
-            l.contains("pitch") && (l.contains("iso") || l.contains("omitted") || l.contains("1.25")),
+            l.contains("pitch")
+                && (l.contains("iso") || l.contains("omitted") || l.contains("1.25")),
             "{reason}"
         );
 
@@ -2297,8 +2294,8 @@ mod tests {
             }]
         }))
         .unwrap();
-        let reason = reject_verify_fix(&thread_first)
-            .expect("thread-first verify fix must not ship");
+        let reason =
+            reject_verify_fix(&thread_first).expect("thread-first verify fix must not ship");
         let l = reason.to_ascii_lowercase();
         assert!(
             l.contains("thread-first") || l.contains("hex extrude"),
@@ -2353,6 +2350,47 @@ mod tests {
         assert!(
             !fastener_repair_hint(&reason).is_empty(),
             "repair must reteach after a named-screw tap verify fix"
+        );
+
+        // Polyline hex hid from is_hex_head; a Gemini verify rewrite named
+        // Body used to ship AF 10 next to size M8.
+        let polyline_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "polyline": {
+                          "points": kernel::ir::hex_vertices(10.0, [0.0, 0.0]),
+                          "closed": true } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason =
+            reject_verify_fix(&polyline_af10).expect("polyline hex AF 10 verify fix must not ship");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "reason should name the polyline AF lie: {reason}"
+        );
+        assert!(
+            !fastener_repair_hint(&reason).is_empty(),
+            "repair must reteach AF 13 after a polyline hex verify fix"
         );
     }
 
