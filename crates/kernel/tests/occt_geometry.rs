@@ -573,7 +573,9 @@ fn distinct_groove_yaws(mesh: &kernel::engine::MeshData, z0: f64, z1: f64, sampl
     let mut bins = std::collections::HashSet::new();
     for i in 0..samples {
         let z = z0 + (z1 - z0) * (i as f64) / (samples as f64);
-        if let Some(y) = groove_yaw_at_z(mesh, z, 0.1) {
+        let yaw = deep_groove_yaw_at_z(mesh, z, 0.12, 4.0, 1.25)
+            .or_else(|| groove_yaw_at_z(mesh, z, 0.1));
+        if let Some(y) = yaw {
             let bin = (((y + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)) * 16.0).floor()
                 as i32;
             bins.insert(bin.rem_euclid(16));
@@ -871,6 +873,149 @@ fn shank_samples(mesh: &kernel::engine::MeshData, z0: f64, z1: f64, r_min: f64) 
     pts
 }
 
+/// Circular mean yaw of the deepest groove vertices in a thin Z band.
+/// More stable than a 32-bin argmin (that flips between U-flanks).
+fn deep_groove_yaw_at_z(
+    mesh: &kernel::engine::MeshData,
+    z: f64,
+    band: f64,
+    r_major: f64,
+    pitch: f64,
+) -> Option<f64> {
+    let depth = kernel::thread::external_depth(pitch);
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    for chunk in mesh.positions.chunks(3) {
+        if chunk.len() < 3 {
+            continue;
+        }
+        if (chunk[2] as f64 - z).abs() > band {
+            continue;
+        }
+        let x = chunk[0] as f64;
+        let y = chunk[1] as f64;
+        let r = (x * x + y * y).sqrt();
+        if r < r_major * 0.55 || r > r_major - 0.18 * depth {
+            continue;
+        }
+        pts.push((y.atan2(x), r));
+    }
+    if pts.len() < 6 {
+        return None;
+    }
+    pts.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let take = (pts.len() / 3).max(4);
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    for (yaw, _) in pts.iter().take(take) {
+        sx += yaw.cos();
+        sy += yaw.sin();
+    }
+    Some(sy.atan2(sx))
+}
+
+fn helix_phase_from_yaw(z: f64, yaw: f64, pitch: f64) -> f64 {
+    (z / pitch.max(1e-9) - yaw / (2.0 * std::f64::consts::PI)).rem_euclid(1.0)
+}
+
+/// Fail if instanced slabs meet with a visible helix step (Ian's mid-shank
+/// horizontal jumps). Does not loosen the mid-shank helix / ISO checks.
+fn assert_helix_continuous_across_instance_windows(
+    mesh: &kernel::engine::MeshData,
+    pitch: f64,
+    z0: f64,
+    z1: f64,
+) {
+    let step = (pitch * 0.40).clamp(0.35, 0.55);
+    let mut phases: Vec<(f64, f64)> = Vec::new();
+    let mut z = z0;
+    while z <= z1 + 1e-9 {
+        if let Some(yaw) = deep_groove_yaw_at_z(mesh, z, 0.14, 4.0, pitch) {
+            phases.push((z, helix_phase_from_yaw(z, yaw, pitch)));
+        }
+        z += step;
+    }
+    assert!(
+        phases.len() >= 8,
+        "too few deep-groove phase samples ({}) between {z0:.1} and {z1:.1} — \
+         cannot inspect instance seams",
+        phases.len()
+    );
+    let mut unwrapped = vec![phases[0].1];
+    for i in 1..phases.len() {
+        let mut p = phases[i].1;
+        let prev = unwrapped[i - 1];
+        while p - prev > 0.5 {
+            p -= 1.0;
+        }
+        while p - prev < -0.5 {
+            p += 1.0;
+        }
+        unwrapped.push(p);
+    }
+    let mut worst = 0.0_f64;
+    let mut worst_at = phases[0].0;
+    for i in 1..unwrapped.len() {
+        let d = (unwrapped[i] - unwrapped[i - 1]).abs();
+        if d > worst {
+            worst = d;
+            worst_at = 0.5 * (phases[i - 1].0 + phases[i].0);
+        }
+    }
+    let mean = unwrapped.iter().sum::<f64>() / unwrapped.len() as f64;
+    let var = unwrapped.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / unwrapped.len() as f64;
+    let rms = var.sqrt();
+    assert!(
+        worst < 0.10 && rms < 0.08,
+        "helix phase jumps {worst:.3} turn (rms {rms:.3}) near z={worst_at:.2} \
+         (instance window seam / yaw discontinuity)"
+    );
+}
+
+/// Fail if the first turn is leftover uncut cylinder / a triangular pipe-entry
+/// notch (dead-height → thread start).
+fn assert_clean_thread_entry(
+    mesh: &kernel::engine::MeshData,
+    r_major: f64,
+    pitch: f64,
+    thread_z0: f64,
+) {
+    let z_probe = thread_z0 + pitch * 0.55;
+    let variation = radius_variation_at_z(mesh, z_probe, 0.16);
+    assert!(
+        variation > 0.08,
+        "dead→thread start is uncut or notched (variation={variation:.4} at z={z_probe:.2})"
+    );
+    let yaw = groove_yaw_at_z(mesh, z_probe, 0.14);
+    assert!(
+        yaw.is_some(),
+        "no groove just after thread start (z={z_probe:.2}) — leftover triangular notch"
+    );
+    // Mid-shank helix phase must already hold this close to the first turn.
+    let z_mid = thread_z0 + pitch * 10.0;
+    if let (Some(y0), Some(ym)) = (yaw, groove_yaw_at_z(mesh, z_mid, 0.14)) {
+        let expected = ym - 2.0 * std::f64::consts::PI * (z_mid - z_probe) / pitch.max(1e-9);
+        let mut d = y0 - expected;
+        while d > std::f64::consts::PI {
+            d -= 2.0 * std::f64::consts::PI;
+        }
+        while d < -std::f64::consts::PI {
+            d += 2.0 * std::f64::consts::PI;
+        }
+        assert!(
+            d.abs() < 0.45,
+            "thread-start groove yaw is off the helix by {d:.3} rad \
+             (entry notch or wrong first-rod phase)"
+        );
+    }
+    assert_no_vertical_uncut_strip(
+        mesh,
+        r_major,
+        pitch,
+        thread_z0 + pitch * 0.35,
+        thread_z0 + pitch * 1.8,
+    );
+}
+
 /// Fail if the thread form is a boxy/wide bead (screenshot) instead of an
 /// ISO-width groove: ~P/8 crest, 5H/8-class depth, sloped flanks, yaw walks.
 fn assert_iso_v_thread_profile(
@@ -1116,6 +1261,9 @@ fn m8_hex_head_bolt_40mm_builds() {
     );
     assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
     assert_iso_v_thread_profile(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    // Ian retest after #19: instance-window seams + dead→thread entry notch.
+    assert_helix_continuous_across_instance_windows(&out.mesh, 1.25, zmin + 8.0, zmin + 36.0);
+    assert_clean_thread_entry(&out.mesh, 4.0, 1.25, zmin + 5.3);
     if let Ok(path) = std::env::var("AGENTCAD_DUMP_MESH") {
         std::fs::write(&path, kernel::export::to_obj(&out.mesh)).expect("dump mesh");
     }
@@ -1507,6 +1655,8 @@ fn m8_bolt_40mm_document_has_no_vertical_sliver() {
     }
     assert_no_vertical_uncut_strip(mesh, 4.0, 1.25, zmin + 8.0, zmin + 36.0);
     assert_iso_v_thread_profile(mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    assert_helix_continuous_across_instance_windows(mesh, 1.25, zmin + 8.0, zmin + 36.0);
+    assert_clean_thread_entry(mesh, 4.0, 1.25, zmin + 5.3);
 }
 
 /// Head height and dead height must stay put when only `bolt_length` changes.
@@ -1650,7 +1800,9 @@ fn golden_hex_cylinder_thread_cut_never_tessellates_long_uncut_host() {
         "expected shank+head length, bbox={:?}",
         out.metrics.bbox
     );
-    let n_yaws = distinct_groove_yaws(mesh, zmin + 8.0, zmin + 18.0, 12);
+    // 12 samples over 10 mm is exactly 2/3 pitch — aliases a real helix
+    // into 3 yaw bins. 17 samples over the same band still require a walk.
+    let n_yaws = distinct_groove_yaws(mesh, zmin + 8.0, zmin + 18.0, 17);
     assert!(
         n_yaws >= 5,
         "groove must walk around the shank; distinct yaws={n_yaws}"
