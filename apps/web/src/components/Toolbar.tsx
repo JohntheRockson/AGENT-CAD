@@ -9,6 +9,7 @@ import {
 } from 'lucide-react'
 import { ExportMenu } from './ExportMenu'
 import { useCadStore } from '../store/useStore'
+import { editorTrustKind, toolbarRewriteConfirmMessage } from '../lib/document'
 
 // ── Tool definitions ───────────────────────────────────────────────────
 
@@ -89,6 +90,9 @@ export function Toolbar({ showJson, onToggleJson, chatOpen, onToggleChat }: Tool
   const clearError      = useCadStore((s) => s.clearError)
   const outlinerOpen    = useCadStore((s) => s.outlinerOpen)
   const setOutlinerOpen = useCadStore((s) => s.setOutlinerOpen)
+  const uncommittedParameterCount = useCadStore((s) => s.uncommittedParameterCount)
+  const lastGoodIrCode  = useCadStore((s) => s.lastGoodIrCode)
+  const editorKind      = editorTrustKind(irCode, lastGoodIrCode)
 
   const busy = isChatLoading || isRunning
 
@@ -192,9 +196,9 @@ export function Toolbar({ showJson, onToggleJson, chatOpen, onToggleChat }: Tool
               group={group}
               disabled={busy}
               onTool={(prompt) => {
-                if (irCode.trim()) {
+                if (irCode.trim() || lastGoodIrCode.trim() || uncommittedParameterCount > 0) {
                   const ok = window.confirm(
-                    'This tool asks the AI to rewrite the current solid, including a loaded golden. Continue?',
+                    toolbarRewriteConfirmMessage(uncommittedParameterCount, editorKind),
                   )
                   if (!ok) return
                 }
