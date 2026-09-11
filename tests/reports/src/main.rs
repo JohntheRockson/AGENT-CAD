@@ -11,7 +11,8 @@ use inspect_m8::fillet_r::{
     check_fillet, insert_fillet_after_cylinder, under_head_edge_indices, FilletEdges,
 };
 use inspect_m8::golden::{
-    check_golden_ir, load_golden_document, FILLET_RADIUS_MM, SHANK_R_MM,
+    check_execute_seconds, check_golden_ir, check_tip_to_top_length, load_golden_document,
+    FILLET_RADIUS_MM, SHANK_R_MM,
 };
 use inspect_m8::look_right::{bbox_tol_mm, check_stl_look_right, check_viewport_look_right};
 use inspect_m8::mesh_util::{bbox_from_mesh, fmt_bb, hex_head_metrics, HexHead};
@@ -127,11 +128,50 @@ fn run() -> Result<bool, String> {
             None
         }
     };
+    let execute_secs = t0.elapsed().as_secs_f64();
+    let (execute_pass, execute_detail) = if baseline.is_some() {
+        check_execute_seconds(execute_secs)
+    } else {
+        (
+            false,
+            format!("no golden execute — cannot verify {execute_secs:.2}s vs 40s budget"),
+        )
+    };
+    log.push(format!("execute budget: {execute_detail}"));
+    if !execute_pass {
+        failed_cmds.push(format!("execute budget: {execute_detail}"));
+    }
 
     let mesh_bbox = baseline
         .as_ref()
         .map(|o| bbox_from_mesh(&o.mesh))
         .unwrap_or([0.0; 6]);
+    let (length_pass, length_detail) = if baseline.is_none() {
+        (
+            false,
+            "no execute bbox — cannot verify tip-to-top L=40".into(),
+        )
+    } else {
+        let mesh = check_tip_to_top_length(mesh_bbox);
+        let kern = baseline
+            .as_ref()
+            .map(|o| check_tip_to_top_length(o.metrics.bbox))
+            .unwrap_or((true, String::new()));
+        if !mesh.0 {
+            mesh
+        } else if !kern.0 {
+            (
+                false,
+                format!("kernel bbox: {}", kern.1),
+            )
+        } else {
+            mesh
+        }
+    };
+    log.push(format!("tip-to-top length: {length_detail}"));
+    if !length_pass {
+        failed_cmds.push(format!("tip-to-top length: {length_detail}"));
+    }
     let head_base = baseline
         .as_ref()
         .map(|o| hex_head_metrics(&o.mesh, SHANK_R_MM));
@@ -310,6 +350,8 @@ fn run() -> Result<bool, String> {
             n_yaws: 0,
             sliver_ok: false,
             iso_v_ok: false,
+            continuous_ok: false,
+            entry_ok: false,
         });
     let (stl_pass, stl_detail, stl_bbox) =
         check_stl_look_right(&stl_bytes, mesh_bbox, baseline.as_ref().map(|o| &o.mesh));
@@ -340,17 +382,36 @@ fn run() -> Result<bool, String> {
         failed_cmds.push(format!("fillet R: {fillet_detail}"));
     }
 
-    let all_pass = golden_pass && look.ok && stl_pass && step.ok && fillet_pass;
+    let helix_windows_pass = look.continuous_ok && look.entry_ok;
+    let helix_windows_detail = if helix_windows_pass {
+        "helix continuous across instance windows (worst < 0.10 turn, rms < 0.08); clean thread entry (first-turn groove on helix)".into()
+    } else {
+        look.detail.clone()
+    };
+
+    let all_pass = golden_pass
+        && execute_pass
+        && length_pass
+        && look.ok
+        && stl_pass
+        && step.ok
+        && fillet_pass;
 
     let report = ReportData {
         all_pass,
         golden_pass,
+        execute_pass,
+        length_pass,
         look_pass: look.ok,
+        helix_windows_pass,
         step_pass: step.ok,
         stl_pass,
         fillet_pass,
         golden_detail,
+        execute_detail,
+        length_detail,
         look_detail: look.detail.clone(),
+        helix_windows_detail,
         step_detail: step.detail.clone(),
         stl_detail,
         fillet_detail,
@@ -366,6 +427,8 @@ fn run() -> Result<bool, String> {
         look_variation: look.variation,
         look_spread: look.spread,
         look_yaws: look.n_yaws,
+        look_continuous: look.continuous_ok,
+        look_entry: look.entry_ok,
         uses_occt: engine.uses_occt(),
         log,
         failed_cmds,
@@ -464,12 +527,18 @@ fn probe_step(
 struct ReportData {
     all_pass: bool,
     golden_pass: bool,
+    execute_pass: bool,
+    length_pass: bool,
     look_pass: bool,
+    helix_windows_pass: bool,
     step_pass: bool,
     stl_pass: bool,
     fillet_pass: bool,
     golden_detail: String,
+    execute_detail: String,
+    length_detail: String,
     look_detail: String,
+    helix_windows_detail: String,
     step_detail: String,
     stl_detail: String,
     fillet_detail: String,
@@ -485,6 +554,8 @@ struct ReportData {
     look_variation: f64,
     look_spread: f64,
     look_yaws: usize,
+    look_continuous: bool,
+    look_entry: bool,
     uses_occt: bool,
     log: Vec<String>,
     failed_cmds: Vec<String>,
@@ -505,8 +576,15 @@ fn render_markdown(r: &ReportData) -> String {
     s.push_str(&format!("**Overall: {overall}**\n\n"));
     s.push_str(
         "Inspector only. No kernel/web/OCCT-WASM edits. Kernel owns STEP implementation. \
-         A silent fillet no-op is FAIL. AABB-only STL of a smooth rod is FAIL. \
-         STEP that is empty/crash **or** ≈ the uncut hex+shank while the viewport is threaded is FAIL.\n\n",
+         A silent fillet no-op is FAIL. Hex-corner R or Δvolume without under-head junction R is FAIL. \
+         AABB-only STL of a smooth rod is FAIL. \
+         A mid-shank helix/AABB bar with instance-window seams or a dead→thread entry notch is FAIL. \
+         STEP that is empty/crash **or** ≈ the uncut hex+shank while the viewport is threaded is FAIL. \
+         A tip-to-top AABB that overshoots locked L=40 by more than 0.20 mm is FAIL \
+         (crest at 40.095 is ok; not ISO 4017 under-head). \
+         A 40 mm span seated below z=0 (short tip) is FAIL. \
+         ISO params must match features (AF13 hex, not head_width-only). \
+         Golden execute above 40s class is FAIL (do not tessellate a long uncut host).\n\n",
     );
     s.push_str("## How to run\n\n");
     s.push_str("```bash\ncargo run --release --manifest-path tests/reports/Cargo.toml --features occt\n```\n\n");
@@ -515,9 +593,19 @@ fn render_markdown(r: &ReportData) -> String {
     s.push_str("## Pass / fail\n\n");
     s.push_str("| Check | Result | Detail |\n|---|---|---|\n");
     s.push_str(&format!(
-        "| 0) ISO caliper golden (AF 13, Ø8, P 1.25, L 40, head ~5.3) | {} | {} |\n",
+        "| 0) ISO caliper golden (AF 13, Ø8, P 1.25, L 40, head ~5.3; params AND features) | {} | {} |\n",
         mark(r.golden_pass),
         escape_md(&r.golden_detail)
+    ));
+    s.push_str(&format!(
+        "| 0b) tip-to-top length (zmax/span vs L=40, tol 0.20 mm) | {} | {} |\n",
+        mark(r.length_pass),
+        escape_md(&r.length_detail)
+    ));
+    s.push_str(&format!(
+        "| 0c) execute seconds (viewport-fast; FAIL if >40s class) | {} | {} |\n",
+        mark(r.execute_pass),
+        escape_md(&r.execute_detail)
     ));
     s.push_str(&format!(
         "| 1) viewport look-right (helix / ISO-V / no sliver) | {} | {} |\n",
@@ -525,7 +613,12 @@ fn render_markdown(r: &ReportData) -> String {
         escape_md(&r.look_detail)
     ));
     s.push_str(&format!(
-        "| 2) STL look-right (not AABB-only; smooth rod = FAIL) | {} | {} |\n",
+        "| 1b) instance-window helix continuity + clean thread entry | {} | {} |\n",
+        mark(r.helix_windows_pass),
+        escape_md(&r.helix_windows_detail)
+    ));
+    s.push_str(&format!(
+        "| 2) STL look-right (not AABB-only; smooth rod / seamed slab = FAIL) | {} | {} |\n",
         mark(r.stl_pass),
         escape_md(&r.stl_detail)
     ));
@@ -535,7 +628,7 @@ fn render_markdown(r: &ReportData) -> String {
         escape_md(&r.step_detail)
     ));
     s.push_str(&format!(
-        "| 4) fillet under-head / named R (Δvol-only = FAIL; silent no-op = FAIL) | {} | {} |\n",
+        "| 4) fillet under-head junction R (hex-corner / Δvol-only = FAIL; silent no-op = FAIL) | {} | {} |\n",
         mark(r.fillet_pass),
         escape_md(&r.fillet_detail)
     ));
@@ -560,6 +653,10 @@ fn render_markdown(r: &ReportData) -> String {
     s.push_str(&format!(
         "Look-right numbers: variation={:.4} spread={:.4} distinct_yaws={}\n\n",
         r.look_variation, r.look_spread, r.look_yaws
+    ));
+    s.push_str(&format!(
+        "Tip-to-top length: {}\n\n",
+        r.length_detail
     ));
     if let Some(bb) = r.stl_bbox {
         s.push_str(&format!("STL parsed bbox: `{}`\n\n", fmt_bb(bb)));
@@ -597,7 +694,8 @@ fn render_markdown(r: &ReportData) -> String {
     s.push_str(&format!(
         "Fillet variant: same features with `{{ op: fillet, radius: {FILLET_RADIUS_MM} }}` inserted after the \
          Ø8 cylinder (under-head junction if topology names edges; otherwise named `all`). \
-         Δvolume alone is not a pass.\n\n"
+         Acceptance requires measurable under-head junction R≈{FILLET_RADIUS_MM} mm \
+         (head ~5.3 / Ø8). Hex-corner R or Δvolume alone is not a pass.\n\n"
     ));
     s.push_str("## Failed commands / why (not faked)\n\n");
     if r.failed_cmds.is_empty() {
@@ -634,15 +732,21 @@ fn report_json(r: &ReportData) -> serde_json::Value {
         },
         "checks": {
             "iso_caliper_golden": { "result": mark(r.golden_pass), "detail": r.golden_detail },
+            "tip_to_top_length": { "result": mark(r.length_pass), "detail": r.length_detail },
+            "execute_seconds": { "result": mark(r.execute_pass), "detail": r.execute_detail },
             "viewport_look_right": { "result": mark(r.look_pass), "detail": r.look_detail },
+            "helix_continuous_and_clean_entry": { "result": mark(r.helix_windows_pass), "detail": r.helix_windows_detail },
             "stl_look_right_not_aabb_only": { "result": mark(r.stl_pass), "detail": r.stl_detail },
             "step_honesty": { "result": mark(r.step_pass), "detail": r.step_detail },
+            "fillet_under_head_junction_r": { "result": mark(r.fillet_pass), "detail": r.fillet_detail },
             "fillet_under_head_or_named_r": { "result": mark(r.fillet_pass), "detail": r.fillet_detail },
         },
         "look_right": {
             "variation": r.look_variation,
             "spread": r.look_spread,
             "distinct_yaws": r.look_yaws,
+            "continuous_ok": r.look_continuous,
+            "entry_ok": r.look_entry,
         },
         "files": {
             "obj_bytes": r.obj_bytes,
