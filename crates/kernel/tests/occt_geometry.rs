@@ -917,14 +917,15 @@ fn helix_phase_from_yaw(z: f64, yaw: f64, pitch: f64) -> f64 {
     (z / pitch.max(1e-9) - yaw / (2.0 * std::f64::consts::PI)).rem_euclid(1.0)
 }
 
-/// Fail if instanced slabs meet with a visible helix step (Ian's mid-shank
-/// horizontal jumps). Does not loosen the mid-shank helix / ISO checks.
-fn assert_helix_continuous_across_instance_windows(
+/// Ian / Atlas helix-continuity metrics. Thresholds stay fail-closed:
+/// worst jump < 0.10 turn and RMS < 0.08. A ~0.163 jump (or RMS past 0.08)
+/// is the #22 CI flap — do not loosen these.
+fn helix_window_continuity_stats(
     mesh: &kernel::engine::MeshData,
     pitch: f64,
     z0: f64,
     z1: f64,
-) {
+) -> (usize, f64, f64, f64) {
     let step = (pitch * 0.40).clamp(0.35, 0.55);
     let mut phases: Vec<(f64, f64)> = Vec::new();
     let mut z = z0;
@@ -934,12 +935,9 @@ fn assert_helix_continuous_across_instance_windows(
         }
         z += step;
     }
-    assert!(
-        phases.len() >= 8,
-        "too few deep-groove phase samples ({}) between {z0:.1} and {z1:.1} — \
-         cannot inspect instance seams",
-        phases.len()
-    );
+    if phases.len() < 2 {
+        return (phases.len(), f64::NAN, f64::NAN, z0);
+    }
     let mut unwrapped = vec![phases[0].1];
     for i in 1..phases.len() {
         let mut p = phases[i].1;
@@ -964,6 +962,26 @@ fn assert_helix_continuous_across_instance_windows(
     let mean = unwrapped.iter().sum::<f64>() / unwrapped.len() as f64;
     let var = unwrapped.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / unwrapped.len() as f64;
     let rms = var.sqrt();
+    (phases.len(), worst, rms, worst_at)
+}
+
+/// Fail if instanced slabs meet with a visible helix step (Ian's mid-shank
+/// horizontal jumps). Does not loosen the mid-shank helix / ISO checks.
+fn assert_helix_continuous_across_instance_windows(
+    mesh: &kernel::engine::MeshData,
+    pitch: f64,
+    z0: f64,
+    z1: f64,
+) {
+    let (n, worst, rms, worst_at) = helix_window_continuity_stats(mesh, pitch, z0, z1);
+    eprintln!(
+        "helix continuity: samples={n} worst={worst:.4} turn rms={rms:.4} at z={worst_at:.2}"
+    );
+    assert!(
+        n >= 8,
+        "too few deep-groove phase samples ({n}) between {z0:.1} and {z1:.1} — \
+         cannot inspect instance seams"
+    );
     assert!(
         worst < 0.10 && rms < 0.08,
         "helix phase jumps {worst:.3} turn (rms {rms:.3}) near z={worst_at:.2} \
@@ -1369,6 +1387,8 @@ fn golden_m8_x40_step_export_is_nonempty_solid() {
         mesh_out.metrics.mesh_provenance,
         MeshProvenance::InstancedThread
     );
+    let (ok, detail) = step_shank_looks_helical(&step, 12.0, 28.0);
+    assert!(ok, "program STEP honesty: {detail}");
 }
 
 /// Inspector PR #13: hex-only and hex+shank probes crashed the same way as
@@ -1863,4 +1883,371 @@ fn hex_head_z_extent(mesh: &kernel::engine::MeshData, shank_r: f64) -> (f64, f64
     } else {
         (z0, z1, z1 - z0)
     }
+}
+
+/// Inspector STEP honesty: CARTESIAN_POINTs on the shank must look helical,
+/// not a smooth Ø8 host. Kernel tests previously only checked nonempty + bbox.
+fn step_shank_looks_helical(step: &[u8], z0: f64, z1: f64) -> (bool, String) {
+    let pts = kernel::export::cartesian_points_from_step(step);
+    let shank: Vec<[f64; 3]> = pts
+        .into_iter()
+        .filter(|p| p[2] >= z0 && p[2] <= z1)
+        .filter(|p| {
+            let r = p[0].hypot(p[1]);
+            r > 2.2 && r < 5.25
+        })
+        .collect();
+    if shank.len() < 80 {
+        return (false, format!("too few shank CARTESIAN_POINTs ({})", shank.len()));
+    }
+    let mesh = kernel::engine::MeshData {
+        positions: shank
+            .iter()
+            .flat_map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+            .collect(),
+        normals: vec![],
+        indices: vec![],
+    };
+    let mid = 0.5 * (z0 + z1);
+    let variation = radius_variation_at_z(&mesh, mid, 0.35);
+    let spread = angular_radius_spread_at_z(&mesh, mid, 0.12);
+    let n_yaws = distinct_groove_yaws(&mesh, z0, z1, 12);
+    let ok = variation > 0.08 && spread > 0.25 && n_yaws >= 5;
+    (
+        ok,
+        format!(
+            "STEP shank helix variation={variation:.3} spread={spread:.3} yaws={n_yaws} n={}",
+            mesh.positions.len() / 3
+        ),
+    )
+}
+
+/// Under-head quarter-torus samples: r > Ø8 and z just below the bearing face.
+fn under_head_fillet_r_median_err(
+    mesh: &kernel::engine::MeshData,
+    head_z: f64,
+    r_shank: f64,
+    expected_r: f64,
+) -> Option<(usize, f64)> {
+    let c_r = r_shank + expected_r;
+    let c_z = head_z + expected_r;
+    let mut errs = Vec::new();
+    for chunk in mesh.positions.chunks(3) {
+        if chunk.len() < 3 {
+            continue;
+        }
+        let x = chunk[0] as f64;
+        let y = chunk[1] as f64;
+        let z = chunk[2] as f64;
+        let r = x.hypot(y);
+        if r < r_shank - 0.15 || r > r_shank + expected_r + 0.40 {
+            continue;
+        }
+        if z < head_z - 0.15 || z > head_z + expected_r + 0.40 {
+            continue;
+        }
+        if r <= r_shank + 0.06 || z <= head_z + 0.06 {
+            continue;
+        }
+        let d = (r - c_r).hypot(z - c_z);
+        errs.push((d - expected_r).abs());
+    }
+    if errs.len() < 12 {
+        return None;
+    }
+    errs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some((errs.len(), errs[errs.len() / 2]))
+}
+
+/// Inspector STEP honesty: faceted document STEP must carry the viewport helix,
+/// not merely a nonempty solid in the same AABB as the uncut hex+shank.
+#[test]
+fn golden_m8_document_step_has_helix_not_uncut_host() {
+    let doc = iso_m8_x40_golden_document();
+    let engine = Engine::new();
+    let mesh_out = engine
+        .execute_document(&doc)
+        .expect("golden execute")
+        .into_model_output()
+        .expect("mesh");
+    let step = engine
+        .export_document(&doc, &ExportFormat::Step)
+        .expect("golden document STEP must not WASM-trap");
+    assert_step_is_solid_in_mesh_bbox_family(&step, mesh_out.metrics.bbox, "golden document");
+    let (ok, detail) = step_shank_looks_helical(&step, 12.0, 28.0);
+    assert!(ok, "STEP honesty: {detail}");
+    let report = kernel::verify::verify_structure(&doc, &engine.execute_document(&doc).expect("verify execute"));
+    assert!(report.passed, "{}", report.summary());
+    let honesty = report
+        .checks
+        .iter()
+        .find(|c| c.name == "mesh_provenance_honesty")
+        .expect("long golden must name instanced-vs-uncut");
+    assert!(honesty.passed, "{}", honesty.message);
+    assert!(honesty.message.contains("uncut"), "{}", honesty.message);
+    let vol = report
+        .checks
+        .iter()
+        .find(|c| c.name == "positive_volume")
+        .expect("volume");
+    assert!(
+        vol.message.contains("uncut"),
+        "verify volume must not look like the grooved solid: {}",
+        vol.message
+    );
+}
+
+/// A many-face faceted Ø8 host in the M8 shank band must not pass helix honesty
+/// (Inspector #25: few-point / smooth-host STEP must not slip through).
+#[test]
+fn faceted_smooth_host_step_fails_helix_honesty() {
+    let mut positions = Vec::new();
+    let mut indices = Vec::new();
+    let nz = 40u32;
+    let ntheta = 24u32;
+    for iz in 0..=nz {
+        let z = 4.3 + 35.7 * (iz as f32 / nz as f32);
+        for it in 0..ntheta {
+            let a = 2.0 * std::f32::consts::PI * (it as f32 / ntheta as f32);
+            positions.extend_from_slice(&[4.0 * a.cos(), 4.0 * a.sin(), z]);
+        }
+    }
+    for iz in 0..nz {
+        for it in 0..ntheta {
+            let a = iz * ntheta + it;
+            let b = iz * ntheta + (it + 1) % ntheta;
+            let c = a + ntheta;
+            let d = b + ntheta;
+            indices.extend_from_slice(&[a, b, c, b, d, c]);
+        }
+    }
+    let smooth = MeshData {
+        positions,
+        normals: vec![],
+        indices,
+    };
+    let step = kernel::export::step_export_bytes(&smooth).expect("smooth host STEP");
+    assert!(step.len() > 512, "many-face host is a nonempty solid");
+    let (ok, detail) = step_shank_looks_helical(&step, 12.0, 28.0);
+    assert!(
+        !ok,
+        "smooth Ø8 faceted host must fail helix honesty, got PASS ({detail})"
+    );
+}
+
+/// Under-head fillet on the instanced golden must show R in the viewport mesh.
+/// B-Rep ΔV alone is not look-right: host-cap clip at thread_z0 used to drop
+/// the torus while volume still grew.
+#[test]
+fn m8_instanced_underhead_fillet_is_visible_in_mesh() {
+    let filleted: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": { "hex": { "across_flats": 13 } } },
+            { "op": "extrude", "depth": 5.3 },
+            { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+            { "op": "fillet", "radius": 0.4, "edges": "all" },
+            { "op": "thread", "kind": "external", "size": "M8", "length": 34.7, "at": [0, 0, 5.3] }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let unfilleted = Engine::new()
+        .execute(&golden_m8_x40_program())
+        .expect("unfilleted golden");
+    let out = Engine::new()
+        .execute(&filleted)
+        .expect("fillet + long thread must build");
+    assert_eq!(
+        out.metrics.mesh_provenance,
+        MeshProvenance::InstancedThread,
+        "34.7 mm thread must still instance"
+    );
+    let dv = out.metrics.volume - unfilleted.metrics.volume;
+    assert!(
+        dv > 0.3,
+        "fillet did not add under-head blend in B-Rep: ΔV={dv}"
+    );
+    let (n, err) = under_head_fillet_r_median_err(&out.mesh, 5.3, 4.0, 0.4).unwrap_or_else(|| {
+        panic!(
+            "under-head fillet missing from instanced viewport (ΔV={dv:.3}) — \
+             host-cap clip / strip_thread_envelope ate the blend"
+        )
+    });
+    assert!(
+        err <= 0.35,
+        "under-head R visible but poorly fit: n={n} err={err:.3}"
+    );
+    // Do not regress #22 / sliver / ISO while keeping the blend.
+    let [_, _, zmin, _, _, _] = out.metrics.bbox;
+    assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    assert_iso_v_thread_profile(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    assert_helix_continuous_across_instance_windows(&out.mesh, 1.25, zmin + 8.0, zmin + 36.0);
+    assert_clean_thread_entry(&out.mesh, 4.0, 1.25, zmin + 5.3);
+}
+
+/// Inspector `FILLET_RADIUS_MM = 0.8`. Cycle 1 locked R=0.4 only — keep-band
+/// must keep the real-R torus in the instanced viewport (n≥12, err≤0.35).
+fn m8_filleted_thread_program(radius: f64) -> CadProgram {
+    serde_json::from_value(serde_json::json!({
+        "units": "mm",
+        "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": { "hex": { "across_flats": 13 } } },
+            { "op": "extrude", "depth": 5.3 },
+            { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+            { "op": "fillet", "radius": radius, "edges": "all" },
+            { "op": "thread", "kind": "external", "size": "M8", "length": 34.7, "at": [0, 0, 5.3] }
+        ]
+    }))
+    .unwrap()
+}
+
+#[test]
+fn m8_instanced_underhead_fillet_r08_is_visible_in_mesh() {
+    let unfilleted = Engine::new()
+        .execute(&golden_m8_x40_program())
+        .expect("unfilleted golden");
+    let no_thread: CadProgram = serde_json::from_str(
+        r#"{
+          "units": "mm",
+          "features": [
+            { "op": "sketch", "plane": "XY",
+              "profile": { "hex": { "across_flats": 13 } } },
+            { "op": "extrude", "depth": 5.3 },
+            { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+            { "op": "fillet", "radius": 0.8, "edges": "all" }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let host = Engine::new()
+        .execute(&no_thread)
+        .expect("R=0.8 hex+shank fillet (no thread)");
+    let host_fit = under_head_fillet_r_median_err(&host.mesh, 5.3, 4.0, 0.8);
+    eprintln!(
+        "R=0.8 BEFORE/host-no-thread: ΔV={:.3} fit={:?}",
+        host.metrics.volume - unfilleted.metrics.volume,
+        host_fit
+    );
+
+    let out = Engine::new()
+        .execute(&m8_filleted_thread_program(0.8))
+        .expect("R=0.8 fillet + long thread must build");
+    assert_eq!(
+        out.metrics.mesh_provenance,
+        MeshProvenance::InstancedThread,
+        "34.7 mm thread must still instance at R=0.8"
+    );
+    let dv = out.metrics.volume - unfilleted.metrics.volume;
+    let fit = under_head_fillet_r_median_err(&out.mesh, 5.3, 4.0, 0.8);
+    eprintln!("R=0.8 instanced: ΔV={dv:.3} fit={fit:?} vol={}", out.metrics.volume);
+    let (n, err) = fit.unwrap_or_else(|| {
+        panic!(
+            "Inspector under_head R=0.8 is NONE on instanced viewport (ΔV={dv:.3}) — \
+             keep-band / strip_thread_envelope ate the blend"
+        )
+    });
+    assert!(
+        n >= 12 && err <= 0.35,
+        "Inspector R=0.8 under-head must be visible: n={n} err={err:.3} ΔV={dv:.3}"
+    );
+    let [_, _, zmin, _, _, _] = out.metrics.bbox;
+    assert_no_vertical_uncut_strip(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    assert_iso_v_thread_profile(&out.mesh, 4.0, 1.25, zmin + 12.0, zmin + 28.0);
+    assert_helix_continuous_across_instance_windows(&out.mesh, 1.25, zmin + 8.0, zmin + 36.0);
+    assert_clean_thread_entry(&out.mesh, 4.0, 1.25, zmin + 5.3);
+
+    // Inspector path: golden CadDocument + fillet R=0.8 after the cylinder.
+    let doc = iso_m8_x40_golden_document_with_fillet(0.8);
+    let doc_out = Engine::new()
+        .execute_document(&doc)
+        .expect("Inspector-path R=0.8 document")
+        .into_model_output()
+        .expect("document mesh");
+    let doc_dv = doc_out.metrics.volume - unfilleted.metrics.volume;
+    let doc_fit = under_head_fillet_r_median_err(&doc_out.mesh, 5.3, 4.0, 0.8);
+    eprintln!(
+        "R=0.8 document-path: ΔV={doc_dv:.3} fit={doc_fit:?} prov={:?}",
+        doc_out.metrics.mesh_provenance
+    );
+    let (dn, derr) = doc_fit.unwrap_or_else(|| {
+        panic!("Inspector document-path under_head R=0.8 is NONE (ΔV={doc_dv:.3})")
+    });
+    assert!(
+        dn >= 12 && derr <= 0.35,
+        "Inspector document-path R=0.8: n={dn} err={derr:.3} ΔV={doc_dv:.3}"
+    );
+
+    // Inspector names under-head edges from hex+shank topology, then fillets
+    // those indices at R=0.8 (not "all").
+    let hex_shank = hex_shank_program();
+    let topo = Engine::new()
+        .list_topology(&hex_shank)
+        .expect("hex+shank topology");
+    let mut idxs: Vec<usize> = Vec::new();
+    for e in &topo.edges {
+        let r = e.mid[0].hypot(e.mid[1]);
+        let on_junction_z = (e.mid[2] - 5.3).abs() <= 0.85;
+        let around_shank = r >= 4.0 - 0.35 && r <= 4.0 + 2.8;
+        let named = e
+            .tags
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("circle") || t.eq_ignore_ascii_case("underhead"));
+        let circular = e.curve_type.to_ascii_lowercase().contains("circle");
+        if on_junction_z && around_shank && (named || circular || e.length > 4.0) {
+            idxs.push(e.index);
+        }
+    }
+    idxs.sort_unstable();
+    idxs.dedup();
+    eprintln!("R=0.8 Inspector edge indices: {idxs:?}");
+    let mut ir: serde_json::Value =
+        serde_json::from_str(include_str!("../../../tests/reports/m8_x40.json")).unwrap();
+    let feat = if idxs.is_empty() {
+        serde_json::json!({ "op": "fillet", "radius": 0.8, "edges": "all" })
+    } else {
+        serde_json::json!({ "op": "fillet", "radius": 0.8, "edges": idxs })
+    };
+    let features = ir["bodies"][0]["features"].as_array_mut().unwrap();
+    let insert_at = features
+        .iter()
+        .position(|f| f["op"] == "cylinder")
+        .map(|i| i + 1)
+        .unwrap_or(features.len());
+    features.insert(insert_at, feat);
+    let named_doc = CadDocument::from_json_value(ir).expect("named-edge fillet doc");
+    let named_out = Engine::new()
+        .execute_document(&named_doc)
+        .expect("named-edge R=0.8")
+        .into_model_output()
+        .expect("named mesh");
+    let named_dv = named_out.metrics.volume - unfilleted.metrics.volume;
+    let named_fit = under_head_fillet_r_median_err(&named_out.mesh, 5.3, 4.0, 0.8);
+    eprintln!("R=0.8 named-edge path: ΔV={named_dv:.3} fit={named_fit:?}");
+    let (nn, nerr) = named_fit.unwrap_or_else(|| {
+        panic!("Inspector named-edge under_head R=0.8 is NONE (ΔV={named_dv:.3}) idxs={idxs:?}")
+    });
+    assert!(
+        nn >= 12 && nerr <= 0.35,
+        "Inspector named-edge R=0.8: n={nn} err={nerr:.3} ΔV={named_dv:.3}"
+    );
+}
+
+fn iso_m8_x40_golden_document_with_fillet(radius: f64) -> CadDocument {
+    const RAW: &str = include_str!("../../../tests/reports/m8_x40.json");
+    let mut ir: serde_json::Value = serde_json::from_str(RAW).expect("golden JSON");
+    let feat = serde_json::json!({ "op": "fillet", "radius": radius, "edges": "all" });
+    let features = ir["bodies"][0]["features"]
+        .as_array_mut()
+        .expect("golden features");
+    let insert_at = features
+        .iter()
+        .position(|f| f["op"] == "cylinder")
+        .map(|i| i + 1)
+        .unwrap_or(features.len());
+    features.insert(insert_at, feat);
+    CadDocument::from_json_value(ir).expect("golden+fillet CadDocument")
 }
