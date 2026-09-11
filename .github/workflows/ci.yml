@@ -1,16 +1,25 @@
 # PR compile+test CI. Triggers on pull_request so PRs get check runs
 # (not only post-push to main). Any failing step fails that job (red).
 #
-# Jobs are independent so Atlas can merge Kernel STEP (#15 area) first,
-# then require the OCCT golden job. Mock lib tests do NOT cover OCCT.
+# Jobs are independent. Mock lib tests do NOT cover OCCT. Kernel STEP and
+# continuous helix (#22) are on main — the OCCT golden job is green-capable
+# (not expected RED). Do not leave that job un-required on stale RED wording.
 #
 # Required-check names (Settings → Branches / Rulesets → require these
 # status checks — names must match exactly):
 #   compile and test
 #   shipping server (occt)
-#   OCCT golden M8 STEP/STL    ← expect RED on current main until Kernel STEP
+#   OCCT golden M8 STEP/STL
 #
 # Explicitly not added: mock/stub helix coverage.
+#
+# actions/checkout@v5 and actions/setup-node@v5 are the Node 24 action
+# runtime (v4 is Node 20, deprecated / removed from runners mid-Sept 2026).
+# apps/web still installs Node 22 below — that is the project toolchain.
+#
+# Every cargo invocation uses --locked so a stale Cargo.lock cannot go green.
+# Root workspace lock for kernel/agent/server; tests/reports/Cargo.lock for
+# the inspector (nested workspace). npm ci already fails on a stale package-lock.
 
 name: CI
 
@@ -18,6 +27,12 @@ on:
   pull_request:
   push:
     branches: [main]
+
+# One in-flight run per PR (or per branch on push to main). A new commit
+# cancels the stale run so the 45–60 min OCCT jobs do not stack.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -33,7 +48,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@1.95.0
@@ -42,16 +57,22 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: kernel lib tests (mock — not OCCT)
-        run: cargo test -p kernel --lib
+        run: cargo test --locked -p kernel --lib
 
       - name: kernel ir tests (mock — not OCCT)
-        run: cargo test -p kernel --test ir_tests
+        run: cargo test --locked -p kernel --test ir_tests
 
       - name: agent tests
-        run: cargo test -p agent
+        run: cargo test --locked -p agent
+
+      # Look-right acceptance (synthetic helix / smooth-rod / STEP / fillet).
+      # No OCCT — the golden job still runs the inspector binary with --features occt.
+      # --locked: this nested workspace has its own Cargo.lock.
+      - name: inspector look-right unit tests (mock — not OCCT)
+        run: cargo test --locked --manifest-path tests/reports/Cargo.toml
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22"
           cache: npm
@@ -75,7 +96,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@1.95.0
@@ -86,7 +107,13 @@ jobs:
       # Default features include `occt` (see crates/server/Cargo.toml).
       # Do not pass --no-default-features — that would be mock-only.
       - name: cargo build -p server --release (links occt)
-        run: cargo build -p server --release
+        run: cargo build --locked -p server --release
+
+      # Same default occt features as the release binary above. Unit tests live
+      # in src/main.rs and src/preview.rs (verify prompt, fastener recipe, SSE
+      # keep-document, mesh-component count). No GEMINI_KEY / network.
+      - name: cargo test -p server --release
+        run: cargo test --locked -p server --release
 
   occt-golden:
     name: OCCT golden M8 STEP/STL
@@ -94,7 +121,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@1.95.0
@@ -106,11 +133,36 @@ jobs:
       # --release: debug wasmtime/Cranelift is too slow for the viewport-fast
       # asserts (25s). Do not loosen those helix/timing checks in the tests.
       - name: kernel OCCT geometry tests (release)
-        run: cargo test --release -p kernel --features occt --test occt_geometry
+        id: occt-geometry
+        run: cargo test --locked --release -p kernel --features occt --test occt_geometry
 
       # Golden M8 + STEP/STL honesty via tests/reports inspector.
-      # Expected RED on current main until Kernel STEP (PR #15 area) lands.
       # if: always() so STEP/STL still reports when a prior geometry test fails.
+      # Inspector verdicts (helix / ISO / sliver) are unchanged. If cargo-test
+      # already failed, rewrite printed Overall so this job cannot claim PASS.
       - name: inspector golden M8 STEP/STL
-        if: always()
-        run: cargo run --release --manifest-path tests/reports/Cargo.toml --features occt
+        if: always() && !cancelled()
+        run: |
+          set +e
+          cargo run --locked --release --manifest-path tests/reports/Cargo.toml --features occt \
+            > "${RUNNER_TEMP}/inspector.out"
+          inspector_rc=$?
+          set -e
+
+          report="${RUNNER_TEMP}/inspector.out"
+          geo="${{ steps.occt-geometry.outcome }}"
+
+          if [ "$geo" != "success" ]; then
+            if [ -s "$report" ]; then
+              sed 's/^\*\*Overall: PASS\*\*/**Overall: FAIL** (prior kernel OCCT geometry \/ helix-continuity step failed; inspector checks below were not loosened)/' \
+                "$report"
+            else
+              echo "**Overall: FAIL** (prior kernel OCCT geometry / helix-continuity step failed)"
+            fi
+            exit 1
+          fi
+
+          if [ -s "$report" ]; then
+            cat "$report"
+          fi
+          exit "$inspector_rc"
