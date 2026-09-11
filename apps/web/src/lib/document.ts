@@ -1,4 +1,12 @@
-import type { CadBody, CadDocument, CadProgram, Feature, ThreadOp } from '../types/cad'
+import type {
+  BodyInstance,
+  CadBody,
+  CadDocument,
+  CadProgram,
+  Feature,
+  MetricsData,
+  ThreadOp,
+} from '../types/cad'
 
 export const BODY_COLORS = [
   '#4a90e2',
@@ -146,6 +154,646 @@ export function setDocumentParameter(
   next = applyParameterDelta(next, name, old, value)
   next.parameters = { ...resolved, [name]: value }
   return next
+}
+
+/** Treat as unchanged so draft/commit guards skip a no-op rebuild. */
+export function sameParameterValue(a: number, b: number): boolean {
+  return Math.abs(a - b) < 1e-9
+}
+
+export function isExplicitParameter(doc: CadDocument, name: string): boolean {
+  const value = doc.parameters?.[name]
+  return value != null && Number.isFinite(value)
+}
+
+export function explicitParameterNames(doc: CadDocument): string[] {
+  return Object.entries(doc.parameters ?? {})
+    .filter(([, value]) => Number.isFinite(value))
+    .map(([name]) => name)
+}
+
+export interface ParameterBatch {
+  values?: Record<string, number>
+  deletes?: string[]
+}
+
+/**
+ * Apply every value edit, then drop deleted keys from `document.parameters`.
+ * Feature literals are not rewritten on delete — only the map entry is removed.
+ * Inferred-only names (no map entry) are ignored on delete; they are not in the map.
+ */
+export function applyParameterBatch(doc: CadDocument, batch: ParameterBatch): CadDocument {
+  const deletes = new Set(batch.deletes ?? [])
+  const values = batch.values ?? {}
+  let next = doc
+  for (const [name, value] of Object.entries(values)) {
+    if (deletes.has(name)) continue
+    next = setDocumentParameter(next, name, value)
+  }
+  if (deletes.size === 0) return next
+
+  const parameters = { ...(next.parameters ?? {}) }
+  let removed = false
+  for (const name of deletes) {
+    if (Object.prototype.hasOwnProperty.call(parameters, name)) {
+      delete parameters[name]
+      removed = true
+    }
+  }
+  if (!removed) return next
+  return {
+    ...next,
+    parameters: Object.keys(parameters).length > 0 ? parameters : undefined,
+  }
+}
+
+export function parameterBatchHasWork(doc: CadDocument, batch: ParameterBatch): boolean {
+  const deletes = batch.deletes ?? []
+  if (deletes.some((name) => isExplicitParameter(doc, name))) return true
+  const resolved = resolvedParameters(doc)
+  for (const [name, value] of Object.entries(batch.values ?? {})) {
+    if (deletes.includes(name)) continue
+    const current = resolved[name]
+    if (current == null || !sameParameterValue(current, value)) return true
+  }
+  return false
+}
+
+export function parameterBatchLabel(batch: ParameterBatch): string {
+  const edits = Object.entries(batch.values ?? {})
+  const deletes = batch.deletes ?? []
+  const parts = [
+    ...edits.map(([name, value]) => `${name} → ${value}`),
+    ...deletes.map((name) => `delete ${name}`),
+  ]
+  if (parts.length === 0) return 'Parameters'
+  if (parts.length === 1) return parts[0]!
+  return `Parameters (${parts.length})`
+}
+
+/**
+ * Turn panel drafts + pending deletes into one Calculate payload.
+ * Enter/blur only update `drafts`; this runs when the user clicks Calculate.
+ */
+export function collectParameterBatch(opts: {
+  committed: Record<string, number>
+  explicitNames: readonly string[]
+  drafts: Record<string, string>
+  pendingDeletes: readonly string[]
+}): { values: Record<string, number>; deletes: string[]; invalid: string[] } {
+  const explicit = new Set(opts.explicitNames)
+  const pending = new Set(opts.pendingDeletes)
+  const deletes = [...pending].filter((name) => explicit.has(name))
+  const values: Record<string, number> = {}
+  const invalid: string[] = []
+
+  for (const [name, current] of Object.entries(opts.committed)) {
+    if (pending.has(name)) continue
+    const raw = opts.drafts[name]
+    if (raw == null) continue
+    const parsed = parseParameterDraft(raw, name)
+    if (parsed == null) {
+      if (raw.trim() !== '' && raw.trim() !== String(current)) {
+        invalid.push(name)
+      }
+      continue
+    }
+    if (!sameParameterValue(parsed, current)) {
+      values[name] = parsed
+    }
+  }
+
+  return { values, deletes, invalid }
+}
+
+/** Dirty value edits + pending deletes + invalid drafts (all uncommitted panel work). */
+export function countUncommittedParameters(batch: {
+  values: Record<string, number>
+  deletes: string[]
+  invalid: string[]
+}): number {
+  return Object.keys(batch.values).length + batch.deletes.length + batch.invalid.length
+}
+
+/**
+ * Keep still-dirty drafts across cosmetic IR updates (pretty-print Run,
+ * rename, visibility). Drop drafts/deletes that no longer apply after
+ * Calculate, chat, or a timeline restore changed committed values.
+ */
+export function reconcileParameterDrafts(opts: {
+  committed: Record<string, number>
+  explicitNames: readonly string[]
+  drafts: Record<string, string>
+  pendingDeletes: readonly string[]
+}): { drafts: Record<string, string>; pendingDeletes: string[] } {
+  const drafts: Record<string, string> = {}
+  for (const [name, raw] of Object.entries(opts.drafts)) {
+    if (!Object.prototype.hasOwnProperty.call(opts.committed, name)) continue
+    const current = opts.committed[name]!
+    const parsed = parseParameterDraft(raw, name)
+    if (parsed == null) {
+      if (raw !== String(current)) drafts[name] = raw
+      continue
+    }
+    if (!sameParameterValue(parsed, current)) drafts[name] = raw
+  }
+  const explicit = new Set(opts.explicitNames)
+  const pendingDeletes = opts.pendingDeletes.filter((name) => explicit.has(name))
+  return { drafts, pendingDeletes }
+}
+
+export function committedParametersSignature(committed: Record<string, number>): string {
+  return JSON.stringify(
+    Object.keys(committed)
+      .sort()
+      .map((name) => [name, committed[name]]),
+  )
+}
+
+/** Chat/toolbar copy: agent sees last calculated IR, not panel drafts. */
+export function uncommittedParameterChatWarning(dirtyCount: number): string {
+  const n =
+    dirtyCount === 1
+      ? '1 uncommitted parameter change'
+      : `${dirtyCount} uncommitted parameter changes`
+  return `You have ${n}. The agent will see the last calculated model, not these drafts. Continue?`
+}
+
+export function toolbarRewriteConfirmMessage(
+  dirtyCount: number,
+  editorKind: EditorTrustKind = 'aligned',
+): string {
+  const base =
+    'This tool asks the AI to rewrite the current solid, including a loaded golden. Continue?'
+  const extras: string[] = []
+  if (dirtyCount > 0) {
+    extras.push(
+      dirtyCount === 1
+        ? '1 uncommitted parameter change will not be sent to the agent.'
+        : `${dirtyCount} uncommitted parameter changes will not be sent to the agent.`,
+    )
+  }
+  if (editorKind === 'invalid') {
+    extras.push('Invalid editor JSON will not be sent — the agent sees the last calculated model.')
+  } else if (editorKind === 'dirty') {
+    extras.push('Unrun JSON editor edits will not be sent — the agent sees the last calculated model.')
+  }
+  if (extras.length === 0) return base
+  return `${base}\n\n${extras.join(' ')}`
+}
+
+export function uncommittedParameterExportNote(dirtyCount: number): string {
+  return dirtyCount === 1
+    ? '1 uncommitted parameter change — export is the last calculated model'
+    : `${dirtyCount} uncommitted parameter changes — export is the last calculated model`
+}
+
+export function parseDocumentOrNull(text: string): CadDocument | null {
+  if (!text.trim()) return null
+  try {
+    return parseSceneJson(text)
+  } catch {
+    return null
+  }
+}
+
+export function documentsAlign(a: CadDocument, b: CadDocument): boolean {
+  return prettyDocument(a) === prettyDocument(b)
+}
+
+export type EditorTrustKind = 'aligned' | 'dirty' | 'invalid' | 'empty'
+
+/**
+ * Editor IR vs last-good (viewport / export). Whitespace-only edits parse
+ * equal after normalize and count as aligned.
+ */
+export function editorTrustKind(irCode: string, lastGoodIrCode: string): EditorTrustKind {
+  const current = parseDocumentOrNull(irCode)
+  const lastGood = parseDocumentOrNull(lastGoodIrCode)
+  if (!irCode.trim()) return lastGood ? 'dirty' : 'empty'
+  if (!current) return lastGood ? 'invalid' : 'empty'
+  if (!lastGood) return 'dirty'
+  return documentsAlign(current, lastGood) ? 'aligned' : 'dirty'
+}
+
+/**
+ * What the agent should see: last calculated document when it exists
+ * (matches viewport / export). Unrun or invalid editor JSON stays local
+ * until Run. Never-run paste falls back to the editor.
+ */
+export function documentForAgent(irCode: string, lastGoodIrCode: string): CadDocument | null {
+  return parseDocumentOrNull(lastGoodIrCode) ?? parseDocumentOrNull(irCode)
+}
+
+/**
+ * Calculate / parameters: use parseable editor JSON so a deliberate
+ * paste can be committed; fall back to last-good so a typo does not
+ * drop drafts or no-op Calculate.
+ */
+export function workingDocument(irCode: string, lastGoodIrCode: string): CadDocument | null {
+  return parseDocumentOrNull(irCode) ?? parseDocumentOrNull(lastGoodIrCode)
+}
+
+export function shouldConfirmChatSend(opts: {
+  editorKind: EditorTrustKind
+  hasLastGood: boolean
+  dirtyParamCount: number
+}): boolean {
+  if (opts.dirtyParamCount > 0) return true
+  if (!opts.hasLastGood) return false
+  return opts.editorKind === 'dirty' || opts.editorKind === 'invalid'
+}
+
+export function chatSendConfirmMessage(opts: {
+  editorKind: EditorTrustKind
+  hasLastGood: boolean
+  dirtyParamCount: number
+}): string {
+  const parts: string[] = []
+  if (opts.dirtyParamCount > 0) {
+    parts.push(
+      opts.dirtyParamCount === 1
+        ? '1 uncommitted parameter change'
+        : `${opts.dirtyParamCount} uncommitted parameter changes`,
+    )
+  }
+  if (opts.hasLastGood && opts.editorKind === 'invalid') {
+    parts.push('invalid JSON in the editor')
+  } else if (opts.hasLastGood && opts.editorKind === 'dirty') {
+    parts.push('unrun JSON editor edits')
+  }
+  const have =
+    parts.length === 0
+      ? 'local edits'
+      : parts.length === 1
+        ? parts[0]!
+        : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`
+  return `You have ${have}. The agent will see the last calculated model (what you see in the viewport), not these drafts. Continue?`
+}
+
+export function chatInputTrustNote(opts: {
+  editorKind: EditorTrustKind
+  hasLastGood: boolean
+  dirtyParamCount: number
+}): string | null {
+  const editor =
+    opts.hasLastGood && opts.editorKind === 'invalid'
+      ? 'JSON is invalid'
+      : opts.hasLastGood && opts.editorKind === 'dirty'
+        ? 'JSON editor does not match the last calculated model'
+        : null
+  if (opts.dirtyParamCount > 0 && editor) {
+    const n =
+      opts.dirtyParamCount === 1
+        ? '1 uncommitted parameter change'
+        : `${opts.dirtyParamCount} uncommitted parameter changes`
+    return `${n} and ${editor.toLowerCase()} — chat uses the last calculated model until Calculate / Run.`
+  }
+  if (editor) {
+    return `${editor} — chat uses the last calculated model until Run.`
+  }
+  if (opts.dirtyParamCount > 0) {
+    return opts.dirtyParamCount === 1
+      ? '1 uncommitted parameter change — chat uses the last calculated model until Calculate.'
+      : `${opts.dirtyParamCount} uncommitted parameter changes — chat uses the last calculated model until Calculate.`
+  }
+  return null
+}
+
+export function parametersLastGoodNote(opts: {
+  editorKind: EditorTrustKind
+  showingLastGood: boolean
+}): string | null {
+  if (!opts.showingLastGood) return null
+  if (opts.editorKind === 'invalid') {
+    return 'JSON is invalid — showing last calculated parameters. Fix or Run to use the editor.'
+  }
+  return 'JSON editor is empty — showing last calculated parameters.'
+}
+
+/** Outliner lists last-good when the editor cannot parse. Actions apply there. */
+export function outlinerLastGoodNote(opts: {
+  editorKind: EditorTrustKind
+  showingLastGood: boolean
+}): string | null {
+  if (!opts.showingLastGood) return null
+  if (opts.editorKind === 'invalid') {
+    return 'JSON is invalid — showing last calculated bodies. Hide, rename, and delete apply to that model and replace the broken editor.'
+  }
+  return 'JSON editor is empty — showing last calculated bodies. Hide, rename, and delete apply to that model.'
+}
+
+/** Drop one body from the document. Missing id is a no-op (`null`). */
+export function removeBodyFromDocument(doc: CadDocument, bodyId: string): CadDocument | null {
+  if (!doc.bodies.some((b) => b.bodyId === bodyId)) return null
+  return {
+    ...doc,
+    bodies: doc.bodies.filter((b) => b.bodyId !== bodyId),
+  }
+}
+
+export function irAfterBodyRemoval(doc: CadDocument): string {
+  return doc.bodies.length ? prettyDocument(doc) : ''
+}
+
+export function deleteBodyTimelineLabel(name: string): string {
+  const cleaned = name.replace(/\s+/g, ' ').trim() || 'body'
+  return `Delete ${cleaned}`
+}
+
+/**
+ * Status-bar / editor metrics for remaining bodies after a local delete.
+ * No kernel run — volume/area add, bbox unions. Empty → null (no leftover solid).
+ */
+export function metricsFromBodies(bodies: BodyInstance[]): MetricsData | null {
+  if (bodies.length === 0) return null
+  if (bodies.length === 1) {
+    const m = bodies[0]!.metrics
+    return {
+      ...m,
+      bbox: [...m.bbox] as MetricsData['bbox'],
+    }
+  }
+  let volume = 0
+  let surface_area = 0
+  let is_solid = true
+  let xmin = Infinity
+  let ymin = Infinity
+  let zmin = Infinity
+  let xmax = -Infinity
+  let ymax = -Infinity
+  let zmax = -Infinity
+  let units: MetricsData['units']
+  for (const body of bodies) {
+    const m = body.metrics
+    volume += m.volume
+    surface_area += m.surface_area
+    is_solid = is_solid && m.is_solid
+    const [x0, y0, z0, x1, y1, z1] = m.bbox
+    xmin = Math.min(xmin, x0)
+    ymin = Math.min(ymin, y0)
+    zmin = Math.min(zmin, z0)
+    xmax = Math.max(xmax, x1)
+    ymax = Math.max(ymax, y1)
+    zmax = Math.max(zmax, z1)
+    if (m.units) units = m.units
+  }
+  return {
+    volume,
+    surface_area,
+    is_solid,
+    bbox: [xmin, ymin, zmin, xmax, ymax, zmax],
+    units,
+  }
+}
+
+export type DeleteBodyPlan =
+  | {
+      kind: 'scene'
+      nextIrCode: string
+      removedName: string
+      label: string
+    }
+  | {
+      kind: 'editor-only'
+      nextIrCode: string
+      removedName: string
+    }
+
+function deletePlanFromDoc(
+  doc: CadDocument,
+  bodyId: string,
+  kind: DeleteBodyPlan['kind'],
+): DeleteBodyPlan | null {
+  const removed = doc.bodies.find((b) => b.bodyId === bodyId)
+  if (!removed) return null
+  const next = removeBodyFromDocument(doc, bodyId)
+  if (!next) return null
+  const removedName = removed.name || removed.bodyId
+  const nextIrCode = irAfterBodyRemoval(next)
+  if (kind === 'scene') {
+    return {
+      kind,
+      nextIrCode,
+      removedName,
+      label: deleteBodyTimelineLabel(removedName),
+    }
+  }
+  return { kind, nextIrCode, removedName }
+}
+
+/**
+ * Which document an Outliner mutate should edit, and whether that is the
+ * visible last-good scene or a parseable editor draft.
+ * Dirty parseable editor stays editor-only (do not loosen Cycles 4–5).
+ * Unparseable editor (invalid / empty) + last-good: apply to the solid the
+ * Outliner already listed, then replace the unusable draft.
+ */
+function planTargetDocument(
+  irCode: string,
+  lastGoodIrCode: string,
+): { doc: CadDocument; kind: 'scene' | 'editor-only' } | null {
+  const current = parseDocumentOrNull(irCode)
+  const lastGood = parseDocumentOrNull(lastGoodIrCode)
+  const aligned = irCode === lastGoodIrCode
+  if (lastGood && aligned) return { doc: lastGood, kind: 'scene' }
+  if (current) return { doc: current, kind: 'editor-only' }
+  if (lastGood) return { doc: lastGood, kind: 'scene' }
+  return null
+}
+
+/**
+ * Aligned last-good: delete the solid you see (IR, mesh, metrics, History).
+ * Dirty parseable editor: JSON draft only — viewport / last-good stay.
+ * Invalid / empty editor: apply to last-good and replace the unusable draft
+ * (Outliner already listed that solid; do not no-op the buttons).
+ */
+export function planDeleteBody(opts: {
+  irCode: string
+  lastGoodIrCode: string
+  bodyId: string
+}): DeleteBodyPlan | null {
+  const target = planTargetDocument(opts.irCode, opts.lastGoodIrCode)
+  if (!target) return null
+  return deletePlanFromDoc(target.doc, opts.bodyId, target.kind)
+}
+
+export function bodyDisplayName(body: { name?: string; bodyId: string }): string {
+  const cleaned = (body.name || body.bodyId).replace(/\s+/g, ' ').trim()
+  return cleaned || 'body'
+}
+
+/** Viewport scene id only — Outliner may list dirty-editor bodies that are not meshed. */
+export function sceneBodyId(
+  bodies: readonly { bodyId: string }[],
+  id: string | null,
+): string | null {
+  if (!id) return null
+  return bodies.some((b) => b.bodyId === id) ? id : null
+}
+
+/**
+ * Drop isolate / selection when the body is gone (History restore, new run).
+ * An orphan isolate hides every mesh while chat/export still send the snapshot.
+ */
+export function retainBodySelection(
+  bodies: readonly { bodyId: string }[],
+  selectedBodyId: string | null,
+  isolatedBodyId: string | null,
+): { selectedBodyId: string | null; isolatedBodyId: string | null } {
+  return {
+    selectedBodyId: sceneBodyId(bodies, selectedBodyId),
+    isolatedBodyId: sceneBodyId(bodies, isolatedBodyId),
+  }
+}
+
+/**
+ * Isolate toggle against the viewport scene, not the Outliner draft list.
+ * A draft-only id would hide every last-good mesh (orphan isolate).
+ */
+export function nextIsolatedBodyId(
+  bodies: readonly { bodyId: string }[],
+  currentIsolated: string | null,
+  requested: string | null,
+): string | null {
+  if (requested == null) return null
+  if (!sceneBodyId(bodies, requested)) return sceneBodyId(bodies, currentIsolated)
+  return currentIsolated === requested ? null : requested
+}
+
+/**
+ * Select against the viewport scene. Draft-only Outliner rows must not
+ * become `selectedBodyId` (no chip, no mesh highlight, easy to isolate next).
+ */
+export function nextSelectedBodyId(
+  bodies: readonly { bodyId: string }[],
+  currentSelected: string | null,
+  requested: string | null,
+): string | null {
+  if (requested == null) return null
+  return sceneBodyId(bodies, requested) ?? sceneBodyId(bodies, currentSelected)
+}
+
+/** Chat may only scope to a body that exists on the document the agent will see. */
+export function targetBodyIdForDocument(
+  document: CadDocument | null,
+  selectedBodyId: string | null,
+): string | undefined {
+  if (!selectedBodyId || !document) return undefined
+  return document.bodies.some((b) => b.bodyId === selectedBodyId) ? selectedBodyId : undefined
+}
+
+/** No-op when the id is missing or visibility is already the requested value. */
+export function setBodyVisibleInDocument(
+  doc: CadDocument,
+  bodyId: string,
+  visible: boolean,
+): CadDocument | null {
+  const body = doc.bodies.find((b) => b.bodyId === bodyId)
+  if (!body) return null
+  const current = body.visible !== false
+  if (current === visible) return null
+  return {
+    ...doc,
+    bodies: doc.bodies.map((b) => (b.bodyId === bodyId ? { ...b, visible } : b)),
+  }
+}
+
+/** No-op when the id is missing, the name is empty, or it already matches. */
+export function renameBodyInDocument(
+  doc: CadDocument,
+  bodyId: string,
+  name: string,
+): CadDocument | null {
+  const cleaned = name.replace(/\s+/g, ' ').trim()
+  if (!cleaned) return null
+  const body = doc.bodies.find((b) => b.bodyId === bodyId)
+  if (!body) return null
+  if (bodyDisplayName(body) === cleaned) return null
+  return {
+    ...doc,
+    bodies: doc.bodies.map((b) => (b.bodyId === bodyId ? { ...b, name: cleaned } : b)),
+  }
+}
+
+export function hideShowTimelineLabel(name: string, visible: boolean): string {
+  const cleaned = name.replace(/\s+/g, ' ').trim() || 'body'
+  return visible ? `Show ${cleaned}` : `Hide ${cleaned}`
+}
+
+export function renameBodyTimelineLabel(from: string, to: string): string {
+  const a = from.replace(/\s+/g, ' ').trim() || 'body'
+  const b = to.replace(/\s+/g, ' ').trim() || 'body'
+  return `Rename ${a} → ${b}`
+}
+
+export type BodyMetaPlan =
+  | {
+      kind: 'scene'
+      nextIrCode: string
+      label: string
+    }
+  | {
+      kind: 'editor-only'
+      nextIrCode: string
+    }
+
+function planBodyMetaEdit(
+  opts: { irCode: string; lastGoodIrCode: string },
+  apply: (doc: CadDocument) => { next: CadDocument; label: string } | null,
+): BodyMetaPlan | null {
+  const target = planTargetDocument(opts.irCode, opts.lastGoodIrCode)
+  if (!target) return null
+  const result = apply(target.doc)
+  if (!result) return null
+  if (target.kind === 'scene') {
+    return { kind: 'scene', nextIrCode: prettyDocument(result.next), label: result.label }
+  }
+  return { kind: 'editor-only', nextIrCode: prettyDocument(result.next) }
+}
+
+/**
+ * Hide/show follow the same last-good vs draft rules as delete.
+ * Aligned: viewport + last-good + History. Dirty parseable editor: JSON only.
+ * Invalid / empty editor: last-good scene (replace the unusable draft).
+ */
+export function planSetBodyVisible(opts: {
+  irCode: string
+  lastGoodIrCode: string
+  bodyId: string
+  visible: boolean
+}): BodyMetaPlan | null {
+  return planBodyMetaEdit(opts, (doc) => {
+    const next = setBodyVisibleInDocument(doc, opts.bodyId, opts.visible)
+    if (!next) return null
+    const body = doc.bodies.find((b) => b.bodyId === opts.bodyId)
+    if (!body) return null
+    return { next, label: hideShowTimelineLabel(bodyDisplayName(body), opts.visible) }
+  })
+}
+
+/**
+ * Rename follows the same last-good vs draft rules as delete.
+ * Aligned: viewport + last-good + History. Dirty parseable editor: JSON only.
+ * Invalid / empty editor: last-good scene (replace the unusable draft).
+ */
+export function planRenameBody(opts: {
+  irCode: string
+  lastGoodIrCode: string
+  bodyId: string
+  name: string
+}): BodyMetaPlan | null {
+  return planBodyMetaEdit(opts, (doc) => {
+    const next = renameBodyInDocument(doc, opts.bodyId, opts.name)
+    if (!next) return null
+    const body = doc.bodies.find((b) => b.bodyId === opts.bodyId)
+    if (!body) return null
+    const renamed = next.bodies.find((b) => b.bodyId === opts.bodyId)
+    return {
+      next,
+      label: renameBodyTimelineLabel(bodyDisplayName(body), bodyDisplayName(renamed ?? body)),
+    }
+  })
 }
 
 /** Scale numbers that match common ratios of the old parameter (hex vertices, halves). */

@@ -15,23 +15,31 @@ import type {
 import { runProgram, exportModel, streamChat } from '../lib/api'
 import { EXPORT_KINDS, canDownloadExport, exportFileName, pickSaveTarget, writeSaveTarget } from '../lib/saveFile'
 import {
+  applyParameterBatch,
+  documentForAgent,
+  metricsFromBodies,
+  parameterBatchHasWork,
+  parameterBatchLabel,
+  parseDocumentOrNull,
   parseScene,
   parseSceneJson,
+  planDeleteBody,
+  planRenameBody,
+  planSetBodyVisible,
   prettyDocument,
-  resolvedParameters,
-  setDocumentParameter,
+  nextIsolatedBodyId,
+  nextSelectedBodyId,
+  retainBodySelection,
+  targetBodyIdForDocument,
+  workingDocument,
+  type ParameterBatch,
 } from '../lib/document'
 import { makeSnapshot, truncateTimelineLabel } from '../lib/timeline'
 
 const EMPTY_IR = ''
 
 function currentDocument(irCode: string): CadDocument | null {
-  if (!irCode.trim()) return null
-  try {
-    return parseSceneJson(irCode)
-  } catch {
-    return null
-  }
+  return parseDocumentOrNull(irCode)
 }
 
 function applyRunPayload(
@@ -41,20 +49,19 @@ function applyRunPayload(
 ) {
   const bodies = resp.bodies ?? []
   set((s) => {
-    const keep = extra.selectedBodyId !== undefined
-      ? extra.selectedBodyId
-      : s.selectedBodyId
+    const keepSelected =
+      extra.selectedBodyId !== undefined ? extra.selectedBodyId : s.selectedBodyId
+    const keepIsolated =
+      extra.isolatedBodyId !== undefined ? extra.isolatedBodyId : s.isolatedBodyId
+    const kept = retainBodySelection(bodies, keepSelected, keepIsolated)
     return {
       ...extra,
       bodies,
       meshData: resp.mesh ?? bodies.find((b) => b.visible)?.mesh ?? null,
       metrics:  resp.metrics ?? null,
       runError: extra.runError ?? null,
-      selectedBodyId: keep && bodies.some((b) => b.bodyId === keep) ? keep : null,
-      isolatedBodyId:
-        s.isolatedBodyId && bodies.some((b) => b.bodyId === s.isolatedBodyId)
-          ? s.isolatedBodyId
-          : null,
+      selectedBodyId: kept.selectedBodyId,
+      isolatedBodyId: kept.isolatedBodyId,
     }
   })
 }
@@ -79,6 +86,10 @@ interface CadStore {
   exportStatus: string | null
   runError:   string | null
 
+  /** Panel-local Calculate drafts (not IR). Chat/export can warn without reading the panel. */
+  uncommittedParameterCount: number
+  setUncommittedParameterCount: (n: number) => void
+
   messages:      ChatMessage[]
   isChatLoading: boolean
 
@@ -90,7 +101,13 @@ interface CadStore {
 
   runGeometry:     (opts?: RunGeometryOptions) => Promise<void>
   setParameter:    (name: string, value: number) => Promise<void>
-  pushTimelineSnapshot: (label: string, source: TimelineSource) => void
+  /** Commit every dirty draft + pending delete, then run one kernel rebuild. */
+  calculateParameters: (batch: ParameterBatch) => Promise<void>
+  pushTimelineSnapshot: (
+    label: string,
+    source: TimelineSource,
+    opts?: { allowEmpty?: boolean },
+  ) => void
   restoreTimelineIndex: (index: number) => void
   branchTimeline:  () => void
   atTimelineTip:   () => boolean
@@ -140,6 +157,10 @@ export const useCadStore = create<CadStore>((set, get) => ({
   exportStatus: null,
   runError:   null,
 
+  uncommittedParameterCount: 0,
+  setUncommittedParameterCount: (n) =>
+    set({ uncommittedParameterCount: n > 0 ? n : 0 }),
+
   messages:      [],
   isChatLoading: false,
 
@@ -160,9 +181,9 @@ export const useCadStore = create<CadStore>((set, get) => ({
     set({ timeline: timeline.slice(0, timelineIndex + 1) })
   },
 
-  pushTimelineSnapshot: (label, source) => {
+  pushTimelineSnapshot: (label, source, opts) => {
     const s = get()
-    if (!s.irCode.trim()) return
+    if (!s.irCode.trim() && !opts?.allowEmpty) return
     const snap = makeSnapshot(label, source, {
       irCode:   s.irCode,
       bodies:   s.bodies,
@@ -182,6 +203,8 @@ export const useCadStore = create<CadStore>((set, get) => ({
   restoreTimelineIndex: (index) => {
     const snap = get().timeline[index]
     if (!snap) return
+    const s = get()
+    const kept = retainBodySelection(snap.bodies, s.selectedBodyId, s.isolatedBodyId)
     set({
       timelineIndex: index,
       irCode:        snap.irCode,
@@ -190,21 +213,27 @@ export const useCadStore = create<CadStore>((set, get) => ({
       meshData:      snap.meshData,
       metrics:       snap.metrics,
       runError:      null,
+      selectedBodyId: kept.selectedBodyId,
+      isolatedBodyId: kept.isolatedBodyId,
     })
   },
 
   setParameter: async (name, value) => {
-    const doc = currentDocument(get().irCode)
+    await get().calculateParameters({ values: { [name]: value } })
+  },
+
+  calculateParameters: async (batch) => {
+    const { irCode, lastGoodIrCode } = get()
+    const doc = workingDocument(irCode, lastGoodIrCode)
     if (!doc) return
-    const current = resolvedParameters(doc)[name]
-    if (current != null && Math.abs(current - value) < 1e-9) return
+    if (!parameterBatchHasWork(doc, batch)) return
+    const updated = applyParameterBatch(doc, batch)
     get().branchTimeline()
-    const updated = setDocumentParameter(doc, name, value)
     // Do not commit IR until the kernel succeeds — failed rebuilds keep
-    // panel, mesh, and export on the last good document.
+    // panel, mesh, and export on the last good document. One batch = one run.
     await get().runGeometry({
       document:   updated,
-      label:      `${name} → ${value}`,
+      label:      parameterBatchLabel(batch),
       source:     'parameter',
       skipBranch: true,
     })
@@ -212,52 +241,104 @@ export const useCadStore = create<CadStore>((set, get) => ({
 
   clearError: () => set({ runError: null }),
 
-  selectBody: (id) => set({ selectedBodyId: id }),
+  selectBody: (id) => {
+    const s = get()
+    set({ selectedBodyId: nextSelectedBodyId(s.bodies, s.selectedBodyId, id) })
+  },
   hoverBody: (id) => set({ hoveredBodyId: id }),
   setOutlinerOpen: (open) => set({ outlinerOpen: open }),
 
   setBodyVisible: (id, visible) => {
-    const doc = currentDocument(get().irCode)
-    if (!doc) return
-    doc.bodies = doc.bodies.map((b) => (b.bodyId === id ? { ...b, visible } : b))
-    const nextIr = prettyDocument(doc)
-    set({
-      irCode: nextIr,
-      lastGoodIrCode: get().lastGoodIrCode === get().irCode ? nextIr : get().lastGoodIrCode,
-      bodies: get().bodies.map((b) => (b.bodyId === id ? { ...b, visible } : b)),
+    const s = get()
+    const plan = planSetBodyVisible({
+      irCode: s.irCode,
+      lastGoodIrCode: s.lastGoodIrCode,
+      bodyId: id,
+      visible,
     })
+    if (!plan) return
+
+    // Unrun / dirty parseable editor: mutate the JSON draft only. Viewport,
+    // last-good, export, and chat stay on the trusted solid (#17 / Cycle 2 / Cycle 4).
+    if (plan.kind === 'editor-only') {
+      set({ irCode: plan.nextIrCode })
+      return
+    }
+
+    // Aligned, or unparseable editor with last-good Outliner fallback: mutate
+    // the visible solid and replace the unusable draft so History matches (Cycle 6).
+    get().branchTimeline()
+    set({
+      irCode: plan.nextIrCode,
+      lastGoodIrCode: plan.nextIrCode,
+      bodies: s.bodies.map((b) => (b.bodyId === id ? { ...b, visible } : b)),
+    })
+    get().pushTimelineSnapshot(plan.label, 'manual')
   },
 
   isolateBody: (id) => {
-    set({ isolatedBodyId: get().isolatedBodyId === id ? null : id })
+    const s = get()
+    set({ isolatedBodyId: nextIsolatedBodyId(s.bodies, s.isolatedBodyId, id) })
   },
 
   renameBody: (id, name) => {
-    const doc = currentDocument(get().irCode)
-    if (!doc) return
-    doc.bodies = doc.bodies.map((b) => (b.bodyId === id ? { ...b, name } : b))
-    const nextIr = prettyDocument(doc)
-    set({
-      irCode: nextIr,
-      lastGoodIrCode: get().lastGoodIrCode === get().irCode ? nextIr : get().lastGoodIrCode,
-      bodies: get().bodies.map((b) => (b.bodyId === id ? { ...b, name } : b)),
+    const s = get()
+    const plan = planRenameBody({
+      irCode: s.irCode,
+      lastGoodIrCode: s.lastGoodIrCode,
+      bodyId: id,
+      name,
     })
+    if (!plan) return
+
+    if (plan.kind === 'editor-only') {
+      set({ irCode: plan.nextIrCode })
+      return
+    }
+
+    // Same last-good scene path as hide (Cycle 6 invalid-editor fallback).
+    get().branchTimeline()
+    const cleaned = name.replace(/\s+/g, ' ').trim()
+    set({
+      irCode: plan.nextIrCode,
+      lastGoodIrCode: plan.nextIrCode,
+      bodies: s.bodies.map((b) => (b.bodyId === id ? { ...b, name: cleaned } : b)),
+    })
+    get().pushTimelineSnapshot(plan.label, 'manual')
   },
 
   deleteBody: (id) => {
-    const doc = currentDocument(get().irCode)
-    if (!doc) return
-    doc.bodies = doc.bodies.filter((b) => b.bodyId !== id)
-    const bodies = get().bodies.filter((b) => b.bodyId !== id)
-    const nextIr = doc.bodies.length ? prettyDocument(doc) : ''
+    const s = get()
+    const plan = planDeleteBody({
+      irCode: s.irCode,
+      lastGoodIrCode: s.lastGoodIrCode,
+      bodyId: id,
+    })
+    if (!plan) return
+
+    // Unrun / dirty parseable editor: mutate the JSON draft only. Viewport,
+    // last-good, export, and chat stay on the trusted solid (#17 / Cycle 2).
+    if (plan.kind === 'editor-only') {
+      set({ irCode: plan.nextIrCode })
+      return
+    }
+
+    // Aligned or unparseable editor + last-good: delete the visible solid and
+    // replace the unusable draft (Cycle 6). Do not leave last-good buttons no-op.
+
+    get().branchTimeline()
+    const bodies = s.bodies.filter((b) => b.bodyId !== id)
     set({
-      irCode: nextIr,
-      lastGoodIrCode: get().lastGoodIrCode === get().irCode ? nextIr : get().lastGoodIrCode,
+      irCode: plan.nextIrCode,
+      lastGoodIrCode: plan.nextIrCode,
       bodies,
       meshData: bodies.find((b) => b.visible)?.mesh ?? null,
-      selectedBodyId: get().selectedBodyId === id ? null : get().selectedBodyId,
-      isolatedBodyId: get().isolatedBodyId === id ? null : get().isolatedBodyId,
+      metrics: metricsFromBodies(bodies),
+      selectedBodyId: s.selectedBodyId === id ? null : s.selectedBodyId,
+      isolatedBodyId: s.isolatedBodyId === id ? null : s.isolatedBodyId,
     })
+    // Allow an empty snapshot so deleting the last body is undoable.
+    get().pushTimelineSnapshot(plan.label, 'manual', { allowEmpty: true })
   },
 
   // ── Run geometry ────────────────────────────────────────────────────────────
@@ -349,7 +430,7 @@ export const useCadStore = create<CadStore>((set, get) => ({
     set({
       isExporting: true,
       exportStatus: 'Choose where to save…',
-      runError: null,
+      // Keep a rebuild error visible when exporting last-good after a failed run.
     })
 
     try {
@@ -388,9 +469,10 @@ export const useCadStore = create<CadStore>((set, get) => ({
   // ── Chat ─────────────────────────────────────────────────────────────────────
 
   sendChatMessage: async (text) => {
-    const { messages, irCode, selectedBodyId, timeline, timelineIndex } = get()
+    const { messages, irCode, lastGoodIrCode, selectedBodyId, timeline, timelineIndex } = get()
     get().branchTimeline()
-    const document = currentDocument(irCode)
+    const document = documentForAgent(irCode, lastGoodIrCode)
+    const targetBodyId = targetBodyIdForDocument(document, selectedBodyId)
 
     const history = messages
       .filter((m) => m.content.trim())
@@ -572,7 +654,7 @@ export const useCadStore = create<CadStore>((set, get) => ({
       const step = timeline[timelineIndex]
       await streamChat(text, history, handleEvent, {
         document: document ?? undefined,
-        targetBodyId: selectedBodyId,
+        targetBodyId,
         timelineStepIndex: step && timelineIndex >= 0 ? timelineIndex : undefined,
         timelineStepLabel: step?.label,
       })

@@ -1,4 +1,5 @@
 import type { ExportFormat } from '../types/cad'
+import { parseDocumentOrNull, uncommittedParameterExportNote } from './document.ts'
 
 export interface ExportKind {
   id: ExportFormat
@@ -34,24 +35,65 @@ export function exportFileName(documentId: string | undefined, ext: string): str
   return `${sanitizeExportBase(documentId)}.${ext}`
 }
 
+export const LAST_GOOD_REBUILD_FAILED_NOTE = 'Exporting last good; rebuild failed'
+
+export type ExportGate =
+  | { ok: true; note?: string }
+  | { ok: false; reason: string }
+
 export function canDownloadExport(opts: {
   runError: string | null
   irCode: string
   lastGoodIrCode: string
-}): { ok: true } | { ok: false; reason: string } {
+}): ExportGate {
+  const lastGoodSet = !!opts.lastGoodIrCode.trim()
+  const editorMatchesLastGood = opts.irCode === opts.lastGoodIrCode
+
+  // Dirty editor IR that ≠ last-good still cannot download — do not loosen.
+  if (lastGoodSet && !editorMatchesLastGood) {
+    return {
+      ok: false,
+      reason: 'Rebuild the model before exporting. Current IR does not match the last successful run.',
+    }
+  }
+
   if (opts.runError) {
+    // Viewport still shows the trusted solid. Export that last-good document,
+    // not mutated editor IR, when it is set and parseable.
+    if (lastGoodSet && editorMatchesLastGood && parseDocumentOrNull(opts.lastGoodIrCode)) {
+      return { ok: true, note: LAST_GOOD_REBUILD_FAILED_NOTE }
+    }
     return { ok: false, reason: 'Cannot export while a rebuild error is set. Fix or rebuild first.' }
   }
+
   if (!opts.irCode.trim()) {
     return { ok: false, reason: 'Nothing to export. Generate or paste a CAD program first.' }
   }
-  if (!opts.lastGoodIrCode.trim() || opts.irCode !== opts.lastGoodIrCode) {
+  if (!lastGoodSet) {
     return {
       ok: false,
       reason: 'Rebuild the model before exporting. Current IR does not match the last successful run.',
     }
   }
   return { ok: true }
+}
+
+/** Menu header / tooltip copy for the export gate. */
+export function exportMenuCaption(gate: ExportGate, uncommittedParameterCount: number): string {
+  if (!gate.ok) return gate.reason
+  if (gate.note) {
+    if (uncommittedParameterCount > 0) {
+      const prefix = uncommittedParameterCount === 1
+        ? '1 uncommitted parameter change'
+        : `${uncommittedParameterCount} uncommitted parameter changes`
+      return `${prefix} — exporting last good; rebuild failed`
+    }
+    return gate.note
+  }
+  if (uncommittedParameterCount > 0) {
+    return uncommittedParameterExportNote(uncommittedParameterCount)
+  }
+  return 'Choose output format'
 }
 
 interface FilePickerHandle {

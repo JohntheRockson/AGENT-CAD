@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Download, Loader2, ChevronDown, Check, FileBox, FileText, Package, AlertTriangle } from 'lucide-react'
 import { useCadStore } from '../store/useStore'
-import { canDownloadExport, EXPORT_KINDS } from '../lib/saveFile'
+import { canDownloadExport, exportMenuCaption, EXPORT_KINDS } from '../lib/saveFile'
 import type { ExportFormat } from '../types/cad'
 
 // ── Format icon mapping ───────────────────────────────────────────────
@@ -32,6 +32,7 @@ export function ExportMenu() {
   const isExporting    = useCadStore((s) => s.isExporting)
   const exportStatus   = useCadStore((s) => s.exportStatus)
   const downloadExport = useCadStore((s) => s.downloadExport)
+  const uncommittedParameterCount = useCadStore((s) => s.uncommittedParameterCount)
 
   const [menuOpen, setMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
@@ -48,6 +49,7 @@ export function ExportMenu() {
   }, [menuOpen])
 
   const gate = canDownloadExport({ runError, irCode, lastGoodIrCode })
+  const caption = exportMenuCaption(gate, uncommittedParameterCount)
   const disabled = isRunning || isExporting || !gate.ok
 
   return (
@@ -69,7 +71,7 @@ export function ExportMenu() {
         <button
           onClick={() => setMenuOpen((o) => !o)}
           disabled={disabled}
-          title={gate.ok ? 'Export' : gate.reason}
+          title={gate.ok ? (gate.note ?? 'Export') : gate.reason}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border
                      text-[11px] font-medium text-gray-200
                      hover:border-accent/50 hover:bg-raised
@@ -93,7 +95,7 @@ export function ExportMenu() {
             <div className="px-3 py-2 border-b border-divide">
               <p className="text-[11px] font-semibold text-gray-300">Export Model</p>
               <p className="text-[10px] text-dim mt-0.5">
-                {gate.ok ? 'Choose output format' : gate.reason}
+                {caption}
               </p>
             </div>
 

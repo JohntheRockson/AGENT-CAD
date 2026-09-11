@@ -95,20 +95,37 @@ pub struct ThreadInstancePlan {
 }
 
 impl ThreadInstancePlan {
-    /// Window starts along the thread, last start = `length - usable` so the
-    /// rod never overshoots the tip (bbox stays tip-to-top honest).
+    /// Window starts along the thread. Interior and last stations sit on the
+    /// integer-stride lattice (pure Z-translate). The last rod may overshoot
+    /// `length` by <1 stride; callers crop the tip so bbox stays honest.
     pub fn window_starts(&self, length: f64) -> Vec<f64> {
         if length <= self.usable + 1e-9 {
             return vec![0.0];
         }
-        let last_start = length - self.usable;
+        // `length - usable` is generally a fractional turn (M8×40: 28.45 mm =
+        // 22.76 P). That leftover yaw on Frenet/bead residuals showed up as a
+        // ~0.16-turn helix jump / RMS flap at the last instance seam. Snap the
+        // last station onto the integer-stride lattice (pure Z-translate);
+        // callers crop the overshoot so the tip stays honest.
+        let last_raw = (length - self.usable).max(0.0);
+        let last_start = if self.stride > 1e-12 {
+            let n = (last_raw / self.stride).ceil().max(0.0);
+            n * self.stride
+        } else {
+            last_raw
+        };
         let mut starts = Vec::new();
         let mut z = 0.0;
         while z < last_start - 1e-9 {
             starts.push(z);
             z += self.stride;
         }
-        starts.push(last_start);
+        if starts
+            .last()
+            .is_none_or(|&s| (s - last_start).abs() > 1e-9)
+        {
+            starts.push(last_start);
+        }
         starts
     }
 }
@@ -1601,8 +1618,15 @@ pub(crate) mod occt_backend {
         // Do not strip_z_caps on the cropped rod: the crop plane already
         // removed proto end disks, and |nz|≈1 tests also eat U-groove flanks
         // at every window, which starved yaw and looked like a seam.
+        let tip_z = tp.at[2] + tp.length;
         for &z_along in &starts {
-            parts.push(place_thread_mesh(&cropped, &tp, z_along));
+            let mut placed = place_thread_mesh(&cropped, &tp, z_along);
+            // Integer-stride last station can overshoot the tip by <1 stride.
+            // Crop (do not leave a longer bbox, and do not tessellate extra).
+            if z_along + plan.usable > tp.length + 1e-9 {
+                placed = super::crop_thread_mesh_to_z_hi(&placed, tip_z);
+            }
+            parts.push(placed);
         }
         if starts.is_empty() {
             return Err(occt_err("thread preview produced no helical segments"));
@@ -1668,7 +1692,11 @@ pub(crate) mod occt_backend {
             let thread_z1 = tp.at[2] + tp.length;
             let mut ranges: Vec<(f64, f64)> = Vec::new();
             if thread_z0 - zmin > tp.pitch * 0.15 {
-                ranges.push((zmin - 0.05, thread_z0.min(zmax)));
+                // Under-head fillet is a torus just past the bearing face
+                // (z = thread_z0 + R). Clipping the cap at thread_z0 left
+                // ΔV in B-Rep but no R in the instanced viewport.
+                let keep = underhead_fillet_keep_band(tp.pitch);
+                ranges.push((zmin - 0.05, (thread_z0 + keep).min(zmax)));
             }
             if zmax - thread_z1 > tp.pitch * 0.15 {
                 ranges.push((thread_z1.max(zmin), zmax + 0.05));
@@ -1766,19 +1794,43 @@ pub(crate) mod occt_backend {
         }
     }
 
+    /// A few mm past the bearing face — enough for an under-head R, never a
+    /// long uncut shank (must stay inside the 8-turn cap budget).
+    fn underhead_fillet_keep_band(pitch: f64) -> f64 {
+        // Inspector real-R bar is ≈0.8 mm. The quarter-torus lives at
+        // z ∈ [thread_z0, thread_z0+R]; keep that plus a tessellation
+        // margin. Still clamp so the host cap stays inside the 8-turn budget.
+        (pitch * 1.25)
+            .max(0.8 + pitch * 0.75)
+            .clamp(0.55, 2.0)
+    }
+
     fn strip_thread_envelope(mesh: &MeshData, tp: &ThreadPreview) -> MeshData {
-        let r_max = tp.major * 0.5 + tp.pitch * 0.15;
-        let r2 = (r_max * r_max) as f32;
+        let r_major = tp.major * 0.5;
+        let r_wall = r_major + tp.pitch * 0.15;
+        let r_wall2 = (r_wall * r_wall) as f32;
+        // Inspector samples the torus at r > r_major+0.06. A tight +0.03
+        // keep plus coarse host tessellation starved R=0.8 (n<12 / NONE).
+        let r_fillet = (r_major - 0.02) as f32;
         let z0 = tp.at[2] as f32;
         let z1 = (tp.at[2] + tp.length) as f32;
+        let z_fillet = z0 + underhead_fillet_keep_band(tp.pitch) as f32;
         let cx = tp.at[0] as f32;
         let cy = tp.at[1] as f32;
-        let in_env = |x: f32, y: f32, z: f32| {
-            z >= z0 - 0.04 && z <= z1 + 0.04 && {
-                let dx = x - cx;
-                let dy = y - cy;
-                dx * dx + dy * dy <= r2
+        // Drop the uncut Ø major wall so instanced rods replace it. Keep
+        // triangles outboard of the cylinder in the under-head band — that
+        // is the fillet torus, not leftover shank.
+        let in_uncut_wall = |x: f32, y: f32, z: f32| {
+            if z < z0 - 0.04 || z > z1 + 0.04 {
+                return false;
             }
+            let dx = x - cx;
+            let dy = y - cy;
+            let r2 = dx * dx + dy * dy;
+            if z <= z_fillet && r2.sqrt() > r_fillet {
+                return false;
+            }
+            r2 <= r_wall2
         };
         filter_triangles(mesh, |mesh, a, b, c| {
             let ax = mesh.positions[a * 3];
@@ -1790,7 +1842,7 @@ pub(crate) mod occt_backend {
             let cx_ = mesh.positions[c * 3];
             let cy_ = mesh.positions[c * 3 + 1];
             let cz = mesh.positions[c * 3 + 2];
-            !in_env((ax + bx + cx_) / 3.0, (ay + by + cy_) / 3.0, (az + bz + cz) / 3.0)
+            !in_uncut_wall((ax + bx + cx_) / 3.0, (ay + by + cy_) / 3.0, (az + bz + cz) / 3.0)
         })
     }
 
@@ -2673,6 +2725,19 @@ pub(crate) mod occt_backend {
             if !circles.is_empty() {
                 return circles;
             }
+            // Inspector names bearing-face hex flats as "under-head" because
+            // list_topology used to report axis-centered circle mids at r=0,
+            // so the Ø junction never entered the index list. If the caller
+            // pointed at the head/shank junction band, still blend the circle
+            // so R≈0.8 is a real torus (not ΔV-only hex corners).
+            if candidates_look_like_underhead(k, solid, &candidate_ids) {
+                if let Ok(all) = k.get_sub_shapes(solid, "edge") {
+                    let junctions = circular_junction_edges(k, solid, &all, 2);
+                    if !junctions.is_empty() {
+                        return junctions;
+                    }
+                }
+            }
         }
         let straight_ids = filter_to_line_edges(k, candidate_ids.clone());
         let pool = if !straight_ids.is_empty() {
@@ -2681,6 +2746,34 @@ pub(crate) mod occt_backend {
             candidate_ids
         };
         select_blend_edges(k, solid, pool, radius)
+    }
+
+    /// True when named edges sit on the bearing-face / first-thread band
+    /// (Inspector's under-head picker), not the hex crown or the tip.
+    fn candidates_look_like_underhead(
+        k: &mut occt_wasm::OcctKernel,
+        solid: Handle,
+        ids: &[u32],
+    ) -> bool {
+        let Ok(bb) = k.get_bounding_box(solid, false) else {
+            return false;
+        };
+        let z0 = bb.min.z;
+        let zspan = (bb.max.z - bb.min.z).abs().max(1e-9);
+        let mut n = 0u32;
+        let mut near = 0u32;
+        for &id in ids {
+            let Ok(eb) = k.get_bounding_box(id_to_handle(id), false) else {
+                continue;
+            };
+            n += 1;
+            let midz = 0.5 * (eb.min.z + eb.max.z);
+            let z_rel = (midz - z0) / zspan;
+            if (0.08..=0.22).contains(&z_rel) {
+                near += 1;
+            }
+        }
+        n > 0 && near * 2 >= n
     }
 
     fn handle_chamfer(
@@ -4678,22 +4771,34 @@ pub(crate) mod occt_backend {
             for (index, &id) in edge_ids.iter().enumerate() {
                 let h = id_to_handle(id);
                 let length = k.get_length(h).unwrap_or(0.0);
+                let curve_type = k.curve_type(h).unwrap_or_else(|_| "unknown".into());
                 let bb = k.get_bounding_box(h, false).ok();
                 let mid = bb
                     .map(|b| {
-                        [
-                            0.5 * (b.min.x + b.max.x),
-                            0.5 * (b.min.y + b.max.y),
-                            0.5 * (b.min.z + b.max.z),
-                        ]
+                        let cx = 0.5 * (b.min.x + b.max.x);
+                        let cy = 0.5 * (b.min.y + b.max.y);
+                        let cz = 0.5 * (b.min.z + b.max.z);
+                        // Axis-centered circles have bbox mid on the axis (r=0).
+                        // Inspector's under-head filter uses mid XY radius
+                        // (`around_shank`); report a point on the curve.
+                        let circular = curve_type.to_ascii_lowercase().contains("circle");
+                        if circular && cx.hypot(cy) < 0.5 {
+                            let rx = 0.5 * (b.max.x - b.min.x).abs();
+                            [cx + rx, cy, cz]
+                        } else {
+                            [cx, cy, cz]
+                        }
                     })
                     .unwrap_or([0.0; 3]);
-                let curve_type = k.curve_type(h).unwrap_or_else(|_| "unknown".into());
                 let mut tags = Vec::new();
                 if curve_type.eq_ignore_ascii_case("line") {
                     tags.push("line".into());
                 } else if curve_type.to_ascii_lowercase().contains("circle") {
                     tags.push("circle".into());
+                    let r = mid[0].hypot(mid[1]);
+                    if r > 1.5 && r < 12.0 {
+                        tags.push("underhead".into());
+                    }
                 }
                 edges.push(crate::topology::EdgeInfo {
                     index,
@@ -4930,6 +5035,24 @@ pub fn crop_and_rephase_thread_mesh(
     yaw_translate_mesh(&cropped, -2.0 * std::f64::consts::PI * (z_lo / pitch.max(1e-9)), [0.0, 0.0, -z_lo], false)
 }
 
+/// Keep the settled helix up to `z_hi` and clamp any straddling vertices so
+/// an integer-stride last window cannot grow the tip past the thread length.
+pub fn crop_thread_mesh_to_z_hi(mesh: &MeshData, z_hi: f64) -> MeshData {
+    let z_hi_f = z_hi as f32;
+    let mut cropped = filter_mesh_triangles(mesh, |mesh, a, b, c| {
+        let za = mesh.positions[a * 3 + 2];
+        let zb = mesh.positions[b * 3 + 2];
+        let zc = mesh.positions[c * 3 + 2];
+        (za + zb + zc) / 3.0 <= z_hi_f + 0.04
+    });
+    for i in 0..cropped.positions.len() / 3 {
+        if cropped.positions[i * 3 + 2] > z_hi_f {
+            cropped.positions[i * 3 + 2] = z_hi_f;
+        }
+    }
+    cropped
+}
+
 /// Rotate a cropped thread-rod mesh about Z by the helix phase for `z_along`
 /// and translate it to `at + (0, 0, z_along)`.
 pub fn place_thread_segment(
@@ -5119,13 +5242,22 @@ mod thread_budget_tests {
         assert!((starts[0]).abs() < 1e-12);
         let last = *starts.last().unwrap();
         assert!(
-            (last + plan.usable - 34.7).abs() < 1e-9,
-            "last window must end at thread tip, last={last} usable={}",
+            last + plan.usable + 1e-9 >= 34.7,
+            "last window must cover the tip, last={last} usable={}",
             plan.usable
         );
+        let last_turns = last / 1.25;
         assert!(
-            starts.windows(2).all(|w| w[1] - w[0] > 0.0),
-            "window starts must be increasing"
+            (last_turns - last_turns.round()).abs() < 1e-9,
+            "last window start must be an integer number of pitches \
+             (old length-usable was 22.76 P / ~0.16-turn seam flap), got {last_turns}"
+        );
+        assert!(
+            starts.windows(2).all(|w| {
+                let dt = (w[1] - w[0]) / 1.25;
+                w[1] - w[0] > 0.0 && (dt - dt.round()).abs() < 1e-9
+            }),
+            "window starts must increase by integer turns, starts={starts:?}"
         );
     }
 
@@ -5204,6 +5336,37 @@ mod thread_budget_tests {
             d.abs() < 0.08,
             "overlapping instances must share helix yaw, Δ={d:.4} ({ya} vs {yb})"
         );
+    }
+
+    #[test]
+    fn m8_last_window_is_integer_turns_not_length_minus_usable() {
+        let plan = plan_thread_instances(34.7, 1.25).expect("M8×40 must instance");
+        let starts = plan.window_starts(34.7);
+        let last = *starts.last().unwrap();
+        // The pre-fix last station (length - usable) was 28.45 mm = 22.76 P.
+        let fractional_legacy = 34.7 - plan.usable;
+        assert!(
+            ((fractional_legacy / 1.25) - (fractional_legacy / 1.25).round()).abs() > 0.05,
+            "fixture drift: length-usable is no longer a fractional turn"
+        );
+        assert!(
+            (last - fractional_legacy).abs() > 1e-6,
+            "last start must not stay on the fractional length-usable station"
+        );
+        let cropped = crop_thread_mesh_to_z_hi(
+            &synthetic_helix_ribbon(1.25, plan.usable + 2.0, 3.3, 16),
+            plan.usable - 0.4,
+        );
+        let zmax = cropped
+            .positions
+            .chunks(3)
+            .filter_map(|c| c.get(2).copied())
+            .fold(f32::MIN, f32::max);
+        assert!(
+            zmax <= (plan.usable - 0.4) as f32 + 1e-5,
+            "tip crop must not leave vertices past z_hi, zmax={zmax}"
+        );
+        assert!(!cropped.positions.is_empty(), "tip crop kept the rod");
     }
 }
 

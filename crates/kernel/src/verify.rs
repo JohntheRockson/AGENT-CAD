@@ -5,8 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{DocumentOutput, MetricsData};
-use crate::ir::{CadDocument, CadProgram, Feature, ThreadKind, Units};
+use crate::engine::{
+    exceeds_inline_thread_budget, DocumentOutput, MeshProvenance, MetricsData,
+};
+use crate::ir::{CadDocument, CadProgram, Feature, ThreadKind, ThreadOp, Units};
 use crate::units::UnitContext;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -63,11 +65,19 @@ pub fn verify_structure(document: &CadDocument, output: &DocumentOutput) -> Veri
     ));
 
     let m = &output.metrics;
-    checks.push(check(
-        "positive_volume",
-        m.volume > 0.0,
-        format!("combined volume = {:.3} {}", m.volume, ctx.units.volume_suffix()),
-    ));
+    let volume_msg = match m.mesh_provenance.honesty_note() {
+        Some(note) => format!(
+            "combined volume = {:.3} {} — {note}",
+            m.volume,
+            ctx.units.volume_suffix()
+        ),
+        None => format!(
+            "combined volume = {:.3} {}",
+            m.volume,
+            ctx.units.volume_suffix()
+        ),
+    };
+    checks.push(check("positive_volume", m.volume > 0.0, volume_msg));
 
     checks.push(check(
         "is_solid",
@@ -134,6 +144,7 @@ pub fn verify_structure(document: &CadDocument, output: &DocumentOutput) -> Veri
 
     checks.extend(verify_parameters(document, output));
     checks.extend(verify_threads(document, output));
+    checks.extend(verify_mesh_honesty(document, output));
 
     let passed = checks.iter().all(|c| c.passed);
     VerificationReport { passed, checks }
@@ -271,6 +282,61 @@ fn verify_threads(document: &CadDocument, output: &DocumentOutput) -> Vec<Verifi
         }
     }
     checks
+}
+
+/// Long Z external threads leave hex+shank uncut in B-Rep and instance short
+/// rods for the viewport / STL / faceted STEP. Volume without that note is a
+/// lie (Ian / Inspector honesty): it matches the smooth host, not the groove.
+fn verify_mesh_honesty(document: &CadDocument, output: &DocumentOutput) -> Vec<VerificationCheck> {
+    if !document_has_long_external_thread(document) {
+        return Vec::new();
+    }
+    let m = &output.metrics;
+    let note = m.mesh_provenance.honesty_note();
+    let ok = m.mesh_provenance == MeshProvenance::InstancedThread
+        && note.is_some_and(|n| n.contains("uncut"));
+    vec![check(
+        "mesh_provenance_honesty",
+        ok,
+        if ok {
+            note.unwrap_or("instanced").to_string()
+        } else {
+            format!(
+                "long external thread must name the instanced-vs-uncut split \
+                 (got {:?}); volume {:.3} would otherwise look like the grooved solid",
+                m.mesh_provenance, m.volume
+            )
+        },
+    )]
+}
+
+fn thread_pitch_doc_units(op: &ThreadOp, units: &Units) -> Option<f64> {
+    if let Some(p) = op.pitch.filter(|p| *p > 0.0) {
+        return Some(p);
+    }
+    let spec = crate::thread::parse_size(op.size.as_deref()?).ok()?;
+    let spec = crate::thread::to_units(&spec, matches!(units, Units::Inch));
+    Some(spec.pitch)
+}
+
+fn document_has_long_external_thread(document: &CadDocument) -> bool {
+    document.bodies.iter().any(|body| {
+        if body.suppressed {
+            return false;
+        }
+        body.features.iter().any(|f| {
+            let Feature::Thread(op) = f else {
+                return false;
+            };
+            if !matches!(op.kind, ThreadKind::External) {
+                return false;
+            }
+            let Some(pitch) = thread_pitch_doc_units(op, &document.units) else {
+                return false;
+            };
+            op.length > 0.0 && exceeds_inline_thread_budget(op.length, pitch)
+        })
+    })
 }
 
 fn body_is_thread_only(body: &crate::ir::CadBody) -> bool {
@@ -705,5 +771,117 @@ mod tests {
         let t = parse_size_triple("80mm x 40mm x 10mm", &Units::Mm).unwrap();
         assert!((t[0] - 80.0).abs() < 1e-6);
         assert!((t[2] - 10.0).abs() < 1e-6);
+    }
+
+    fn long_m8_thread_doc() -> CadDocument {
+        CadDocument::from_json_value(serde_json::json!({
+            "documentId": "m8_honest",
+            "units": "mm",
+            "parameters": { "bolt_length": 40.0, "head_width": 13.0, "head_height": 5.3 },
+            "bodies": [{
+                "bodyId": "body_m8",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 34.7, "at": [0, 0, 5.3] }
+                ]
+            }]
+        }))
+        .expect("long M8 document")
+    }
+
+    fn fake_output(provenance: MeshProvenance, volume: f64) -> DocumentOutput {
+        let metrics = MetricsData {
+            volume,
+            bbox: [-6.5, -6.5, 0.0, 6.5, 6.5, 40.0],
+            surface_area: 800.0,
+            is_solid: true,
+            mesh_provenance: provenance,
+        };
+        DocumentOutput {
+            bodies: vec![crate::engine::BodyOutput {
+                body_id: "body_m8".into(),
+                name: "M8".into(),
+                visible: true,
+                suppressed: false,
+                mesh: crate::engine::MeshData {
+                    positions: vec![],
+                    normals: vec![],
+                    indices: vec![],
+                },
+                metrics: metrics.clone(),
+            }],
+            metrics,
+        }
+    }
+
+    #[test]
+    fn long_thread_verify_fails_closed_without_instanced_honesty() {
+        let doc = long_m8_thread_doc();
+        let out = fake_output(MeshProvenance::Brep, 2519.9);
+        let report = verify_structure(&doc, &out);
+        assert!(!report.passed, "uncut-host metrics without a note must not PASS");
+        let honesty = report
+            .checks
+            .iter()
+            .find(|c| c.name == "mesh_provenance_honesty")
+            .expect("long thread must emit honesty check");
+        assert!(!honesty.passed, "{}", honesty.message);
+        assert!(
+            honesty.message.contains("uncut") || honesty.message.contains("instanced"),
+            "{}",
+            honesty.message
+        );
+    }
+
+    #[test]
+    fn long_thread_verify_passes_when_instanced_note_present() {
+        let doc = long_m8_thread_doc();
+        let out = fake_output(MeshProvenance::InstancedThread, 2519.9);
+        let report = verify_structure(&doc, &out);
+        assert!(report.passed, "{}", report.summary());
+        let honesty = report
+            .checks
+            .iter()
+            .find(|c| c.name == "mesh_provenance_honesty")
+            .expect("long thread must emit honesty check");
+        assert!(honesty.passed);
+        assert!(honesty.message.contains("uncut"), "{}", honesty.message);
+        let vol = report
+            .checks
+            .iter()
+            .find(|c| c.name == "positive_volume")
+            .expect("volume check");
+        assert!(
+            vol.message.contains("uncut"),
+            "volume must not look like the grooved solid: {}",
+            vol.message
+        );
+    }
+
+    #[test]
+    fn short_thread_verify_does_not_require_instanced_note() {
+        let doc = CadDocument::from_json_value(serde_json::json!({
+            "documentId": "m8_short",
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "b",
+                "features": [
+                    { "op": "cylinder", "diameter": 8, "height": 8 },
+                    { "op": "thread", "kind": "external", "size": "M8", "length": 8 }
+                ]
+            }]
+        }))
+        .expect("short M8");
+        let out = fake_output(MeshProvenance::Brep, 350.0);
+        let report = verify_structure(&doc, &out);
+        assert!(
+            !report.checks.iter().any(|c| c.name == "mesh_provenance_honesty"),
+            "inline ≤8-turn cut is the same solid as the mesh"
+        );
+        assert!(report.passed, "{}", report.summary());
     }
 }
