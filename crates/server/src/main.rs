@@ -615,8 +615,6 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
             }
         };
 
-        last_document = Some(document.clone());
-
         if let Err(val_err) = document.validate() {
             last_error = format!("Validation error: {val_err}");
             tracing::warn!(attempt, %last_error, "repair loop");
@@ -642,6 +640,38 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
             });
             continue;
         }
+        // Recipe-breaking or invalid parses must not become leftover on exhaust
+        // (Cycle 11 refused them as Gemini verify fixes; Cycle 14 skipped
+        // recipe-breaking leftover). Do not keep a document that failed
+        // validate — a later attempt must not overwrite a prior legal parse.
+        // Cycle 36: Gemini Ok/Skipped used to emit_success anyway, so a
+        // draft/thicken/blank-shank parse that the kernel built still shipped.
+        if let Some(recipe_err) = reject_chat_success(&document) {
+            last_error = format!("Fastener recipe failed: {recipe_err}");
+            tracing::warn!(attempt, %last_error, "recipe rejected before execute");
+            emit(
+                &tx,
+                ChatSseEvent::Repair {
+                    attempt,
+                    error: last_error.clone(),
+                },
+            )
+            .await;
+            contents.push(GeminiContent {
+                role: "model".to_string(),
+                parts: vec![gemini_text(model_text)],
+            });
+            contents.push(GeminiContent {
+                role: "user".to_string(),
+                parts: vec![gemini_text(format!(
+                    "The document failed the fastener recipe: {recipe_err}.\
+                     {}Return a valid {{ \"say\", \"document\" }} JSON object.",
+                    fastener_repair_hint(&recipe_err),
+                ))],
+            });
+            continue;
+        }
+        last_document = Some(document.clone());
 
         emit(&tx, ChatSseEvent::CalculatingStart).await;
         let calc_start = Instant::now();
@@ -667,7 +697,7 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
             Ok(output) => {
                 tracing::info!(attempt, "Chat: geometry generated successfully");
 
-                let quality = preview::quality_notes(&output);
+                let quality = preview::quality_notes_for(&output, Some(&document));
                 let preview_png = preview::render_png(&output);
                 let quality_text = preview::quality_report(&quality);
 
@@ -736,6 +766,28 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                                     "The solid does not match the user request: {reason}. \
                                      Your corrected document failed validation: {val_err}. \
                                      Return a valid {{ \"say\", \"document\" }} JSON object."
+                                ))],
+                            });
+                            continue;
+                        }
+                        // Gemini verify may rewrite the IR. Do not accept a
+                        // "fix" the deterministic judge would have rejected,
+                        // and do not keep it as last_document.
+                        if let Some(recipe_err) = reject_verify_fix(&fixed) {
+                            last_error =
+                                format!("Corrected document failed fastener recipe: {recipe_err}");
+                            tracing::warn!(attempt, %last_error, "verify fix broke fastener recipe");
+                            contents.push(GeminiContent {
+                                role: "model".to_string(),
+                                parts: vec![gemini_text(model_text)],
+                            });
+                            contents.push(GeminiContent {
+                                role: "user".to_string(),
+                                parts: vec![gemini_text(format!(
+                                    "The solid did not match the request ({reason}). \
+                                     Your corrected document broke the fastener recipe: {recipe_err}.\
+                                     {}Return a valid {{ \"say\", \"document\" }} JSON object.",
+                                    fastener_repair_hint(&recipe_err),
                                 ))],
                             });
                             continue;
@@ -884,6 +936,35 @@ async fn run_chat_session(state: Arc<AppState>, body: ChatRequest, tx: SseTx) {
                     }
                     VerifyVerdict::Ok { say: verified_say }
                     | VerifyVerdict::Skipped { say: verified_say } => {
+                        if let Some(recipe_err) = reject_chat_success(&document) {
+                            last_error = format!("Fastener recipe failed: {recipe_err}");
+                            tracing::warn!(
+                                attempt,
+                                %last_error,
+                                "Gemini verify accepted recipe-breaking IR; forcing repair"
+                            );
+                            emit(
+                                &tx,
+                                ChatSseEvent::Repair {
+                                    attempt,
+                                    error: last_error.clone(),
+                                },
+                            )
+                            .await;
+                            contents.push(GeminiContent {
+                                role: "model".to_string(),
+                                parts: vec![gemini_text(model_text)],
+                            });
+                            contents.push(GeminiContent {
+                                role: "user".to_string(),
+                                parts: vec![gemini_text(format!(
+                                    "The solid built, but the fastener recipe failed: {recipe_err}.\
+                                     {}Return a valid {{ \"say\", \"document\" }} JSON object.",
+                                    fastener_repair_hint(&recipe_err),
+                                ))],
+                            });
+                            continue;
+                        }
                         let program_val = serde_json::to_value(&document).unwrap_or_default();
                         let message = verified_say
                             .or(say)
@@ -1336,6 +1417,19 @@ fn kernel_error_for_model(err: &kernel::engine::KernelError) -> String {
     }
 }
 
+/// Gemini verify may return a rewritten CadDocument. Reject it when the
+/// deterministic fastener judge would have failed the original — otherwise
+/// a thread-first / AF-10 / past-tip "fix" ships and becomes last_document.
+fn reject_verify_fix(fixed: &CadDocument) -> Option<String> {
+    reject_chat_success(fixed)
+}
+
+/// Chat must not `emit_success` for recipe-breaking IR even if Gemini
+/// verify says ok / skipped. Same gate as leftover `last_document`.
+fn reject_chat_success(doc: &CadDocument) -> Option<String> {
+    agent::fastener_recipe_violation(doc)
+}
+
 fn fastener_repair_hint(err: &str) -> String {
     let l = err.to_lowercase();
     if l.contains("fuse")
@@ -1344,8 +1438,14 @@ fn fastener_repair_hint(err: &str) -> String {
         || l.contains("fastener")
         || l.contains("hex")
         || l.contains("fillet")
+        || l.contains("major_diameter")
+        || l.contains("shank")
+        || l.contains("chamfer")
+        || l.contains("dead_height")
+        || l.contains("grip")
+        || l.contains("pitch")
     {
-        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then thread (external) to CUT the helix into that shank. Leave dead_height / unthreaded grip under the head. Never thread first and fuse a hex head on. Never fillet edges:\"all\" after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13. ".into()
+        " FASTENER RECIPE: hex sketch+extrude first, then a cylinder shank that OVERLAPS the head by ~1mm, then ONE thread (external) to CUT the helix into that shank — do not emit a second thread or pattern after thread. A body named bolt, screw, M8, or stud (hex+shank) — or documentId M8 / stud — must be external CUT, not a blank shank or tap/internal. A box-head named bolt is still a blank shank without thread CUT. Do not fake threads with helix, torus, or revolve (not in place of thread CUT, and not after it). Leave dead_height / unthreaded grip under the head — thread at must be head_height + dead_height, not the head face. Thread must not run past the tip — length is bolt_length - head_height - dead_height. hex AF must match head_width. ISO M8 is AF 13 even if head_width is omitted or the body is only named M8 / documentId M8 — never the old wrench size of 10. cylinder diameter must match major_diameter (ISO size M8 is Ø8 even if major_diameter is omitted; Ø8 is still M8 even if pitch is a lie). Explicit thread.pitch must match ISO (M8 is 1.25) even if the pitch param is omitted — prefer diameter/pitch null. pitch param must match the ISO token (M8 is 1.25). Fillet under-head before thread. Never fillet after thread (not only edges:\"all\" / \"longest\"). Chamfer the tip after thread edges:\"top\" — not bottom/all/longest; a hex chamfer before thread does not count. Never thread first and fuse a hex head on. Never fillet or chamfer edges:\"all\" or edges:\"longest\" after thread. Never shell, offset, draft, thicken, or common after thread. M8 size table: Ø8, pitch 1.25, AF/head_width 13 (not 10). ".into()
     } else {
         String::new()
     }
@@ -1634,6 +1734,71 @@ mod tests {
             lower.contains("hex extrude") && lower.contains("overlapping cylinder"),
             "verify fastener-order rules must restate the golden recipe"
         );
+        assert!(
+            lower.contains("dead_height"),
+            "verify must catch a fully-threaded bolt (missing unthreaded grip)"
+        );
+        assert!(
+            lower.contains("past") && lower.contains("tip"),
+            "verify must catch a thread that runs past the tip"
+        );
+        assert!(
+            lower.contains("longest"),
+            "verify must catch chamfer-longest after thread"
+        );
+        assert!(
+            lower.contains("second") && lower.contains("thread"),
+            "verify must catch a second external thread"
+        );
+        assert!(
+            lower.contains("pattern") && lower.contains("after thread"),
+            "verify must catch a pattern after thread"
+        );
+        assert!(
+            lower.contains("tap") && lower.contains("external"),
+            "verify must catch a named bolt that is a tap"
+        );
+        assert!(
+            lower.contains("screw"),
+            "verify must catch a named screw that is a tap"
+        );
+        assert!(
+            lower.contains("helix") && lower.contains("torus") && lower.contains("revolve"),
+            "verify must catch helix/torus/revolve in place of thread CUT"
+        );
+        assert!(
+            (lower.contains("named m8") || lower.contains("body named m8"))
+                && lower.contains("af 13"),
+            "verify must catch a named-M8 body that keeps AF 10"
+        );
+        assert!(
+            lower.contains("blank shank") || (lower.contains("hex+shank") && lower.contains("thread")),
+            "verify must catch a named-M8 hex+shank with no thread CUT"
+        );
+        assert!(
+            lower.contains("stud"),
+            "verify must catch a named-stud hex+shank with no thread CUT"
+        );
+        assert!(
+            lower.contains("box-head") || lower.contains("box head"),
+            "verify must catch a box-head named bolt with no thread CUT"
+        );
+        assert!(
+            lower.contains("documentid") || lower.contains("document id"),
+            "verify must catch documentId M8 that keeps AF 10"
+        );
+        assert!(
+            lower.contains("shell") && lower.contains("offset"),
+            "verify must catch shell/offset after thread"
+        );
+        assert!(
+            lower.contains("draft") && lower.contains("thicken"),
+            "verify must catch draft/thicken after thread"
+        );
+        assert!(
+            lower.contains("common") && lower.contains("after thread"),
+            "verify must catch common after thread"
+        );
     }
 
     #[test]
@@ -1662,6 +1827,714 @@ mod tests {
         assert!(
             agent::fastener_recipe_violation(&golden).is_none(),
             "golden hex→cylinder→thread must pass"
+        );
+
+        // Inspector-golden shape: order is legal, but no dead_height / grip.
+        let fully_threaded = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": { "bolt_length": 40.0, "head_height": 5.3, "head_width": 13.0 },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8", "length": 34.7,
+                      "at": [0, 0, 5.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&fully_threaded)
+            .expect("fully-threaded hex bolt must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("unthreaded") || l.contains("dead_height") || l.contains("grip"),
+            "{reason}"
+        );
+
+        let undriven_shank = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 10, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&undriven_shank)
+            .expect("major_diameter 8 with cylinder Ø10 must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("major_diameter") || l.contains("cylinder") || l.contains("shank"),
+            "{reason}"
+        );
+
+        let missing_finish = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&missing_finish)
+            .expect("legal order without fillet/chamfer must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(l.contains("fillet") || l.contains("chamfer"), "{reason}");
+
+        // Cycle 2 hole: omit major_diameter, hard-code Ø10 next to size M8.
+        let omitted_major = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 10, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&omitted_major)
+            .expect("omitted major_diameter + M8 + Ø10 shank must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("major_diameter") || l.contains("cylinder") || l.contains("iso"),
+            "{reason}"
+        );
+
+        // Cycle 3 required any chamfer; default edges:"all" after thread
+        // wrecks the helix the same way fillet-all does.
+        let chamfer_all = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5 }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&chamfer_all)
+            .expect("chamfer-all after thread must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(l.contains("chamfer") && l.contains("all"), "{reason}");
+
+        // Cycle 2 hole: omit pitch, hard-code thread.pitch 2.0 next to size M8.
+        let omitted_pitch = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "pitch": 2.0, "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&omitted_pitch)
+            .expect("omitted pitch + M8 + thread.pitch 2.0 must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("pitch")
+                && (l.contains("iso") || l.contains("omitted") || l.contains("1.25")),
+            "{reason}"
+        );
+
+        // Cycle 3 hole: a hex chamfer before thread is not a tip chamfer.
+        let chamfer_before = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&chamfer_before)
+            .expect("chamfer before thread must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("chamfer") && (l.contains("tip") || l.contains("after")),
+            "{reason}"
+        );
+
+        // Cycle 1 hole: old AF 10 table next to size M8 (param and hex agree).
+        let old_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 10.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 10 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&old_af10)
+            .expect("size M8 with AF 10 table must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "{reason}"
+        );
+
+        // Cycle 4 analog: pitch param 2.0 next to size M8, thread.pitch null.
+        let pitch_table_lie = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 2.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&pitch_table_lie)
+            .expect("size M8 with pitch param 2.0 must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("pitch") && (l.contains("iso") || l.contains("1.25") || l.contains("m8")),
+            "{reason}"
+        );
+
+        // Cycle 1–9 checked start only. Kernel bind clamps length when
+        // bolt_length is present — omit it and length 50 still ran past the tip.
+        let past_tip = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 50.0, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&past_tip)
+            .expect("omitted bolt_length + thread length 50 past the tip must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("tip") && (l.contains("past") || l.contains("length")),
+            "{reason}"
+        );
+
+        // Cycle 5 rejected chamfer-all; longest after thread still passed as a tip.
+        let chamfer_longest = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "longest" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&chamfer_longest)
+            .expect("chamfer-longest after thread must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("chamfer") && (l.contains("longest") || l.contains("top")),
+            "{reason}"
+        );
+
+        // Cycle 15: omit size, write Ø8×1.25, keep the old AF 10 table.
+        let omitted_size = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 10.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0,
+                "pitch": 1.25
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 10 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external",
+                      "diameter": 8.0, "pitch": 1.25,
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = agent::fastener_recipe_violation(&omitted_size)
+            .expect("omitted size + Ø8×1.25 + AF 10 must fail verify");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn fastener_repair_hint_teaches_af13_and_param_driven_grip() {
+        let hint = fastener_repair_hint("thread fuse fillet hex");
+        let l = hint.to_ascii_lowercase();
+        assert!(l.contains("dead_height"), "repair must reteach the grip");
+        assert!(
+            l.contains("head_width") && (l.contains("13") || l.contains("af")),
+            "repair must reteach AF 13, not 10: {hint}"
+        );
+        assert!(
+            !hint.contains("head_width 10")
+                && !hint.contains("AF 10")
+                && !hint.contains("AF/head_width 10"),
+            "repair must not teach the old AF 10 table: {hint}"
+        );
+        assert!(
+            l.contains("head_height") && l.contains("dead_height"),
+            "repair must say thread at is head_height + dead_height"
+        );
+        assert!(
+            l.contains("past the tip") && l.contains("bolt_length"),
+            "repair must say thread must not run past the tip: {hint}"
+        );
+        let past_tip_reason =
+            "thread must not run past the tip; length is bolt_length - head_height - dead_height";
+        assert!(
+            !fastener_repair_hint(past_tip_reason).is_empty(),
+            "repair hint must fire on the thread-past-tip reason"
+        );
+        assert!(
+            l.contains("major_diameter") && l.contains("cylinder"),
+            "repair must say cylinder diameter matches major_diameter: {hint}"
+        );
+        assert!(
+            l.contains("omitted") || l.contains("iso"),
+            "repair must say ISO Ø still applies when major_diameter is omitted: {hint}"
+        );
+        // Cycle 2 judge reason named cylinder/major_diameter, not thread/hex/fillet.
+        let shank_reason =
+            "cylinder diameter must be driven by major_diameter (or the ISO size token when major_diameter is omitted)";
+        assert!(
+            !fastener_repair_hint(shank_reason).is_empty(),
+            "repair hint must fire on the major_diameter / ISO shank reason"
+        );
+        assert!(
+            l.contains("fillet") && l.contains("before thread"),
+            "repair must reteach under-head fillet before thread: {hint}"
+        );
+        assert!(
+            l.contains("chamfer") && l.contains("tip") && l.contains("after thread"),
+            "repair must reteach tip chamfer after thread: {hint}"
+        );
+        assert!(
+            l.contains("af") && l.contains("13") && l.contains("omitted"),
+            "repair must reteach ISO M8 AF 13 even if head_width is omitted: {hint}"
+        );
+        let af_reason =
+            "hex across_flats must match the ISO size token; M8 is AF 13 — not 10, even if head_width is omitted or also 10";
+        assert!(
+            !fastener_repair_hint(af_reason).is_empty(),
+            "repair hint must fire on the ISO AF reason"
+        );
+        assert!(
+            l.contains("chamfer") && l.contains("edges:\"all\"") && l.contains("after thread"),
+            "repair must forbid chamfer-all after thread: {hint}"
+        );
+        assert!(
+            l.contains("longest"),
+            "repair must forbid chamfer-longest after thread: {hint}"
+        );
+        let chamfer_longest_reason =
+            "chamfer edges:\"all\" or \"longest\" after thread wrecks the helix; chamfer the tip with edges:\"top\"";
+        assert!(
+            !fastener_repair_hint(chamfer_longest_reason).is_empty(),
+            "repair hint must fire on the chamfer-longest reason"
+        );
+        let chamfer_all_reason =
+            "chamfer edges:\"all\" after thread wrecks the helix; chamfer the tip with edges:\"top\"";
+        assert!(
+            !fastener_repair_hint(chamfer_all_reason).is_empty(),
+            "repair hint must fire on the chamfer-all reason"
+        );
+        assert!(
+            l.contains("thread.pitch") || (l.contains("pitch") && l.contains("omitted")),
+            "repair must reteach ISO pitch when the pitch param is omitted: {hint}"
+        );
+        let pitch_reason =
+            "thread pitch must match the size-table pitch (or the ISO size token when pitch is omitted)";
+        assert!(
+            !fastener_repair_hint(pitch_reason).is_empty(),
+            "repair hint must fire on the omitted-pitch / ISO reason"
+        );
+        let pitch_table_reason =
+            "pitch must match the ISO size token; M8 is 1.25 — do not keep a size-table lie next to size:\"M8\"";
+        assert!(
+            !fastener_repair_hint(pitch_table_reason).is_empty(),
+            "repair hint must fire on the pitch param / ISO token reason"
+        );
+        let second_thread_reason =
+            "hex-head bolt must have one thread CUT; do not emit a second external thread";
+        assert!(
+            !fastener_repair_hint(second_thread_reason).is_empty(),
+            "repair hint must fire on the second-thread reason"
+        );
+        assert!(
+            l.contains("second thread") || l.contains("one thread"),
+            "repair must say one thread CUT only: {hint}"
+        );
+        assert!(
+            l.contains("pattern") && l.contains("after thread"),
+            "repair must forbid a pattern after thread: {hint}"
+        );
+        let fillet_after_reason =
+            "fillet after thread is not an under-head fillet; fillet before thread, chamfer the tip with edges:\"top\"";
+        assert!(
+            !fastener_repair_hint(fillet_after_reason).is_empty(),
+            "repair hint must fire on fillet after thread"
+        );
+        assert!(
+            l.contains("screw"),
+            "repair must reteach that a named screw is not a tap: {hint}"
+        );
+        assert!(
+            l.contains("helix") && l.contains("torus") && l.contains("revolve"),
+            "repair must forbid helix/torus/revolve fakes: {hint}"
+        );
+        assert!(
+            l.contains("named m8"),
+            "repair must bind a named-M8 body to AF 13: {hint}"
+        );
+        assert!(
+            l.contains("blank shank") || l.contains("hex+shank"),
+            "repair must reteach named M8 hex+shank needs thread CUT: {hint}"
+        );
+        assert!(
+            l.contains("stud"),
+            "repair must reteach named stud hex+shank needs thread CUT: {hint}"
+        );
+        assert!(
+            l.contains("box-head") || l.contains("box head"),
+            "repair must reteach box-head named bolt needs thread CUT: {hint}"
+        );
+        let fake_reason =
+            "do not fake threads with helix, torus, or revolve; use thread CUT (kind external, size M8)";
+        assert!(
+            !fastener_repair_hint(fake_reason).is_empty(),
+            "repair hint must fire on helix/torus/revolve fakes"
+        );
+        let helix_after_reason =
+            "do not fake threads with helix, torus, or revolve after a thread CUT; one external thread only";
+        assert!(
+            !fastener_repair_hint(helix_after_reason).is_empty(),
+            "repair hint must fire on helix/revolve after a legal CUT"
+        );
+        let screw_tap_reason =
+            "hex-head bolt or screw must use external thread CUT, not tap/internal";
+        assert!(
+            !fastener_repair_hint(screw_tap_reason).is_empty(),
+            "repair hint must fire on a named screw that is a tap"
+        );
+        assert!(
+            l.contains("shell") && l.contains("offset"),
+            "repair must forbid shell/offset after thread: {hint}"
+        );
+        assert!(
+            l.contains("draft") && l.contains("thicken"),
+            "repair must forbid draft/thicken after thread: {hint}"
+        );
+        let shell_reason =
+            "shell or offset after thread wrecks the helix; chamfer the tip with edges:\"top\" only";
+        assert!(
+            !fastener_repair_hint(shell_reason).is_empty(),
+            "repair hint must fire on shell/offset after thread"
+        );
+        let draft_reason =
+            "draft or thicken after thread wrecks the helix; chamfer the tip with edges:\"top\" only";
+        assert!(
+            !fastener_repair_hint(draft_reason).is_empty(),
+            "repair hint must fire on draft/thicken after thread"
+        );
+        assert!(
+            l.contains("common") && l.contains("after thread"),
+            "repair must forbid common after thread: {hint}"
+        );
+        let common_reason =
+            "common after thread wrecks the helix; chamfer the tip with edges:\"top\" only";
+        assert!(
+            !fastener_repair_hint(common_reason).is_empty(),
+            "repair hint must fire on common after thread"
+        );
+        assert!(fastener_repair_hint("unrelated box error").is_empty());
+    }
+
+    #[test]
+    fn verify_fix_must_not_bypass_fastener_judge() {
+        let golden = agent::example_m8_bolt_document();
+        assert!(
+            reject_verify_fix(&golden).is_none(),
+            "golden recipe must still be an acceptable verify fix"
+        );
+
+        let thread_first = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_bad",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "thread", "kind": "external", "size": "M8", "length": 24 },
+                    { "op": "cylinder", "diameter": 13, "height": 5.3, "at": [0, 0, 24] },
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason =
+            reject_verify_fix(&thread_first).expect("thread-first verify fix must not ship");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("thread-first") || l.contains("hex extrude"),
+            "{reason}"
+        );
+        assert!(
+            !fastener_repair_hint(&reason).is_empty(),
+            "repair must reteach the recipe after a rejected verify fix"
+        );
+
+        let tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "plate",
+                "features": [
+                    { "op": "box", "size": [40, 40, 12], "centered": true },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_verify_fix(&tap).is_none(),
+            "internal tap verify fix must not be rejected as a bolt"
+        );
+
+        let screw_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "M8 hex cap screw",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason = reject_verify_fix(&screw_tap)
+            .expect("named screw tap verify fix must not ship");
+        assert!(
+            reason.to_ascii_lowercase().contains("screw")
+                && reason.to_ascii_lowercase().contains("external"),
+            "{reason}"
+        );
+        assert!(
+            !fastener_repair_hint(&reason).is_empty(),
+            "repair must reteach after a named-screw tap verify fix"
+        );
+
+        // Polyline hex hid from is_hex_head; a Gemini verify rewrite named
+        // Body used to ship AF 10 next to size M8.
+        let polyline_af10 = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "polyline": {
+                          "points": kernel::ir::hex_vertices(10.0, [0.0, 0.0]),
+                          "closed": true } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" }
+                ]
+            }]
+        }))
+        .unwrap();
+        let reason =
+            reject_verify_fix(&polyline_af10).expect("polyline hex AF 10 verify fix must not ship");
+        let l = reason.to_ascii_lowercase();
+        assert!(
+            l.contains("13") || l.contains("af") || l.contains("iso") || l.contains("head_width"),
+            "reason should name the polyline AF lie: {reason}"
+        );
+        assert!(
+            !fastener_repair_hint(&reason).is_empty(),
+            "repair must reteach AF 13 after a polyline hex verify fix"
         );
     }
 
@@ -1713,5 +2586,274 @@ mod tests {
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["program"]["bodies"][0]["bodyId"], "body_plate");
+    }
+
+    /// Exhaust leftover used to prefer any last parse, including a thread-first
+    /// "bolt" that verify had already rejected. Keep the incoming document.
+    #[test]
+    fn failed_chat_result_does_not_keep_recipe_breaking_parse() {
+        let incoming = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "features": [{ "op": "box", "size": [20, 20, 4], "centered": true }]
+            }]
+        }))
+        .unwrap();
+        let thread_first = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_bad",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "thread", "kind": "external", "size": "M8", "length": 24 },
+                    { "op": "cylinder", "diameter": 13, "height": 5.3, "at": [0, 0, 24] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(agent::fastener_recipe_violation(&thread_first).is_some());
+        let kept = agent::keep_document_on_kernel_failure(Some(&thread_first), Some(&incoming));
+        let ev = ChatSseEvent::Result {
+            success: false,
+            message: "Could not generate a valid model after 6 attempts.".into(),
+            program: agent::program_json_for_chat(kept),
+            mesh: None,
+            metrics: None,
+            bodies: vec![],
+            error: Some("Result did not match the request: thread-first".into()),
+            attempts: 6,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["success"], false);
+        assert_eq!(
+            v["program"]["bodies"][0]["bodyId"], "body_plate",
+            "exhaust leftover must not ship a recipe-breaking last_parsed"
+        );
+    }
+
+    /// Gemini Ok/Skipped used to emit_success for IR the judge would refuse.
+    /// Chat success and leftover keep share the same gate.
+    #[test]
+    fn chat_success_must_not_ship_recipe_breaking_ir() {
+        let thread_first = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_bad",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "thread", "kind": "external", "size": "M8", "length": 24 },
+                    { "op": "cylinder", "diameter": 13, "height": 5.3, "at": [0, 0, 24] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&thread_first).is_some(),
+            "thread-first must not ship as chat success"
+        );
+
+        let draft_after = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "draft", "faces": "side", "angle": 2 }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&draft_after).is_some(),
+            "draft after thread must not ship as chat success"
+        );
+
+        let named_m8_blank = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "M8",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&named_m8_blank).is_some(),
+            "named M8 hex+shank with no thread must not ship as chat success"
+        );
+
+        let named_stud_blank = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Hex Stud",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&named_stud_blank).is_some(),
+            "named stud hex+shank with no thread must not ship as chat success"
+        );
+
+        let doc_id_blank = CadDocument::from_json_value(serde_json::json!({
+            "documentId": "m8_bolt",
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "Body",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&doc_id_blank).is_some(),
+            "documentId M8 hex+shank with no thread must not ship as chat success"
+        );
+
+        let named_box_blank = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_main",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "box", "size": [13, 13, 5.3], "centered": true },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&named_box_blank).is_some(),
+            "box-head named bolt with no thread must not ship as chat success"
+        );
+
+        let bolt_circle = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_jig",
+                "name": "bolt circle",
+                "features": [
+                    { "op": "box", "size": [80, 80, 10], "centered": true },
+                    { "op": "cylinder", "diameter": 20, "height": 8, "at": [0, 0, 10] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&bolt_circle).is_none(),
+            "bolt circle box + boss must still ship"
+        );
+
+        assert!(
+            reject_chat_success(&agent::example_m8_bolt_document()).is_none(),
+            "golden recipe must still ship"
+        );
+
+        let hex_plate_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "hex plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&hex_plate_tap).is_none(),
+            "hex-plate tap must still ship"
+        );
+
+        let stud_plate_tap = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "bodies": [{
+                "bodyId": "body_plate",
+                "name": "stud plate",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 40 } } },
+                    { "op": "extrude", "depth": 12 },
+                    { "op": "cylinder", "diameter": 16, "height": 4, "at": [0, 0, 12] },
+                    { "op": "thread", "kind": "tap", "size": "M8",
+                      "center": [0, 0], "through": true }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&stud_plate_tap).is_none(),
+            "stud-plate tap must still ship"
+        );
+
+        let cut_after = CadDocument::from_json_value(serde_json::json!({
+            "units": "mm",
+            "parameters": {
+                "bolt_length": 40.0,
+                "head_height": 5.3,
+                "head_width": 13.0,
+                "dead_height": 8.0,
+                "major_diameter": 8.0
+            },
+            "bodies": [{
+                "bodyId": "body_m8_bolt",
+                "name": "M8 Bolt",
+                "features": [
+                    { "op": "sketch", "plane": "XY",
+                      "profile": { "hex": { "across_flats": 13 } } },
+                    { "op": "extrude", "depth": 5.3 },
+                    { "op": "cylinder", "diameter": 8, "height": 35.7, "at": [0, 0, 4.3] },
+                    { "op": "fillet", "radius": 0.4, "edges": "longest" },
+                    { "op": "thread", "kind": "external", "size": "M8",
+                      "length": 26.7, "at": [0, 0, 13.3] },
+                    { "op": "chamfer", "distance": 0.5, "edges": "top" },
+                    { "op": "cut",
+                      "profile": { "rect": { "w": 1.2, "h": 8, "centered": true } },
+                      "depth": 2, "at": [0, 0, 5.3] },
+                    { "op": "transform", "translate": [10, 0, 0] }
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            reject_chat_success(&cut_after).is_none(),
+            "cut/transform after thread must still ship"
+        );
     }
 }
