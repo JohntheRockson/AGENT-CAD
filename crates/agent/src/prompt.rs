@@ -36,7 +36,7 @@ M8 table (ISO 261/4014/4017): Ø8, pitch 1.25, AF 13 — emit head_width 13, NOT
 2) overlapping cylinder: "diameter":"major_diameter", "height":"bolt_length - head_height + 1", "at":[0,0,"head_height - 1"].
 3) Unthreaded grip — do not fully-thread head-to-tip:
    "length":"bolt_length - head_height - dead_height", "at":[0,0,"head_height + dead_height"].
-4) Under-head fillet BEFORE thread (small r, edges:"longest"). Tip chamfer edges:"top". NEVER fillet edges:"all" after thread (rounds the helix).
+4) Under-head fillet BEFORE thread (small r, edges:"longest"). Tip chamfer edges:"top". NEVER fillet/chamfer edges:"all" or "longest" after thread.
 5) { "op":"thread", "kind":"external", "size":"M8" } on an existing solid CUTS the groove.
 size is M8 / M8x1 / 1/4-20. Do not fake threads with tori, rings, or revolved grooves.
 
@@ -91,16 +91,14 @@ hole { "op":"hole", "diameter":<d>, "depth":<h>, "center":[x,y], "plane":"XY", "
 cut { "op":"cut", "profile":<P>, "depth":<h>, "at":[x,y,z], "plane":"XY", "face":"largest"|<i>, "through": true }
 fuse { "op":"fuse", "profile":<P>, "depth":<h>, "at":[x,y,z], "plane":"XY", "face":"largest"|<i> }
 common { "op":"common", "profile":<P>, "depth":<h>, "at":[x,y,z], "plane":"XY" }
-fillet { "op":"fillet", "radius":<r>, "edges":"all"|"top"|"longest"|[i] }  r < half wall. Never edges:"all" after thread.
-chamfer { "op":"chamfer", "distance":<d>, "angle":<deg>, "edges":"all"|"top"|[i] }
+fillet { "op":"fillet", "radius":<r>, "edges":"all"|"top"|"longest"|[i] } Never all/longest after thread
+chamfer { "op":"chamfer", "distance":<d>, "angle":<deg>, "edges":"all"|"top"|[i] } Never all/longest after thread
 transform { "op":"transform", "translate":[x,y,z], "rotate":{"axis":[x,y,z],"angle":<deg>,"origin":[x,y,z]}, "scale":<s> }
 mirror { "op":"mirror", "plane":"YZ"|"XZ"|"XY", "origin":[x,y,z], "fuse": true }
 pattern { "op":"pattern", "kind":"linear"|"circular", "count":<n≥2>, "spacing":<d>, "direction":[x,y,z], "axis":"Z", "angle":<deg>, "center":[x,y,z], "scope":"body"|"feature" }
 shell { "op":"shell", "thickness":<t>, "faces":"all"|[i]|"largest" }
 offset { "op":"offset", "distance":<d> }
 draft { "op":"draft", "faces":"side"|[i], "angle":<deg>, "direction":[0,0,1] }
-
-Face: "largest"|"top"|"bottom"|index. Edges: "all"|"top"|"longest"|[i].
 
 ## Example — M8 bolt (hex → overlapping cylinder → thread CUT)
 {
@@ -147,7 +145,23 @@ Do not diagnose tessellation or wasm crashes; that is the kernel's job.
 Fastener order (judge only):
 A hex-head bolt must be hex extrude → overlapping cylinder → thread CUT.
 Reject thread-first then fuse a head.
-Reject fillet edges:"all" after thread (that rounds the helix).
+Reject fillet or chamfer edges:"all" or "longest" after thread (that wrecks the helix).
+Reject a hex-head bolt fully threaded from the head (missing dead_height).
+head_width must drive the hex wrench size; ISO M8 / M8x1.25 is AF 13 even if head_width or size is omitted (not 10).
+dead_height must drive thread start.
+major_diameter (or the ISO size token when that param is omitted) must drive the shank cylinder.
+Explicit thread.pitch must match ISO when the pitch param is omitted (M8 is 1.25; prefer null).
+pitch param must match the ISO token (M8 is 1.25) — no size-table lie.
+Require under-head fillet before thread and a tip chamfer after thread (edges:"top").
+Reject a thread that runs past the bolt tip.
+Reject a second external thread on a hex-head bolt, or a pattern after thread.
+Reject any fillet after thread (not only edges:"all" / "longest").
+Chamfer after thread must be edges:"top" — not bottom/all/longest.
+A body named bolt or screw must use external thread CUT, not tap/internal.
+Reject helix, torus, or revolve in place of or after thread CUT.
+A body named M8 (or documentId / an Ø8 shank) is still ISO AF 13 / Ø8 even if size is omitted or pitch is a lie.
+Named M8 or stud hex+shank (or documentId), or a box-head named bolt, still needs thread CUT (not a blank shank).
+Reject shell, offset, draft, thicken, or common after thread (that wrecks the helix).
 "#;
 
 #[cfg(test)]
@@ -249,6 +263,30 @@ mod tests {
             p.contains("never") && p.contains("edges:\"all\"") && p.contains("after thread"),
             "must forbid fillet edges:all after thread"
         );
+        assert!(
+            SYSTEM_PROMPT.contains(r#"fillet/chamfer edges:"all" or "longest" after thread"#),
+            "must forbid chamfer/fillet edges:longest after thread, not only fillet-all"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains(r#"Never all/longest after thread"#),
+            "op catalog must forbid all/longest after thread"
+        );
+        let fillet_line = SYSTEM_PROMPT
+            .lines()
+            .find(|l| l.contains(r#""op":"fillet""#))
+            .expect("fillet catalog line");
+        let chamfer_line = SYSTEM_PROMPT
+            .lines()
+            .find(|l| l.contains(r#""op":"chamfer""#))
+            .expect("chamfer catalog line");
+        assert!(
+            fillet_line.contains("longest") && fillet_line.contains("after thread"),
+            "op catalog fillet line must forbid longest after thread: {fillet_line}"
+        );
+        assert!(
+            chamfer_line.contains("longest") && chamfer_line.contains("after thread"),
+            "op catalog chamfer line must forbid longest after thread, not only list all|top: {chamfer_line}"
+        );
     }
 
     #[test]
@@ -305,8 +343,116 @@ mod tests {
             "verify must reject thread-first"
         );
         assert!(
-            v.contains("edges:\"all\"") && v.contains("after thread"),
-            "verify must reject fillet-all after thread"
+            v.contains("edges:\"all\"") && v.contains("after thread") && v.contains("chamfer"),
+            "verify must reject fillet-all and chamfer-all after thread"
+        );
+        assert!(
+            v.contains("longest"),
+            "verify must reject fillet/chamfer edges:longest after thread"
+        );
+        assert!(
+            v.contains("dead_height") && (v.contains("fully threaded") || v.contains("unthreaded")),
+            "verify must reject a fully-threaded hex bolt (missing grip)"
+        );
+        assert!(
+            v.contains("head_width") && v.contains("drive"),
+            "verify must require head_width to drive the hex"
+        );
+        assert!(
+            (v.contains("af 13") || v.contains("af is 13")) && (v.contains("omitted") || v.contains("iso")),
+            "verify must bind ISO M8 / M8x1.25 to AF 13 when head_width or size is omitted"
+        );
+        assert!(
+            v.contains("m8x1.25") && v.contains("size"),
+            "verify must treat M8x1.25 / omitted size as still M8 AF 13"
+        );
+        assert!(
+            v.contains("major_diameter") && v.contains("cylinder"),
+            "verify must require major_diameter to drive the shank"
+        );
+        assert!(
+            v.contains("omitted") || v.contains("iso size"),
+            "verify must bind the ISO size token when major_diameter is omitted"
+        );
+        assert!(
+            v.contains("thread.pitch") || (v.contains("pitch") && v.contains("1.25")),
+            "verify must bind explicit thread.pitch to ISO when pitch is omitted"
+        );
+        assert!(
+            v.contains("pitch param") || (v.contains("pitch") && v.contains("size-table")),
+            "verify must reject a pitch param that fights the ISO token"
+        );
+        assert!(
+            v.contains("fillet") && v.contains("before thread"),
+            "verify must require under-head fillet before thread"
+        );
+        assert!(
+            v.contains("chamfer") && v.contains("tip") && v.contains("after thread"),
+            "verify must require a tip chamfer after thread"
+        );
+        assert!(
+            v.contains("past") && v.contains("tip"),
+            "verify must reject a thread that runs past the tip"
+        );
+        assert!(
+            v.contains("second") && v.contains("thread"),
+            "verify must reject a second external thread"
+        );
+        assert!(
+            v.contains("pattern") && v.contains("after thread"),
+            "verify must reject a pattern after thread"
+        );
+        assert!(
+            v.contains("any fillet after thread") || v.contains("fillet after thread"),
+            "verify must reject any fillet after thread, not only all/longest"
+        );
+        assert!(
+            v.contains("tap") && v.contains("external"),
+            "verify must reject a named bolt that is a tap"
+        );
+        assert!(
+            v.contains("screw"),
+            "verify must reject a named screw that is a tap"
+        );
+        assert!(
+            v.contains("helix") && v.contains("torus") && v.contains("revolve"),
+            "verify must reject helix/torus/revolve in place of thread CUT"
+        );
+        assert!(
+            (v.contains("named m8") || v.contains("body named m8")) && v.contains("af 13"),
+            "verify must bind a named-M8 body to ISO AF 13"
+        );
+        assert!(
+            v.contains("blank shank") || (v.contains("hex+shank") && v.contains("thread")),
+            "verify must reject a named-M8 hex+shank with no thread CUT"
+        );
+        assert!(
+            v.contains("stud"),
+            "verify must reject a named-stud hex+shank with no thread CUT"
+        );
+        assert!(
+            v.contains("box-head") || v.contains("box head"),
+            "verify must reject a box-head named bolt with no thread CUT"
+        );
+        assert!(
+            v.contains("documentid") || v.contains("document id"),
+            "verify must bind documentId M8 to ISO AF 13"
+        );
+        assert!(
+            v.contains("shell") && v.contains("offset") && v.contains("after thread"),
+            "verify must reject shell/offset after thread"
+        );
+        assert!(
+            v.contains("draft") && v.contains("thicken") && v.contains("after thread"),
+            "verify must reject draft/thicken after thread"
+        );
+        assert!(
+            v.contains("common") && v.contains("after thread"),
+            "verify must reject common after thread"
+        );
+        assert!(
+            v.contains("edges:\"top\"") && v.contains("bottom"),
+            "verify must require chamfer edges:top after thread"
         );
         assert!(
             !v.contains("draft_extrude") && !v.contains("## feature ops"),

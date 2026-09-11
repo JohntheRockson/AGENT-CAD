@@ -4,7 +4,14 @@ import {
   Layers, Search, ListTree, LayoutList,
 } from 'lucide-react'
 import { useCadStore } from '../store/useStore'
-import { bodyColor, featureKey, featureLabel, parseSceneJson } from '../lib/document'
+import {
+  bodyColor,
+  editorTrustKind,
+  featureKey,
+  featureLabel,
+  outlinerLastGoodNote,
+  parseDocumentOrNull,
+} from '../lib/document'
 import type { Feature } from '../types/cad'
 
 // ── Tabs ───────────────────────────────────────────────────────────────
@@ -15,6 +22,7 @@ type Tab = 'bodies' | 'features'
 
 export function Outliner() {
   const irCode          = useCadStore((s) => s.irCode)
+  const lastGoodIrCode  = useCadStore((s) => s.lastGoodIrCode)
   const bodies          = useCadStore((s) => s.bodies)
   const selectedBodyId  = useCadStore((s) => s.selectedBodyId)
   const hoveredBodyId   = useCadStore((s) => s.hoveredBodyId)
@@ -29,11 +37,15 @@ export function Outliner() {
   const [tab, setTab]     = useState<Tab>('bodies')
   const [filter, setFilter] = useState('')
 
-  const doc = useMemo(() => {
-    try { return irCode.trim() ? parseSceneJson(irCode) : null } catch { return null }
-  }, [irCode])
+  const doc = useMemo(() => parseDocumentOrNull(irCode), [irCode])
+  const lastGoodDoc = useMemo(() => parseDocumentOrNull(lastGoodIrCode), [lastGoodIrCode])
+  const showingLastGood = !doc && !!lastGoodDoc
+  const lastGoodNote = outlinerLastGoodNote({
+    editorKind: editorTrustKind(irCode, lastGoodIrCode),
+    showingLastGood,
+  })
 
-  const nodes = doc?.bodies ?? bodies.map((b) => ({
+  const nodes = doc?.bodies ?? lastGoodDoc?.bodies ?? bodies.map((b) => ({
     bodyId: b.bodyId,
     name: b.name,
     visible: b.visible,
@@ -86,6 +98,12 @@ export function Outliner() {
           />
         </div>
       </div>
+
+      {lastGoodNote && (
+        <p className="px-3 py-1.5 text-[10px] text-amber-200/90 bg-amber-500/10 border-b border-amber-500/20 leading-relaxed">
+          {lastGoodNote}
+        </p>
+      )}
 
       {/* ── Body list ──────────────────────────────────────────────── */}
       {tab === 'bodies' && (
