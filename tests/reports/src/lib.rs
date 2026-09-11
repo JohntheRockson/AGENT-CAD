@@ -1,4 +1,4 @@
-//! Inspector look-right library: golden M8×40 helix / STEP honesty / fillet R.
+//! Inspector look-right library: golden M8×40 helix / instance seams / STEP honesty / fillet R.
 //!
 //! Public kernel APIs only. Do not patch the kernel or implement STEP here.
 

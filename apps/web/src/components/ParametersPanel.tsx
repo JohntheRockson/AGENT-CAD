@@ -1,46 +1,48 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { SlidersHorizontal, Loader2, Trash2, RotateCcw } from 'lucide-react'
 import { useCadStore } from '../store/useStore'
 import {
   collectParameterBatch,
+  committedParametersSignature,
+  countUncommittedParameters,
   explicitParameterNames,
   formatParameterName,
   isExplicitParameter,
   parameterAllowsZero,
   parameterEntries,
+  parseDocumentOrNull,
   parseParameterDraft,
-  parseSceneJson,
+  parametersLastGoodNote,
+  reconcileParameterDrafts,
   sameParameterValue,
   sliderBounds,
   unitSuffix,
+  editorTrustKind,
 } from '../lib/document'
 
 export function ParametersPanel() {
   const irCode              = useCadStore((s) => s.irCode)
+  const lastGoodIrCode      = useCadStore((s) => s.lastGoodIrCode)
   const isRunning           = useCadStore((s) => s.isRunning)
+  const isChatLoading       = useCadStore((s) => s.isChatLoading)
   const timeline            = useCadStore((s) => s.timeline)
   const timelineIndex       = useCadStore((s) => s.timelineIndex)
   const calculateParameters = useCadStore((s) => s.calculateParameters)
+  const setUncommittedParameterCount = useCadStore((s) => s.setUncommittedParameterCount)
 
   const [open, setOpen] = useState(true)
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [pendingDeletes, setPendingDeletes] = useState<string[]>([])
-  const [draftIr, setDraftIr] = useState(irCode)
+  const [committedSig, setCommittedSig] = useState('')
 
-  // New committed IR (Calculate success, chat, timeline) clears local drafts.
-  if (draftIr !== irCode) {
-    setDraftIr(irCode)
-    setDrafts({})
-    setPendingDeletes([])
-  }
-
-  const doc = useMemo(() => {
-    try {
-      return irCode.trim() ? parseSceneJson(irCode) : null
-    } catch {
-      return null
-    }
-  }, [irCode])
+  const parsedCurrent = useMemo(() => parseDocumentOrNull(irCode), [irCode])
+  const doc = useMemo(
+    () => parsedCurrent ?? parseDocumentOrNull(lastGoodIrCode),
+    [parsedCurrent, lastGoodIrCode],
+  )
+  const editorKind = editorTrustKind(irCode, lastGoodIrCode)
+  const showingLastGood = !parsedCurrent && !!doc
+  const lastGoodNote = parametersLastGoodNote({ editorKind, showingLastGood })
 
   const entries = doc ? parameterEntries(doc) : []
   const explicitNames = doc ? explicitParameterNames(doc) : []
@@ -48,6 +50,20 @@ export function ParametersPanel() {
     () => Object.fromEntries(entries),
     [entries],
   )
+  const nextCommittedSig = committedParametersSignature(committed)
+  // Cosmetic IR (pretty-print Run, rename, hide) keeps still-dirty drafts.
+  // Calculate / chat / timeline change committed values and prune what no longer applies.
+  if (committedSig !== nextCommittedSig) {
+    setCommittedSig(nextCommittedSig)
+    const next = reconcileParameterDrafts({
+      committed,
+      explicitNames,
+      drafts,
+      pendingDeletes,
+    })
+    setDrafts(next.drafts)
+    setPendingDeletes(next.pendingDeletes)
+  }
   const atTip = timeline.length === 0 || timelineIndex >= timeline.length - 1
 
   const batch = useMemo(
@@ -61,8 +77,14 @@ export function ParametersPanel() {
     [committed, explicitNames, drafts, pendingDeletes],
   )
 
-  const dirtyCount = Object.keys(batch.values).length + batch.deletes.length
-  const canCalculate = dirtyCount > 0 && batch.invalid.length === 0 && !isRunning
+  const dirtyCount = countUncommittedParameters(batch)
+  const busy = isRunning || isChatLoading
+  const canCalculate = dirtyCount > 0 && batch.invalid.length === 0 && !busy
+
+  useEffect(() => {
+    setUncommittedParameterCount(dirtyCount)
+    return () => setUncommittedParameterCount(0)
+  }, [dirtyCount, setUncommittedParameterCount])
 
   const setDraft = useCallback((name: string, raw: string) => {
     setDrafts((prev) => ({ ...prev, [name]: raw }))
@@ -135,6 +157,11 @@ export function ParametersPanel() {
           Historical step — edits branch from here and replace later timeline.
         </p>
       )}
+      {lastGoodNote && (
+        <p className="px-2.5 py-1.5 text-[10px] text-yellow-400/90 border-b border-border leading-snug">
+          {lastGoodNote}
+        </p>
+      )}
 
       <div className="overflow-y-auto py-2 px-2.5 space-y-3 min-h-0">
         {entries.map(([name, value]) => {
@@ -151,7 +178,7 @@ export function ParametersPanel() {
               name={name}
               committed={value}
               draft={draft}
-              disabled={isRunning}
+              disabled={busy}
               dirty={dirtyValue}
               invalid={invalid}
               pendingDelete={pendingDelete}
@@ -181,11 +208,13 @@ export function ParametersPanel() {
                 : 'No uncommitted parameter changes'
           }
         >
-          {isRunning ? <Loader2 size={10} className="animate-spin" /> : null}
+          {busy ? <Loader2 size={10} className="animate-spin" /> : null}
           Calculate
         </button>
         {isRunning ? (
           <span className="text-[10px] text-accent">Rebuilding…</span>
+        ) : isChatLoading ? (
+          <span className="text-[10px] text-accent">Agent busy…</span>
         ) : dirtyCount > 0 ? (
           <span className="text-[10px] text-muted">
             {dirtyCount} uncommitted

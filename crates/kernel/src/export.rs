@@ -313,18 +313,10 @@ pub fn step_export_bytes(mesh: &MeshData) -> Result<Vec<u8>, String> {
     Ok(s.into_bytes())
 }
 
-/// Axis-aligned bbox of `CARTESIAN_POINT` coordinates in an ISO-10303 file.
-pub fn cartesian_bbox_from_step(bytes: &[u8]) -> Option<[f64; 6]> {
+/// `CARTESIAN_POINT` coordinates in an ISO-10303 file (viewport / faceted STEP).
+pub fn cartesian_points_from_step(bytes: &[u8]) -> Vec<[f64; 3]> {
     let text = std::str::from_utf8(bytes).ok().unwrap_or("");
-    let mut bb = [
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
-    ];
-    let mut any = false;
+    let mut pts = Vec::new();
     let mut rest = text;
     while let Some(i) = rest.find("CARTESIAN_POINT") {
         rest = &rest[i + 15..];
@@ -344,20 +336,35 @@ pub fn cartesian_bbox_from_step(bytes: &[u8]) -> Option<[f64; 6]> {
             rest = &after[close..];
             continue;
         };
+        pts.push([x, y, z]);
+        rest = &after[close..];
+    }
+    pts
+}
+
+/// Axis-aligned bbox of `CARTESIAN_POINT` coordinates in an ISO-10303 file.
+pub fn cartesian_bbox_from_step(bytes: &[u8]) -> Option<[f64; 6]> {
+    let pts = cartesian_points_from_step(bytes);
+    if pts.is_empty() {
+        return None;
+    }
+    let mut bb = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for [x, y, z] in pts {
         bb[0] = bb[0].min(x);
         bb[1] = bb[1].min(y);
         bb[2] = bb[2].min(z);
         bb[3] = bb[3].max(x);
         bb[4] = bb[4].max(y);
         bb[5] = bb[5].max(z);
-        any = true;
-        rest = &after[close..];
     }
-    if any {
-        Some(bb)
-    } else {
-        None
-    }
+    Some(bb)
 }
 
 struct StepBuf {
@@ -530,6 +537,11 @@ mod tests {
         assert!(
             text.contains("MANIFOLD_SOLID_BREP") && text.contains("CLOSED_SHELL"),
             "STEP must parse as a solid"
+        );
+        let pts = cartesian_points_from_step(&step);
+        assert!(
+            pts.len() >= 8,
+            "faceted STEP must expose CARTESIAN_POINT samples"
         );
         let bb = cartesian_bbox_from_step(&step).expect("CARTESIAN_POINT bbox");
         assert!((bb[0] + 5.7735).abs() < 1e-4 && (bb[3] - 5.7735).abs() < 1e-4);

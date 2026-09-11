@@ -1,22 +1,55 @@
 import assert from 'node:assert/strict'
 import {
   applyParameterBatch,
+  bodyDisplayName,
+  chatInputTrustNote,
+  chatSendConfirmMessage,
   collectParameterBatch,
+  committedParametersSignature,
+  countUncommittedParameters,
+  deleteBodyTimelineLabel,
+  documentForAgent,
+  documentsAlign,
+  editorTrustKind,
   explicitParameterNames,
+  hideShowTimelineLabel,
   inferBoltParameters,
+  irAfterBodyRemoval,
   isExplicitParameter,
+  metricsFromBodies,
+  nextIsolatedBodyId,
+  nextSelectedBodyId,
   parameterAllowsZero,
   parameterBatchHasWork,
   parameterBatchLabel,
   parameterEntries,
+  parametersLastGoodNote,
+  parseDocumentOrNull,
   parseParameterDraft,
   parseSceneJson,
+  outlinerLastGoodNote,
+  planDeleteBody,
+  planRenameBody,
+  planSetBodyVisible,
   prettyDocument,
+  reconcileParameterDrafts,
+  removeBodyFromDocument,
+  renameBodyInDocument,
+  renameBodyTimelineLabel,
   resolvedParameters,
+  retainBodySelection,
+  sceneBodyId,
+  setBodyVisibleInDocument,
   setDocumentParameter,
+  shouldConfirmChatSend,
   sliderBounds,
+  targetBodyIdForDocument,
+  toolbarRewriteConfirmMessage,
+  uncommittedParameterChatWarning,
+  uncommittedParameterExportNote,
+  workingDocument,
 } from './document.ts'
-import type { CadDocument, CylinderOp, ExtrudeOp, Feature, ThreadOp } from '../types/cad.ts'
+import type { BodyInstance, CadDocument, CylinderOp, ExtrudeOp, Feature, MetricsData, ThreadOp } from '../types/cad.ts'
 
 /** Golden M8×40 IR with numeric literals and no parameters map. */
 function goldenM8NoParams(overrides?: {
@@ -387,6 +420,650 @@ function almost(a: number, b: number, eps = 1e-9) {
   assert.equal(collected.values.head_width, undefined)
   assert.deepEqual(collected.deletes, ['head_width'])
   assert.deepEqual(collected.invalid, [])
+}
+
+// 8. Drafts survive cosmetic IR updates; prune after Calculate / lost names
+{
+  const committed = { bolt_length: 40, head_height: 5.3, dead_height: 0 }
+  const explicit = ['bolt_length', 'head_height', 'dead_height']
+  const kept = reconcileParameterDrafts({
+    committed,
+    explicitNames: explicit,
+    drafts: { bolt_length: '50', head_height: '5.3', dead_height: 'nope' },
+    pendingDeletes: ['head_height'],
+  })
+  // Cosmetic IR (rename / Run pretty-print): same committed values keep dirty + invalid.
+  almost(Number(kept.drafts.bolt_length), 50)
+  assert.equal(kept.drafts.head_height, undefined, 'draft matching committed is pruned')
+  assert.equal(kept.drafts.dead_height, 'nope')
+  assert.deepEqual(kept.pendingDeletes, ['head_height'])
+  assert.equal(
+    committedParametersSignature(committed),
+    committedParametersSignature({ dead_height: 0, bolt_length: 40, head_height: 5.3 }),
+  )
+}
+
+{
+  // After Calculate commits 50, the matching draft is no longer dirty.
+  const afterCalc = reconcileParameterDrafts({
+    committed: { bolt_length: 50, head_height: 5.3, dead_height: 0 },
+    explicitNames: ['bolt_length', 'head_height', 'dead_height'],
+    drafts: { bolt_length: '50' },
+    pendingDeletes: [],
+  })
+  assert.deepEqual(afterCalc.drafts, {})
+}
+
+{
+  // Deleted explicit name that reappears as inferred-only must not stay pending-delete.
+  const afterDelete = reconcileParameterDrafts({
+    committed: { bolt_length: 50, head_height: 5.3, dead_height: 0 },
+    explicitNames: ['head_height', 'dead_height'],
+    drafts: { bolt_length: '55', gone: '1' },
+    pendingDeletes: ['bolt_length', 'gone'],
+  })
+  assert.equal(afterDelete.drafts.gone, undefined)
+  almost(Number(afterDelete.drafts.bolt_length), 55)
+  assert.deepEqual(afterDelete.pendingDeletes, [])
+}
+
+{
+  assert.ok(
+    uncommittedParameterChatWarning(2).includes('last calculated model'),
+  )
+  assert.ok(uncommittedParameterChatWarning(1).includes('1 uncommitted'))
+  assert.ok(uncommittedParameterExportNote(2).includes('export is the last calculated'))
+  const rewrite = toolbarRewriteConfirmMessage(0)
+  assert.ok(rewrite.includes('loaded golden'))
+  assert.ok(!rewrite.includes('uncommitted'))
+  const rewriteDirty = toolbarRewriteConfirmMessage(1)
+  assert.ok(rewriteDirty.includes('1 uncommitted parameter change'))
+  assert.ok(rewriteDirty.includes('will not be sent to the agent'))
+  assert.equal(
+    countUncommittedParameters({
+      values: { bolt_length: 50 },
+      deletes: ['head_width'],
+      invalid: ['dead_height'],
+    }),
+    3,
+  )
+}
+
+// 9. Chat / Calculate use last-good when editor JSON is dirty or invalid
+{
+  const lastGood = prettyDocument(parseSceneJson(goldenM8NoParams()))
+  const dirty = prettyDocument(parseSceneJson(goldenM8NoParams({ cylHeight: 99 })))
+  const invalid = '{ "bodies": [ }'
+  const spaced = `  ${lastGood}  \n`
+
+  assert.equal(editorTrustKind(lastGood, lastGood), 'aligned')
+  assert.equal(editorTrustKind(spaced, lastGood), 'aligned', 'whitespace-only stays aligned')
+  assert.equal(editorTrustKind(dirty, lastGood), 'dirty')
+  assert.equal(editorTrustKind(invalid, lastGood), 'invalid')
+  assert.equal(editorTrustKind('', lastGood), 'dirty', 'cleared editor is dirty vs last-good')
+  assert.equal(editorTrustKind(dirty, ''), 'dirty')
+  assert.equal(editorTrustKind('', ''), 'empty')
+  assert.equal(editorTrustKind('{', ''), 'empty')
+
+  assert.ok(documentsAlign(parseSceneJson(lastGood), parseSceneJson(spaced)))
+  assert.equal(parseDocumentOrNull(invalid), null)
+
+  // Agent always sees last-good when it exists (viewport / export truth).
+  assert.ok(documentsAlign(documentForAgent(dirty, lastGood)!, parseSceneJson(lastGood)))
+  assert.ok(documentsAlign(documentForAgent(invalid, lastGood)!, parseSceneJson(lastGood)))
+  assert.ok(documentsAlign(documentForAgent('', lastGood)!, parseSceneJson(lastGood)))
+  assert.ok(documentsAlign(documentForAgent(lastGood, lastGood)!, parseSceneJson(lastGood)))
+  assert.equal(documentForAgent(invalid, ''), null)
+  assert.ok(documentsAlign(documentForAgent(dirty, '')!, parseSceneJson(dirty)))
+
+  // Calculate prefers parseable editor JSON; typo falls back to last-good.
+  assert.ok(documentsAlign(workingDocument(dirty, lastGood)!, parseSceneJson(dirty)))
+  assert.ok(documentsAlign(workingDocument(invalid, lastGood)!, parseSceneJson(lastGood)))
+  assert.ok(documentsAlign(workingDocument('', lastGood)!, parseSceneJson(lastGood)))
+
+  assert.equal(
+    shouldConfirmChatSend({ editorKind: 'aligned', hasLastGood: true, dirtyParamCount: 0 }),
+    false,
+  )
+  assert.equal(
+    shouldConfirmChatSend({ editorKind: 'dirty', hasLastGood: true, dirtyParamCount: 0 }),
+    true,
+  )
+  assert.equal(
+    shouldConfirmChatSend({ editorKind: 'invalid', hasLastGood: true, dirtyParamCount: 0 }),
+    true,
+  )
+  assert.equal(
+    shouldConfirmChatSend({ editorKind: 'dirty', hasLastGood: false, dirtyParamCount: 0 }),
+    false,
+    'never-run paste does not confirm',
+  )
+  assert.equal(
+    shouldConfirmChatSend({ editorKind: 'aligned', hasLastGood: true, dirtyParamCount: 1 }),
+    true,
+  )
+
+  const dirtyConfirm = chatSendConfirmMessage({
+    editorKind: 'dirty',
+    hasLastGood: true,
+    dirtyParamCount: 0,
+  })
+  assert.ok(dirtyConfirm.includes('unrun JSON editor edits'))
+  assert.ok(dirtyConfirm.includes('last calculated model'))
+  const bothConfirm = chatSendConfirmMessage({
+    editorKind: 'invalid',
+    hasLastGood: true,
+    dirtyParamCount: 2,
+  })
+  assert.ok(bothConfirm.includes('2 uncommitted parameter changes'))
+  assert.ok(bothConfirm.includes('invalid JSON'))
+
+  assert.ok(
+    chatInputTrustNote({
+      editorKind: 'aligned',
+      hasLastGood: true,
+      dirtyParamCount: 1,
+    })?.includes('last calculated model until Calculate'),
+  )
+  assert.ok(
+    chatInputTrustNote({
+      editorKind: 'dirty',
+      hasLastGood: true,
+      dirtyParamCount: 0,
+    })?.includes('until Run'),
+  )
+  assert.equal(
+    chatInputTrustNote({
+      editorKind: 'dirty',
+      hasLastGood: false,
+      dirtyParamCount: 0,
+    }),
+    null,
+  )
+  assert.ok(
+    parametersLastGoodNote({ editorKind: 'invalid', showingLastGood: true })?.includes('JSON is invalid'),
+  )
+  assert.equal(parametersLastGoodNote({ editorKind: 'dirty', showingLastGood: false }), null)
+  assert.ok(
+    outlinerLastGoodNote({ editorKind: 'invalid', showingLastGood: true })?.includes('replace the broken editor'),
+  )
+  assert.ok(
+    outlinerLastGoodNote({ editorKind: 'dirty', showingLastGood: true })?.includes('JSON editor is empty'),
+  )
+  assert.equal(outlinerLastGoodNote({ editorKind: 'invalid', showingLastGood: false }), null)
+
+  const rewriteEditor = toolbarRewriteConfirmMessage(0, 'dirty')
+  assert.ok(rewriteEditor.includes('Unrun JSON editor edits will not be sent'))
+  assert.ok(toolbarRewriteConfirmMessage(1, 'invalid').includes('Invalid editor JSON'))
+}
+
+// 10. Delete-body: History snapshot + metrics; dirty editor does not strip the solid
+{
+  const twoBody = parseSceneJson(JSON.stringify({
+    documentId: 'two',
+    units: 'mm',
+    bodies: [
+      {
+        bodyId: 'body_a',
+        name: 'Bolt',
+        visible: true,
+        features: [{ op: 'box', size: [10, 10, 10] }],
+      },
+      {
+        bodyId: 'body_b',
+        name: 'Nut',
+        visible: true,
+        features: [{ op: 'cylinder', diameter: 8, height: 6 }],
+      },
+    ],
+  }))
+  const aligned = prettyDocument(twoBody)
+  const removed = removeBodyFromDocument(twoBody, 'body_a')
+  assert.ok(removed)
+  assert.equal(removed.bodies.length, 1)
+  assert.equal(removed.bodies[0].bodyId, 'body_b')
+  assert.equal(twoBody.bodies.length, 2, 'source document is not mutated')
+  assert.equal(removeBodyFromDocument(twoBody, 'missing'), null)
+  const lastRemoved = removeBodyFromDocument(removed, 'body_b')
+  assert.ok(lastRemoved)
+  assert.equal(irAfterBodyRemoval(lastRemoved), '')
+  assert.equal(deleteBodyTimelineLabel('Bolt'), 'Delete Bolt')
+  assert.equal(deleteBodyTimelineLabel('  '), 'Delete body')
+
+  const scene = planDeleteBody({
+    irCode: aligned,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+  })
+  assert.ok(scene && scene.kind === 'scene')
+  assert.equal(scene.label, 'Delete Bolt')
+  assert.ok(documentsAlign(parseSceneJson(scene.nextIrCode), removed))
+  // Chat / export last-good after a scene delete is the remaining solid.
+  assert.ok(
+    documentsAlign(documentForAgent(scene.nextIrCode, scene.nextIrCode)!, removed),
+  )
+
+  const last = planDeleteBody({
+    irCode: scene.nextIrCode,
+    lastGoodIrCode: scene.nextIrCode,
+    bodyId: 'body_b',
+  })
+  assert.ok(last && last.kind === 'scene')
+  assert.equal(last.nextIrCode, '')
+
+  const dirtyIr = prettyDocument({
+    ...twoBody,
+    bodies: twoBody.bodies.map((b) =>
+      b.bodyId === 'body_b' ? { ...b, name: 'Nut draft' } : b,
+    ),
+  })
+  assert.notEqual(dirtyIr, aligned)
+  const editorOnly = planDeleteBody({
+    irCode: dirtyIr,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+  })
+  assert.ok(editorOnly && editorOnly.kind === 'editor-only')
+  assert.equal(parseDocumentOrNull(editorOnly.nextIrCode)?.bodies.length, 1)
+  assert.equal(parseDocumentOrNull(editorOnly.nextIrCode)?.bodies[0].bodyId, 'body_b')
+  // Viewport / chat / export stay on last-good (still has both bodies).
+  assert.ok(documentsAlign(documentForAgent(editorOnly.nextIrCode, aligned)!, twoBody))
+  assert.equal(
+    planDeleteBody({ irCode: aligned, lastGoodIrCode: aligned, bodyId: 'nope' }),
+    null,
+  )
+}
+
+{
+  const mesh = { positions: [0], normals: [0], indices: [0] }
+  const metric = (partial: Partial<MetricsData> & { volume: number; bbox: MetricsData['bbox'] }): MetricsData => ({
+    surface_area: partial.surface_area ?? 1,
+    is_solid: partial.is_solid ?? true,
+    units: partial.units ?? 'mm',
+    volume: partial.volume,
+    bbox: partial.bbox,
+  })
+  const inst = (id: string, m: MetricsData): BodyInstance => ({
+    bodyId: id,
+    name: id,
+    visible: true,
+    suppressed: false,
+    mesh,
+    metrics: m,
+  })
+
+  assert.equal(metricsFromBodies([]), null)
+  const one = metricsFromBodies([
+    inst('a', metric({ volume: 10, surface_area: 4, bbox: [0, 0, 0, 2, 2, 2] })),
+  ])
+  almost(one!.volume, 10)
+  assert.deepEqual(one!.bbox, [0, 0, 0, 2, 2, 2])
+
+  const combined = metricsFromBodies([
+    inst('a', metric({ volume: 10, surface_area: 4, bbox: [0, 0, 0, 2, 2, 2] })),
+    inst('b', metric({ volume: 3, surface_area: 5, is_solid: false, bbox: [-1, 1, 0, 1, 4, 3] })),
+  ])
+  almost(combined!.volume, 13)
+  almost(combined!.surface_area, 9)
+  assert.equal(combined!.is_solid, false)
+  assert.deepEqual(combined!.bbox, [-1, 0, 0, 2, 4, 3])
+}
+
+// 11. Hide / rename: History when aligned; dirty editor does not hide the solid
+{
+  const twoBody = parseSceneJson(JSON.stringify({
+    documentId: 'two',
+    units: 'mm',
+    bodies: [
+      {
+        bodyId: 'body_a',
+        name: 'Bolt',
+        visible: true,
+        features: [{ op: 'box', size: [10, 10, 10] }],
+      },
+      {
+        bodyId: 'body_b',
+        name: 'Nut',
+        visible: true,
+        features: [{ op: 'cylinder', diameter: 8, height: 6 }],
+      },
+    ],
+  }))
+  const aligned = prettyDocument(twoBody)
+
+  assert.equal(bodyDisplayName({ name: '  Bolt  ', bodyId: 'body_a' }), 'Bolt')
+  assert.equal(hideShowTimelineLabel('Bolt', false), 'Hide Bolt')
+  assert.equal(hideShowTimelineLabel('Bolt', true), 'Show Bolt')
+  assert.equal(renameBodyTimelineLabel('Bolt', 'Hex bolt'), 'Rename Bolt → Hex bolt')
+  assert.equal(renameBodyTimelineLabel('  ', 'x'), 'Rename body → x')
+
+  const hiddenDoc = setBodyVisibleInDocument(twoBody, 'body_a', false)
+  assert.ok(hiddenDoc)
+  assert.equal(hiddenDoc.bodies.find((b) => b.bodyId === 'body_a')?.visible, false)
+  assert.equal(twoBody.bodies.find((b) => b.bodyId === 'body_a')?.visible, true, 'source not mutated')
+  assert.equal(setBodyVisibleInDocument(twoBody, 'body_a', true), null, 'already visible')
+  assert.equal(setBodyVisibleInDocument(twoBody, 'missing', false), null)
+
+  const renamedDoc = renameBodyInDocument(twoBody, 'body_a', '  Hex bolt  ')
+  assert.ok(renamedDoc)
+  assert.equal(renamedDoc.bodies.find((b) => b.bodyId === 'body_a')?.name, 'Hex bolt')
+  assert.equal(twoBody.bodies.find((b) => b.bodyId === 'body_a')?.name, 'Bolt')
+  assert.equal(renameBodyInDocument(twoBody, 'body_a', 'Bolt'), null)
+  assert.equal(renameBodyInDocument(twoBody, 'body_a', '   '), null)
+  assert.equal(renameBodyInDocument(twoBody, 'missing', 'X'), null)
+
+  const hideScene = planSetBodyVisible({
+    irCode: aligned,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    visible: false,
+  })
+  assert.ok(hideScene && hideScene.kind === 'scene')
+  assert.equal(hideScene.label, 'Hide Bolt')
+  assert.ok(documentsAlign(parseSceneJson(hideScene.nextIrCode), hiddenDoc))
+  // Chat / export last-good after an aligned hide is the hidden solid.
+  assert.ok(
+    documentsAlign(documentForAgent(hideScene.nextIrCode, hideScene.nextIrCode)!, hiddenDoc),
+  )
+
+  const showScene = planSetBodyVisible({
+    irCode: hideScene.nextIrCode,
+    lastGoodIrCode: hideScene.nextIrCode,
+    bodyId: 'body_a',
+    visible: true,
+  })
+  assert.ok(showScene && showScene.kind === 'scene')
+  assert.equal(showScene.label, 'Show Bolt')
+
+  const renameScene = planRenameBody({
+    irCode: aligned,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    name: 'Hex bolt',
+  })
+  assert.ok(renameScene && renameScene.kind === 'scene')
+  assert.equal(renameScene.label, 'Rename Bolt → Hex bolt')
+  assert.ok(documentsAlign(parseSceneJson(renameScene.nextIrCode), renamedDoc))
+
+  const dirtyIr = prettyDocument({
+    ...twoBody,
+    bodies: twoBody.bodies.map((b) =>
+      b.bodyId === 'body_b' ? { ...b, name: 'Nut draft' } : b,
+    ),
+  })
+  assert.notEqual(dirtyIr, aligned)
+
+  const hideDraft = planSetBodyVisible({
+    irCode: dirtyIr,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    visible: false,
+  })
+  assert.ok(hideDraft && hideDraft.kind === 'editor-only')
+  assert.equal(parseDocumentOrNull(hideDraft.nextIrCode)?.bodies.find((b) => b.bodyId === 'body_a')?.visible, false)
+  // Viewport / chat / export stay on last-good (Bolt still visible).
+  assert.ok(documentsAlign(documentForAgent(hideDraft.nextIrCode, aligned)!, twoBody))
+  assert.equal(
+    parseDocumentOrNull(aligned)?.bodies.find((b) => b.bodyId === 'body_a')?.visible !== false,
+    true,
+  )
+
+  const renameDraft = planRenameBody({
+    irCode: dirtyIr,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    name: 'Hex bolt',
+  })
+  assert.ok(renameDraft && renameDraft.kind === 'editor-only')
+  assert.equal(parseDocumentOrNull(renameDraft.nextIrCode)?.bodies.find((b) => b.bodyId === 'body_a')?.name, 'Hex bolt')
+  assert.ok(documentsAlign(documentForAgent(renameDraft.nextIrCode, aligned)!, twoBody))
+
+  assert.equal(
+    planSetBodyVisible({ irCode: aligned, lastGoodIrCode: aligned, bodyId: 'nope', visible: false }),
+    null,
+  )
+
+  // Cycle 4 dirty-editor delete still stays editor-only (do not loosen).
+  const dirtyDelete = planDeleteBody({
+    irCode: dirtyIr,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+  })
+  assert.ok(dirtyDelete && dirtyDelete.kind === 'editor-only')
+}
+
+// 12. Invalid / empty editor: Outliner last-good mutate applies to the scene
+{
+  const twoBody = parseSceneJson(JSON.stringify({
+    documentId: 'two',
+    units: 'mm',
+    bodies: [
+      {
+        bodyId: 'body_a',
+        name: 'Bolt',
+        visible: true,
+        features: [{ op: 'box', size: [10, 10, 10] }],
+      },
+      {
+        bodyId: 'body_b',
+        name: 'Nut',
+        visible: true,
+        features: [{ op: 'cylinder', diameter: 8, height: 6 }],
+      },
+    ],
+  }))
+  const aligned = prettyDocument(twoBody)
+  const invalid = '{ "bodies": [ }'
+  const removed = removeBodyFromDocument(twoBody, 'body_a')
+  assert.ok(removed)
+  const hiddenDoc = setBodyVisibleInDocument(twoBody, 'body_a', false)
+  assert.ok(hiddenDoc)
+  const renamedDoc = renameBodyInDocument(twoBody, 'body_a', 'Hex bolt')
+  assert.ok(renamedDoc)
+
+  const invalidDelete = planDeleteBody({
+    irCode: invalid,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+  })
+  assert.ok(invalidDelete && invalidDelete.kind === 'scene', 'invalid JSON applies to last-good')
+  assert.equal(invalidDelete.label, 'Delete Bolt')
+  assert.ok(documentsAlign(parseSceneJson(invalidDelete.nextIrCode), removed))
+  // After the store replaces the unusable draft, chat / export last-good match.
+  assert.ok(
+    documentsAlign(documentForAgent(invalidDelete.nextIrCode, invalidDelete.nextIrCode)!, removed),
+  )
+
+  const emptyDelete = planDeleteBody({
+    irCode: '',
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+  })
+  assert.ok(emptyDelete && emptyDelete.kind === 'scene', 'empty editor applies to last-good')
+  assert.ok(documentsAlign(parseSceneJson(emptyDelete.nextIrCode), removed))
+
+  const invalidHide = planSetBodyVisible({
+    irCode: invalid,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    visible: false,
+  })
+  assert.ok(invalidHide && invalidHide.kind === 'scene')
+  assert.equal(invalidHide.label, 'Hide Bolt')
+  assert.ok(documentsAlign(parseSceneJson(invalidHide.nextIrCode), hiddenDoc))
+  assert.ok(
+    documentsAlign(documentForAgent(invalidHide.nextIrCode, invalidHide.nextIrCode)!, hiddenDoc),
+  )
+
+  const emptyHide = planSetBodyVisible({
+    irCode: '',
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    visible: false,
+  })
+  assert.ok(emptyHide && emptyHide.kind === 'scene')
+  assert.ok(documentsAlign(parseSceneJson(emptyHide.nextIrCode), hiddenDoc))
+
+  const invalidRename = planRenameBody({
+    irCode: invalid,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    name: 'Hex bolt',
+  })
+  assert.ok(invalidRename && invalidRename.kind === 'scene')
+  assert.equal(invalidRename.label, 'Rename Bolt → Hex bolt')
+  assert.ok(documentsAlign(parseSceneJson(invalidRename.nextIrCode), renamedDoc))
+
+  const emptyRename = planRenameBody({
+    irCode: '',
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    name: 'Hex bolt',
+  })
+  assert.ok(emptyRename && emptyRename.kind === 'scene')
+  assert.ok(documentsAlign(parseSceneJson(emptyRename.nextIrCode), renamedDoc))
+
+  assert.equal(
+    planDeleteBody({ irCode: invalid, lastGoodIrCode: '', bodyId: 'body_a' }),
+    null,
+    'invalid JSON with no last-good still no-ops',
+  )
+  assert.equal(
+    planSetBodyVisible({ irCode: invalid, lastGoodIrCode: '', bodyId: 'body_a', visible: false }),
+    null,
+  )
+  assert.equal(
+    planRenameBody({ irCode: invalid, lastGoodIrCode: '', bodyId: 'body_a', name: 'Hex bolt' }),
+    null,
+  )
+  assert.equal(
+    planDeleteBody({ irCode: invalid, lastGoodIrCode: aligned, bodyId: 'nope' }),
+    null,
+  )
+
+  // Dirty parseable editor still cannot touch last-good (Cycles 4–5).
+  const dirtyIr = prettyDocument({
+    ...twoBody,
+    bodies: twoBody.bodies.map((b) =>
+      b.bodyId === 'body_b' ? { ...b, name: 'Nut draft' } : b,
+    ),
+  })
+  const dirtyDelete = planDeleteBody({
+    irCode: dirtyIr,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+  })
+  assert.ok(dirtyDelete && dirtyDelete.kind === 'editor-only')
+  assert.ok(documentsAlign(documentForAgent(dirtyDelete.nextIrCode, aligned)!, twoBody))
+  const dirtyHide = planSetBodyVisible({
+    irCode: dirtyIr,
+    lastGoodIrCode: aligned,
+    bodyId: 'body_a',
+    visible: false,
+  })
+  assert.ok(dirtyHide && dirtyHide.kind === 'editor-only')
+  assert.ok(documentsAlign(documentForAgent(dirtyHide.nextIrCode, aligned)!, twoBody))
+}
+
+// 13. History restore must drop isolate/select when the snapshot lacks that body
+{
+  const two = [{ bodyId: 'body_a' }, { bodyId: 'body_b' }]
+  const one = [{ bodyId: 'body_a' }]
+
+  assert.deepEqual(
+    retainBodySelection(two, 'body_b', 'body_b'),
+    { selectedBodyId: 'body_b', isolatedBodyId: 'body_b' },
+    'keep isolate/select when the snapshot still has the body',
+  )
+  assert.deepEqual(
+    retainBodySelection(one, 'body_b', 'body_b'),
+    { selectedBodyId: null, isolatedBodyId: null },
+    'orphan isolate would hide every mesh while chat/export still send the snapshot',
+  )
+  assert.deepEqual(
+    retainBodySelection(one, 'body_a', 'body_b'),
+    { selectedBodyId: 'body_a', isolatedBodyId: null },
+  )
+  assert.deepEqual(
+    retainBodySelection([], 'body_a', 'body_a'),
+    { selectedBodyId: null, isolatedBodyId: null },
+  )
+  assert.deepEqual(
+    retainBodySelection(two, null, null),
+    { selectedBodyId: null, isolatedBodyId: null },
+  )
+
+  const lastGood = parseSceneJson(JSON.stringify({
+    documentId: 'two',
+    units: 'mm',
+    bodies: [
+      { bodyId: 'body_a', name: 'Bolt', features: [{ op: 'box', size: [10, 10, 10] }] },
+      { bodyId: 'body_b', name: 'Nut', features: [{ op: 'cylinder', diameter: 8, height: 6 }] },
+    ],
+  }))
+  assert.equal(targetBodyIdForDocument(lastGood, 'body_b'), 'body_b')
+  assert.equal(
+    targetBodyIdForDocument(lastGood, 'draft_only'),
+    undefined,
+    'do not silently scope chat to a body the agent document does not have',
+  )
+  assert.equal(targetBodyIdForDocument(lastGood, null), undefined)
+  assert.equal(targetBodyIdForDocument(null, 'body_b'), undefined)
+}
+
+// 14. Outliner isolate/select must not adopt a draft-only id missing from the viewport
+{
+  const scene = [{ bodyId: 'body_a' }, { bodyId: 'body_b' }]
+
+  assert.equal(sceneBodyId(scene, 'body_b'), 'body_b')
+  assert.equal(sceneBodyId(scene, 'draft_only'), null)
+  assert.equal(sceneBodyId(scene, null), null)
+  assert.equal(sceneBodyId([], 'body_a'), null)
+
+  assert.equal(
+    nextIsolatedBodyId(scene, null, 'body_b'),
+    'body_b',
+    'isolate a body the viewport still has',
+  )
+  assert.equal(
+    nextIsolatedBodyId(scene, 'body_b', 'body_b'),
+    null,
+    'toggle isolate off',
+  )
+  assert.equal(
+    nextIsolatedBodyId(scene, 'body_a', 'body_b'),
+    'body_b',
+  )
+  assert.equal(
+    nextIsolatedBodyId(scene, null, 'draft_only'),
+    null,
+    'draft-only isolate would hide every last-good mesh',
+  )
+  assert.equal(
+    nextIsolatedBodyId(scene, 'body_a', 'draft_only'),
+    'body_a',
+    'refuse draft-only isolate; keep a still-valid isolate',
+  )
+  assert.equal(
+    nextIsolatedBodyId(scene, 'ghost', 'draft_only'),
+    null,
+    'drop an already-orphan isolate if the new id is also missing',
+  )
+  assert.equal(nextIsolatedBodyId(scene, 'body_a', null), null)
+
+  assert.equal(nextSelectedBodyId(scene, null, 'body_b'), 'body_b')
+  assert.equal(nextSelectedBodyId(scene, 'body_b', null), null)
+  assert.equal(
+    nextSelectedBodyId(scene, null, 'draft_only'),
+    null,
+    'do not select a body the viewport does not have',
+  )
+  assert.equal(
+    nextSelectedBodyId(scene, 'body_a', 'draft_only'),
+    'body_a',
+    'draft-only Outliner click must not steal a valid selection',
+  )
+  assert.equal(nextSelectedBodyId(scene, 'ghost', 'draft_only'), null)
 }
 
 console.log('document.test.ts: all assertions passed')
